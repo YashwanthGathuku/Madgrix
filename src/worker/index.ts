@@ -60,6 +60,7 @@ import type {
 } from "../lib/types.ts";
 import { SELECTOR_POLICY_VERSION } from "../lib/types.ts";
 import type { Effect } from "../lib/task-state.ts";
+import { taskHashFor } from "../lib/task-state.ts";
 import { computePermitId, TaskAuthority } from "../do/TaskAuthority.ts";
 
 /** Re-exported so the runtime can register the Durable Object class from
@@ -384,22 +385,26 @@ export async function handleCreateTask(env: Env, request: Request): Promise<Resp
 		return json({ error: "baseline_commit_not_found", baseline_commit }, 404);
 	}
 
-	// Spec 1 §5: freeze the task; task_hash commits to the frozen record.
+	// Spec 1 §5 (FROZEN): freeze the task; task_hash = SHA256(canonical_json(task_record)).
+	// The joinHashParts convention is NOT used here — it omits behavior_contract and
+	// disagrees with the frozen spec; taskHashFor (src/lib/task-state.ts) is the
+	// single conforming implementation.
 	const frozen_at = new Date().toISOString();
 	const policy_version = SELECTOR_POLICY_VERSION;
-	const task_hash = await sha256Hex(
-		joinHashParts(intent, baseline_repo, baseline_commit, policy_version, frozen_at),
-	);
 	const task_id = `task_${randomHex(12)}`;
-	const task: TaskRecord = {
-		task_id,
-		task_hash,
+	const task_record_fields = {
 		intent,
 		baseline_repo,
 		baseline_commit,
 		behavior_contract: typeof behavior_contract === "string" ? behavior_contract : "",
 		policy_version,
 		frozen_at,
+	};
+	const task_hash = await taskHashFor(task_record_fields, sha256Hex);
+	const task: TaskRecord = {
+		task_id,
+		task_hash,
+		...task_record_fields,
 	};
 
 	const res = await doRpc(taskStub(env, task_id), "/init", { body: { task } });

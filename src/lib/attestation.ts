@@ -14,6 +14,24 @@
  * digests MUST chain; a verifier recomputes the chain and any break
  * fails verification.
  *
+ * Bit-for-bit promotion assumption (documented, NOT a spec change): the
+ * "candidate digest" check in verifyBundle assumes promotion writes the
+ * reviewed commit to the canonical repo bit-for-bit — same tree, same
+ * message, same parents — so the shipped commit SHA is identical to the
+ * reviewed candidate SHA. This holds by construction of the promotion
+ * path: attemptPromotion (task-state.ts) emits a canonical_write effect
+ * carrying only the reviewed tree_sha256 and the expected parent; the
+ * promotion service (the ONLY canonical writer, spec 3 §2) creates no
+ * merge commit and performs no re-encoding — it stores
+ * SHA256(canonical_json({parents, tree, message})) with the candidate's
+ * own tree/message and the reviewed parent (fake-artifacts.ts
+ * storeCommit; the slice's harness asserts promotedSha === winner_sha).
+ * If a future promotion path ever re-encodes or re-parents the candidate
+ * tree, verifyBundle's candidate-digest check will fail closed rather
+ * than silently bless a different artifact — that is the correct behavior
+ * here, because "reviewed at SHA X ships at SHA X" is the binding the
+ * attestation makes.
+ *
  * The predicateType URIs for the reused in-toto predicates are
  * slice-level constants; spec 4 §8 leaves the exact reuse-vs-subtype
  * decision OPEN. The AgentPromotionAuthority/v1 URI is FROZEN by
@@ -293,6 +311,15 @@ export async function verifyBundle(
 	}
 
 	// 2. candidate digest — candidate commit+tree match the attested digests.
+	// ASSUMPTION (documented in this module's doc comment): promotion
+	// preserves the reviewed commit bit-for-bit — the promotion path
+	// (task-state.ts attemptPromotion → canonical_write effect → sole
+	// canonical writer) creates no merge commit and performs no
+	// re-encoding; the commit hash is a pure function of
+	// {parents, tree, message}, so the shipped commit IS the reviewed
+	// candidate SHA. Any re-encoding/re-parenting upstream would land
+	// here as a FAIL, which is the correct fail-closed behavior (reviewed
+	// at SHA X must ship at SHA X; spec 3 §6 attack #7).
 	if (
 		ap !== null &&
 		ap.candidate.commit === bundle.ship.commit &&

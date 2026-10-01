@@ -66,6 +66,7 @@ import {
 	runVerdictSeam,
 	submitEvaluation,
 	submitVerifierReport,
+	taskHashFor,
 	type CandidateEvidence,
 	type Ctx,
 	type NewClaimInput,
@@ -214,8 +215,18 @@ export async function runSlice(opts: SliceOptions = {}): Promise<SliceResult> {
 		"Fix isTokenExpired so expired tokens (exp <= now) return true and valid tokens return false.";
 	const behavior_contract = "isTokenExpired(exp, now) returns true iff exp <= now.";
 	const frozen_at = new Date().toISOString();
-	const task_hash = await sha256Hex(
-		joinHashParts(intent, "canonical", baseline, SELECTOR_POLICY_VERSION, frozen_at),
+	// Spec 1 §5 (FROZEN): task_hash = SHA256(canonical_json(task_record)) — the
+	// single conforming implementation is taskHashFor (src/lib/task-state.ts).
+	const task_hash = await taskHashFor(
+		{
+			intent,
+			baseline_repo: "canonical",
+			baseline_commit: baseline,
+			behavior_contract,
+			policy_version: SELECTOR_POLICY_VERSION,
+			frozen_at,
+		},
+		sha256Hex,
 	);
 	const task: TaskRecord = {
 		task_id,

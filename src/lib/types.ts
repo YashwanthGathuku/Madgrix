@@ -228,6 +228,14 @@ export type PromotionOutcome =
 
 export type QuarantineTrigger =
 	| "eval_file_modification"
+	/**
+	 * Amendment `specs/amendments/evaluator-config-trigger.md`: evaluator-config
+	 * modification (spec 3 §6 attack 3, §4.3 evaluator locking) is a DISTINCT
+	 * mechanical trigger — a pre-run locked-config hash mismatch — not a
+	 * hidden_eval_boundary_violation. The frozen §9.5 trigger list names the
+	 * category closed; this member extends it via the amendment mechanism.
+	 */
+	| "evaluator_config_modification"
 	| "unauthorized_canonical_write"
 	| "candidate_sha_substitution"
 	| "forged_evidence"

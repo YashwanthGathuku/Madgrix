@@ -449,6 +449,36 @@ describe("quarantine", () => {
 		assert.equal(rev.state.contenders["contender-1"].status, "revoked");
 		assert.equal(rev.state.evaluations["csha1"].tainted, true); // taint kept
 	});
+
+	it("evaluator_config_modification quarantines on locked-config hash mismatch (spec 3 §6 attack 3)", async () => {
+		// Amendment specs/amendments/evaluator-config-trigger.md: attack 3 is a
+		// DISTINCT trigger, not hidden_eval_boundary_violation. The mechanical
+		// finding is SHA256(canonical_json(presented_config)) != locked digest.
+		const ctx = makeCtx();
+		const bundle = await makeBundle();
+		let state = stateWithContender(ctx);
+		state = await submitEvaluation(state, bundle, ctx);
+		const locked = { evaluator_version: "eval-domain/0.3.1", hidden_seed: "9f2c", policy: "strict" };
+		const lockedHash = await ctx.sha256Hex(canonicalJson(locked));
+		const presented = { ...locked, hidden_seed: "0000" }; // attacker-modified config
+		const presentedHash = await ctx.sha256Hex(canonicalJson(presented));
+		assert.notEqual(presentedHash, lockedHash, "modified config must change the locked digest");
+		const { state: qstate, effects } = await quarantineContender(
+			state,
+			"contender-1",
+			"evaluator_config_modification",
+			presentedHash,
+			ctx,
+		);
+		assert.equal(qstate.quarantine["contender-1"].status, "QUARANTINED");
+		assert.equal(qstate.quarantine["contender-1"].trigger, "evaluator_config_modification");
+		assert.equal(qstate.contenders["contender-1"].status, "quarantined");
+		assert.equal(qstate.evaluations["csha1"].tainted, true);
+		assert.ok(
+			effects.some((e) => e.kind === "revoke_token"),
+			"quarantine must revoke the fork's write token",
+		);
+	});
 });
 
 describe("escalation", () => {
@@ -498,6 +528,13 @@ describe("ledger + task hash", () => {
 			policy_version: "seam-policy/0.1.0",
 			frozen_at: "2026-10-01T18:00:00Z",
 		})));
+		// The retired joinHashParts convention (pre-reconciliation) omitted
+		// behavior_contract and disagrees with the frozen spec: it must NOT
+		// equal the conforming hash. taskHashFor is the single convention.
+		const oldConvention = await sha256Hex(
+			["x", "r", "c", "seam-policy/0.1.0", "2026-10-01T18:00:00Z"].join("\0"),
+		);
+		assert.notEqual(h, oldConvention, "task hash must cover the full task record, not the NUL-joined subset");
 	});
 
 	it("defaultCtx is constructible", () => {
