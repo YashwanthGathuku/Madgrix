@@ -1,57 +1,95 @@
-# Seam (internal codename)
+# Verdict Seam
 
 **A governed promotion protocol for autonomous software agents** — built on Cloudflare Workers + Durable Objects.
 
-"Seam" is an internal codename, not a public brand (the name is crowded and trademark-risky). "Verdict Seam" is kept only as in-architecture terminology for the verdict policy layer.
+"Verdict Seam" is the working name of the verdict policy layer. The repo's internal
+codename is `seam/` (the folder keeps that name; it is not a public brand — the public
+name is still undecided, see `docs/NAME_SHORTLIST.md`).
 
-Git records *what changed*. Seam adds, for autonomous work: *why it began, what alternatives existed, what each claimed, what was independently verified, why one was chosen, what authority permitted shipping — and whether the shipped state is exactly the reviewed state.*
+## What it is
+
+A governed path from an agent's *intent* to shipped code:
 
 ```
 INTENT → competing implementations → independent evidence
        → VERDICT → exact-state authorization → promotion → verifiable history
 ```
 
-## What this repo actually is (honest status)
+Git records *what changed*. Verdict Seam records everything else: *why the work began,
+what alternatives were tried, what each one claimed, what was independently checked,
+why one was chosen, what authority permitted shipping — and whether the shipped state
+is exactly the reviewed state.*
 
-This is a **locally runnable prototype**, not a production deployment:
+## Why it matters
 
-- **Real, production-shaped logic:** the protocol layer (`src/lib/`) is the actual
-  state machine — task lifecycle, claim classification, evaluation/admission gates,
-  blind-verifier commit→reveal, the verdict seam (eligibility gates → objective
-  dominance → blind 2-of-3 vote), exact-state single-consume permits, quarantine
-  lifecycle, and the in-toto attestation chain with Ed25519 DSSE signatures.
-- **Fake substrate:** `FakeArtifacts` implements the `ArtifactsPort` interface
-  (repos, scoped bearer tokens, content-addressed commits, queue events) in memory.
-  Nothing touches real git, Cloudflare, or the network. The platform layer
-  (`src/do/TaskAuthority.ts`, `src/worker/index.ts`) is written against the port,
-  so production can swap in real Artifacts without changing protocol logic.
-- **Simulated agents:** the slice's "contenders" and "verifiers" are deterministic
-  harness code, not LLMs. The blind-verifier ordering guarantee (commit before
-  seeing candidates, no retry after an invalid reveal) is real; the judgments are
-  scripted.
-- **Frozen specs:** `../specs/` holds the FROZEN-v1 protocol specs. Never silently
-  change a frozen contract while implementing — open a spec amendment with the
-  failing invariant and the proposed change instead.
+Giving each agent its own fork is commodity infrastructure now. The hard part — and the
+invention here — is **adjudication plus enforcement**:
 
-## Quickstart
+1. **Competing implementations, one task.** Several agents (contenders) tackle the same
+   frozen task in isolated forks.
+2. **Independent evidence.** Each candidate is tested against checks the agents never
+   see, then judged by blind verifiers who score anonymized code.
+3. **A verdict with fixed rules.** Selection follows a published order — correctness,
+   then regressions, then security, then blast radius, then minimality — followed by a
+   blind 2-of-3 vote. No vibes, no loudest-agent-wins, and ties mean *abstain*, not a
+   coin flip.
+4. **Exact-state authorization.** The permit to ship binds the *exact* reviewed code,
+   baseline, and destination. If anything moved since the review, the permit dies.
+5. **Proof you can check offline.** The whole chain is signed into a promotion bundle
+   anyone can verify with no network and no trusted server.
+
+Humans can resolve genuine ambiguities and trade-offs — but they can never override an
+integrity gate (a failed test, a tampered file, a signature mismatch). Those require
+starting over, not an exception.
+
+## Architecture
+
+Five trust zones with a strict credential matrix:
+
+```
+┌──────────────┐   ┌──────────────┐   ┌──────────────┐   ┌──────────────┐   ┌──────────────┐
+│ Control plane │ → │ Contender    │ → │ Evaluation   │ → │ Verdict      │ → │ Promotion    │
+│ TaskAuthority │   │ microVMs     │   │ domain       │   │ plane        │   │ service      │
+│ (Durable      │   │ (one fork    │   │ (hidden      │   │ (gates →      │   │ (sole        │
+│  Object)      │   │  per agent)  │   │  oracles,    │   │  dominance →  │   │  canonical   │
+└──────────────┘   └──────────────┘   │  blind       │   │  blind vote) │   │  writer)     │
+                                      │  verifiers)  │   └──────────────┘   └──────────────┘
+                                      └──────────────┘
+```
+
+Contenders hold short-lived write tokens for *their own fork only*. Verifiers get no
+repo access at all. Only the promotion service can write canonical state, and it is
+unreachable from contender sandboxes. Full detail with diagrams:
+`docs/ARCHITECTURE.md`.
+
+## Quickstart (fresh machine)
+
+Requirements: **Node 24** (tested on v24.20.0), **npm 10**. Everything runs locally —
+no credentials, no network, no deploys.
 
 ```bash
 npm install
-npm run typecheck   # must pass
-npm run slice       # full vertical slice: task → claims → forks → evaluation
-                    # → blind verifiers → verdict → permit → promotion
-                    # → signed bundle → offline verification. Ends with SLICE OK.
-npm test            # 70 tests, 20 suites — includes the slice as an integration test
-npm run bench -- --quick   # benchmark harness (synthetic/harness-validation only)
-npm run verify -- .slice-output/promotion.bundle   # offline bundle verification
+npm run typecheck                     # must pass
+npm test                              # 74 tests, 20 suites
+npm run slice                         # the full loop: task → claims → forks → evaluation
+                                      # → blind verifiers → verdict → permit → promotion
+                                      # → signed bundle → offline verification
+                                      # ends with SLICE OK
+npm run verify -- .slice-output/promotion.bundle   # offline check: 8-line transcript + VERIFIED
+npm run bench -- --quick              # benchmark harness (synthetic / harness-validation only)
 ```
 
-`npm run slice` writes `.slice-output/promotion.bundle` (gitignored). No credentials,
-no network, no deploys. Node 24 type-stripping runs the `.ts` sources directly.
+Notes:
 
-> Note: `node --test test/` (directory form) fails on this Node build
-> (`Cannot find module '…/test'`), so the `test` script uses the equivalent glob
-> `node --test "test/**/*.test.ts"`, which runs the identical test set.
+- `npm run slice` writes `.slice-output/promotion.bundle` (gitignored). No credentials,
+  no network, no deploys. Node 24 type-stripping runs the `.ts` sources directly.
+- `node --test test/` (directory form) fails on this Node build
+  (`Cannot find module '…/test'`), so the `test` script uses the equivalent glob
+  `node --test "test/**/*.test.ts"`, which runs the identical test set.
+- The slice's *outcomes* are deterministic (verdict ACCEPT, winner contender-1,
+  quarantine, replay consumed, bundle VERIFIED) but its *IDs* are fresh each run: task
+  hashes, nonces, tokens, and permit values differ run to run. Quote assertions, not hex.
+  See `docs/DEMO_SCRIPT.md`.
 
 ## The vertical slice
 
@@ -76,13 +114,33 @@ four blind verifiers (one reveals with the wrong nonce → inadmissible, no retr
    (correctness → regressions → security → blast radius → minimality), then blind
    2-of-3 vote → `ACCEPT` with contender-1 the unique dominant candidate.
 9. **Permit + promotion** — single-use exact-state permit; replay is a no-op
-   `ALREADY_CONSUMED` ACK; canonical head unchanged.
+   `ALREADY_CONSUMED` ACK; canonical head moves exactly once.
 10. **Attestation** — in-toto link → test result → verification result →
     authority predicate, all DSSE-signed into one bundle.
 11. **Offline verify** — `node src/cli/verify.ts` prints the exact 8-line
     transcript and exits 0 (`VERIFIED`) or 1 (`NOT VERIFIED`).
 
 Any unexpected outcome fails the slice with a non-zero exit and a clear message.
+
+## Honest limitations
+
+- **In-memory Artifacts stand-in.** `FakeArtifacts` implements the `ArtifactsPort`
+  interface (repos, scoped tokens, content-addressed commits, queue events) in memory.
+  Nothing touches real git, Cloudflare, or the network. The platform layer
+  (`src/do/TaskAuthority.ts`, `src/worker/index.ts`) is written against the port, so
+  production swaps in real Artifacts without changing protocol logic.
+- **Remote binding untested from this sandbox.** The port is written against the real
+  Artifacts API, but no live Cloudflare end-to-end run has happened from here yet —
+  that needs a direct-egress machine or deploy permission.
+- **Deterministic verifier stand-ins.** The slice's "contenders" and "verifiers" are
+  deterministic harness code, not LLMs. The ordering guarantees (commit before seeing
+  candidates, no retry after an invalid reveal) are real; the judgments are scripted.
+- **Ed25519 slice signer vs production Sigstore.** The slice signs with Ed25519; the
+  DSSE envelope shape is identical to production's Sigstore path.
+- **Frozen specs.** `../specs/` holds the protocol specs; specs 1, 3, and 5 are
+  FROZEN-v1 (amendment-only). Never silently change a frozen contract while
+  implementing — open a spec amendment with the failing invariant and the proposed
+  change instead.
 
 ## API surface
 
@@ -129,14 +187,26 @@ page. The full benchmark on real datasets (SWE-bench etc.) is future work.
 - **Blind verifiers.** Commit before seeing candidates; a wrong reveal is
   inadmissible, with no retry and no rewritten opinions.
 - **Evaluation plane isolation.** Contenders hold write tokens on their forks only —
-  never on the baseline, the evaluation material, policy, or the ledger. The slice
-  demonstrates a write attempt via a READ token → `SCOPE_DENIED`.
+  never on the baseline, the evaluation material, policy, or the ledger.
 - **Idempotent promotion.** The same permit presented twice returns
   `ALREADY_CONSUMED` (no-op ACK): no duplicate promotions, no duplicate effects,
   canonical head unchanged.
 - **Mechanical quarantine only.** Agent accusation is never a trigger; revocation
   cancels side effects, freezes evidence, and taints downstream. Quarantined state
   can never be promoted.
+
+## Docs
+
+- `docs/DEMO_SCRIPT.md` — 7-minute narrated demo: exact commands, expected output,
+  tamper-rejection showcase.
+- `docs/ARCHITECTURE.md` — system architecture, with a mermaid diagram and a rendered
+  SVG (`docs/architecture.svg`).
+- `docs/SECURITY.md` — threat model: the 13-attack battery, trust zones, credential
+  matrix, honest sandbox constraint, non-claims.
+- `docs/NAME_SHORTLIST.md` — public-name candidates with collision verdicts (nothing
+  renamed; decision pending).
+- `docs/SUBMISSION_CHECKLIST.md` — competition requirements mapped to repo locations,
+  plus remaining decisions.
 
 ## Layout
 
@@ -158,6 +228,7 @@ src/
   harness/        the vertical slice (src/harness/slice.ts)
   cli/            offline bundle verifier (src/cli/verify.ts)
 test/             unit tests + slice integration test
+docs/             submission docs (demo script, architecture, security, naming, checklist)
 ../specs/         FROZEN-v1 protocol specs (amendment-only)
 ```
 
