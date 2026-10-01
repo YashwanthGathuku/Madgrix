@@ -1,0 +1,895 @@
+/**
+ * Worker entry point for the seam platform layer (internal codename: seam —
+ * NOT a public brand).
+ *
+ * # What this file is
+ *
+ * FAITHFUL SKELETON. It MUST typecheck (strict, erasable syntax only) but
+ * it will NOT run end-to-end on this machine: workerd cannot reach the
+ * remote Artifacts binding through this sandbox's TLS egress proxy, and the
+ * Durable Object / Queue / Workflow runtime is not exercised here
+ * (see ../SETUP_STATUS.md). The full vertical slice runs locally via a Node
+ * harness driving the same pure logic (task-state.ts) and FakeArtifacts.
+ *
+ * # Architecture (spec 5)
+ *
+ * - Ingestion: Queue (at-least-once, unordered) → `queue()` → per-task
+ *   Durable Object (`TaskAuthority`) via POST /event → `event_key` dedupe →
+ *   authoritative state transition → `Effect[]` RETURNED (never executed by
+ *   the DO) → executed here by `executeEffects`.
+ * - `Env.ARTIFACTS` is the `ArtifactsPort` abstraction. `productionPort()`
+ *   adapts the raw runtime value ONCE at the edge: the real binding in
+ *   production (`BindingArtifactsPort`), a `FakeArtifacts` in the local
+ *   harness (which already implements the port).
+ * - Zone credentials (spec 3 §5): `issueContenderCredentials` (WRITE, own
+ *   fork only, ≤1h), `issueEvaluatorCredentials` (READ, per-evaluation),
+ *   verifiers get NONE.
+ * - The promotion service is the ONLY canonical writer (spec 3 §2). The
+ *   `/promote` route below is a skeleton that performs the platform-owned
+ *   preconditions (permit lookup, consumed check, quarantine check,
+ *   destination-HEAD check, tree check); the canonical write itself happens
+ *   in the merge sandbox with a merge-scoped token (spec 5 §7).
+ *
+ * No credentials in code or logs. No network calls from this module beyond
+ * the platform's own RPCs. Plaintext tokens are returned once in a response
+ * body and never logged.
+ */
+
+import type {
+	ArtifactsPort,
+	ArtifactsRepo,
+	CommitMetadata,
+	CreateRepoResult,
+	CreateTokenResult,
+	RepoListResult,
+	TokenInfo,
+	TokenScope,
+} from "../lib/artifacts-port.ts";
+import { forkIdempotent } from "../lib/artifacts-port.ts";
+import type { SimulatedGit } from "../lib/artifacts-port.ts";
+import { joinHashParts, randomHex, sha256Hex } from "../lib/canonical.ts";
+import type {
+	AuthorityState,
+	ContenderRecord,
+	EvaluationBundle,
+	PermitRecord,
+	PromotionOutcome,
+	QueuePushEvent,
+	TaskRecord,
+	WorkClaim,
+} from "../lib/types.ts";
+import { SELECTOR_POLICY_VERSION } from "../lib/types.ts";
+import type { Effect } from "../lib/task-state.ts";
+import { computePermitId, TaskAuthority } from "../do/TaskAuthority.ts";
+
+/** Re-exported so the runtime can register the Durable Object class from
+ *  the entry module (classic DO wiring). */
+export { TaskAuthority };
+
+/* ------------------------------------------------------------------ */
+/* Small HTTP helpers                                                  */
+/* ------------------------------------------------------------------ */
+
+function json(data: unknown, status: number = 200): Response {
+	return new Response(JSON.stringify(data), {
+		status,
+		headers: { "content-type": "application/json" },
+	});
+}
+
+async function readJsonBody(
+	request: Request,
+): Promise<{ ok: true; body: Record<string, unknown> } | { ok: false; response: Response }> {
+	try {
+		const body = (await request.json()) as Record<string, unknown>;
+		return { ok: true, body };
+	} catch {
+		return { ok: false, response: json({ error: "invalid_json" }, 400) };
+	}
+}
+
+function taskStub(env: Env, taskId: string): DoStub {
+	const ns = env.TASK_AUTHORITY;
+	return ns.get(ns.idFromName(taskId));
+}
+
+async function doRpc(
+	stub: DoStub,
+	path: string,
+	init?: { method?: string; body?: unknown },
+): Promise<{ ok: boolean; status: number; body: unknown }> {
+	const res = await stub.fetch(
+		new Request(`https://task-authority${path}`, {
+			method: init?.method ?? "POST",
+			headers: { "content-type": "application/json" },
+			body: init?.body === undefined ? undefined : JSON.stringify(init.body),
+		}),
+	);
+	let body: unknown = null;
+	try {
+		body = await res.json();
+	} catch {
+		body = null;
+	}
+	return { ok: res.ok, status: res.status, body };
+}
+
+/* ------------------------------------------------------------------ */
+/* Production port adapter: real binding → ArtifactsPort               */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Structural mirror of the REAL generated binding types
+ * (`Artifacts` / `ArtifactsRepo` in workerd types). Written out explicitly
+ * because @cloudflare/workers-types is not vendored here; production
+ * replaces this with the real imported types.
+ */
+interface RealTokenResult {
+	id: string;
+	plaintext: string;
+	scope: "read" | "write";
+	expiresAt: string;
+}
+interface RealTokenMeta {
+	id: string;
+	scope: "read" | "write";
+	state: "active" | "expired" | "revoked";
+	createdAt: string;
+	expiresAt: string;
+}
+interface RealCommitMeta {
+	hash: string;
+	treeHash: string;
+	parents: string[];
+	message: string;
+}
+interface RealArtifactsRepoBinding {
+	fork(
+		name: string,
+		opts?: { description?: string; readOnly?: boolean; defaultBranchOnly?: boolean },
+	): Promise<{ name: string; remote: string; token: string }>;
+	createToken(scope?: "read" | "write", ttl?: number): Promise<RealTokenResult>;
+	revokeToken(tokenOrId: string): Promise<boolean>;
+	listTokens(): Promise<{ tokens: RealTokenMeta[]; total: number }>;
+	log(opts?: { ref?: string; limit?: number; offset?: number }): Promise<RealCommitMeta[]>;
+	readCommit(hash: string): Promise<RealCommitMeta | null>;
+	info(): Promise<{ name: string; remote: string; defaultBranch: string }>;
+}
+interface RealArtifactsBinding {
+	create(
+		name: string,
+		opts?: { readOnly?: boolean; description?: string; setDefaultBranch?: string },
+	): Promise<{ name: string; remote: string; token: string }>;
+	get(name: string): Promise<RealArtifactsRepoBinding>;
+	list(opts?: {
+		limit?: number;
+		cursor?: string;
+	}): Promise<{
+		repos: Array<{ name: string; defaultBranch: string; createdAt: string; lastPushAt: string | null }>;
+		total: number;
+		cursor?: string;
+	}>;
+	delete(name: string): Promise<boolean>;
+}
+
+class BindingRepo implements ArtifactsRepo {
+	private binding: RealArtifactsRepoBinding;
+	private repoName: string;
+	private repoRemote: string;
+
+	constructor(binding: RealArtifactsRepoBinding, name: string, remote: string) {
+		this.binding = binding;
+		this.repoName = name;
+		this.repoRemote = remote;
+	}
+
+	get name(): string {
+		return this.repoName;
+	}
+	get remote(): string {
+		return this.repoRemote;
+	}
+
+	async fork(
+		name: string,
+		opts?: { description?: string; readOnly?: boolean; defaultBranchOnly?: boolean },
+	): Promise<CreateRepoResult> {
+		const r = await this.binding.fork(name, opts);
+		return { name: r.name, remote: r.remote, tokenPlaintext: r.token };
+	}
+
+	async createToken(scope: TokenScope = "write", ttl: number = 86400): Promise<CreateTokenResult> {
+		const t = await this.binding.createToken(scope, ttl);
+		return { id: t.id, plaintext: t.plaintext, scope: t.scope, expiresAt: t.expiresAt };
+	}
+
+	revokeToken(tokenOrId: string): Promise<boolean> {
+		return this.binding.revokeToken(tokenOrId);
+	}
+
+	async listTokens(): Promise<TokenInfo[]> {
+		const r = await this.binding.listTokens();
+		return r.tokens.map((t) => ({
+			id: t.id,
+			scope: t.scope,
+			state: t.state,
+			createdAt: t.createdAt,
+			expiresAt: t.expiresAt,
+		}));
+	}
+
+	async log(opts?: { ref?: string; limit?: number; offset?: number }): Promise<CommitMetadata[]> {
+		const entries = await this.binding.log(opts);
+		return entries.map((e) => ({
+			hash: e.hash,
+			treeHash: e.treeHash,
+			parents: e.parents,
+			message: e.message,
+		}));
+	}
+
+	async readCommit(hash: string): Promise<CommitMetadata | null> {
+		const e = await this.binding.readCommit(hash);
+		if (!e) return null;
+		return { hash: e.hash, treeHash: e.treeHash, parents: e.parents, message: e.message };
+	}
+
+	/** Convenience over log({ ref, limit: 1 }); no direct binding equivalent. */
+	async getHead(ref: string = "main"): Promise<string | null> {
+		const entries = await this.binding.log({ ref, limit: 1 });
+		return entries.length > 0 ? entries[0].hash : null;
+	}
+}
+
+/**
+ * 1:1 pass-through adapter: real Artifacts binding → ArtifactsPort.
+ * Every method maps to exactly one binding method (see ArtifactsPort JSDoc).
+ */
+class BindingArtifactsPort implements ArtifactsPort {
+	private binding: RealArtifactsBinding;
+
+	constructor(binding: RealArtifactsBinding) {
+		this.binding = binding;
+	}
+
+	async create(
+		name: string,
+		opts?: { readOnly?: boolean; description?: string; setDefaultBranch?: string },
+	): Promise<CreateRepoResult> {
+		const r = await this.binding.create(name, opts);
+		return { name: r.name, remote: r.remote, tokenPlaintext: r.token };
+	}
+
+	async get(name: string): Promise<ArtifactsRepo> {
+		const b = await this.binding.get(name);
+		const info = await b.info();
+		return new BindingRepo(b, info.name, info.remote);
+	}
+
+	async list(opts?: { limit?: number; cursor?: string }): Promise<RepoListResult> {
+		const r = await this.binding.list(opts);
+		return {
+			repos: r.repos.map((x) => ({
+				name: x.name,
+				defaultBranch: x.defaultBranch,
+				createdAt: x.createdAt,
+				lastPushAt: x.lastPushAt,
+			})),
+			total: r.total,
+			cursor: r.cursor,
+		};
+	}
+
+	delete(name: string): Promise<boolean> {
+		return this.binding.delete(name);
+	}
+}
+
+function isSimulatedGitPort(v: unknown): v is ArtifactsPort & SimulatedGit {
+	return (
+		typeof v === "object" &&
+		v !== null &&
+		typeof (v as { adminPush?: unknown }).adminPush === "function"
+	);
+}
+
+/**
+ * Resolve the platform's ArtifactsPort from the raw runtime value, once at
+ * the edge. Production: `env.ARTIFACTS` is the real binding → adapt it.
+ * Local harness: `env.ARTIFACTS` is a `FakeArtifacts` → already a port.
+ * (The declared `Env` type presents the port view; this function bridges
+ * the declared type and the raw runtime value.)
+ */
+function productionPort(env: Env): ArtifactsPort {
+	const raw: unknown = env.ARTIFACTS;
+	if (isSimulatedGitPort(raw)) return raw;
+	return new BindingArtifactsPort(raw as RealArtifactsBinding);
+}
+
+/* ------------------------------------------------------------------ */
+/* Zone credential helpers (spec 3 §5 — credential matrix)             */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Contender credentials: WRITE scope, THE FORK ONLY, short-lived (v1 ≤ 1h),
+ * minted at fork time. The contender MUST NOT hold any token for the
+ * baseline repo or the canonical repo — enforced structurally: we only
+ * ever mint on the fork handle.
+ * Plaintext is returned once; never log or persist it.
+ */
+export async function issueContenderCredentials(
+	port: ArtifactsPort,
+	forkRepoName: string,
+	ttlSeconds: number,
+): Promise<CreateTokenResult> {
+	if (!(ttlSeconds >= 1 && ttlSeconds <= 3600)) {
+		throw new Error(`contender token TTL must be within (0, 3600]s (spec 3 §5); got ${ttlSeconds}`);
+	}
+	const fork = await port.get(forkRepoName);
+	return fork.createToken("write", ttlSeconds);
+}
+
+/**
+ * Evaluator credentials: READ scope on the candidate repo, per-evaluation
+ * TTL. The evaluator gets NO write token of any kind (spec 3 §5). Binding
+ * tokens are repo-scoped; candidate-SHA pinning is enforced by the
+ * evaluation flow (readTreeAsToken / git fetch of the exact SHA), not by
+ * the token itself.
+ */
+export async function issueEvaluatorCredentials(
+	port: ArtifactsPort,
+	candidateRepoName: string,
+	ttlSeconds: number,
+): Promise<CreateTokenResult> {
+	const repo = await port.get(candidateRepoName);
+	return repo.createToken("read", ttlSeconds);
+}
+
+/**
+ * Verifiers (judges) get NO Git access at all (spec 3 §5: "Judge /
+ * verifiers — NO Git access"). They read evidence, not repos. This function
+ * exists so the "no credentials" rule is explicit in code rather than
+ * implicit by omission.
+ */
+export function verifierCredentials(): null {
+	return null;
+}
+
+/* ------------------------------------------------------------------ */
+/* Route logic (also called by Workflow steps)                         */
+/* ------------------------------------------------------------------ */
+
+/** POST /tasks — freeze a task and seed its task authority. */
+export async function handleCreateTask(env: Env, request: Request): Promise<Response> {
+	const parsed = await readJsonBody(request);
+	if (!parsed.ok) return parsed.response;
+	const { intent, baseline_repo, baseline_commit, behavior_contract } = parsed.body;
+	if (typeof intent !== "string" || intent === "") return json({ error: "intent_required" }, 400);
+	if (typeof baseline_repo !== "string" || baseline_repo === "") {
+		return json({ error: "baseline_repo_required" }, 400);
+	}
+	if (typeof baseline_commit !== "string" || baseline_commit === "") {
+		return json({ error: "baseline_commit_required" }, 400);
+	}
+
+	const port = productionPort(env);
+	let baselineRepo: ArtifactsRepo;
+	try {
+		baselineRepo = await port.get(baseline_repo);
+	} catch {
+		return json({ error: "baseline_repo_not_found", baseline_repo }, 404);
+	}
+	const baselineCommit = await baselineRepo.readCommit(baseline_commit);
+	if (baselineCommit === null) {
+		return json({ error: "baseline_commit_not_found", baseline_commit }, 404);
+	}
+
+	// Spec 1 §5: freeze the task; task_hash commits to the frozen record.
+	const frozen_at = new Date().toISOString();
+	const policy_version = SELECTOR_POLICY_VERSION;
+	const task_hash = await sha256Hex(
+		joinHashParts(intent, baseline_repo, baseline_commit, policy_version, frozen_at),
+	);
+	const task_id = `task_${randomHex(12)}`;
+	const task: TaskRecord = {
+		task_id,
+		task_hash,
+		intent,
+		baseline_repo,
+		baseline_commit,
+		behavior_contract: typeof behavior_contract === "string" ? behavior_contract : "",
+		policy_version,
+		frozen_at,
+	};
+
+	const res = await doRpc(taskStub(env, task_id), "/init", { body: { task } });
+	if (!res.ok) return json({ error: "authority_init_failed", detail: res.body }, 502);
+	return json({ task_id, task_hash, frozen_at }, 201);
+}
+
+/** POST /tasks/:id/claim — forward a WorkClaim to the task authority. */
+export async function handleClaim(env: Env, taskId: string, request: Request): Promise<Response> {
+	const parsed = await readJsonBody(request);
+	if (!parsed.ok) return parsed.response;
+	const claim = parsed.body["claim"] as WorkClaim | undefined;
+	if (!claim || typeof claim.work_id !== "string") {
+		return json({ error: "invalid_claim", detail: "body.claim must be a WorkClaim" }, 400);
+	}
+	const res = await doRpc(taskStub(env, taskId), "/claim", { body: { claim } });
+	return json(res.body, res.status);
+}
+
+/**
+ * POST /tasks/:id/contenders — idempotent contender fork (spec 5 §5).
+ * Fork op id = H(task_id, contender_id); the fork NAME is derived from it,
+ * so a retry converges to the existing fork (list-before-create). The
+ * contender gets a ≤1h WRITE token on the fork ONLY; the fork-creation
+ * token (default long TTL) is revoked immediately.
+ * The plaintext token is returned ONCE in the response body and never logged.
+ */
+export async function handleCreateContender(
+	env: Env,
+	taskId: string,
+	request: Request,
+): Promise<Response> {
+	const parsed = await readJsonBody(request);
+	if (!parsed.ok) return parsed.response;
+	const agent_id = parsed.body["agent_id"];
+	if (typeof agent_id !== "string" || agent_id === "") {
+		return json({ error: "agent_id_required" }, 400);
+	}
+
+	const stateRes = await doRpc(taskStub(env, taskId), "/state", { method: "GET" });
+	if (!stateRes.ok) return json({ error: "task_not_found", task_id: taskId }, 404);
+	const state = stateRes.body as AuthorityState;
+
+	const contender_id = (await sha256Hex(joinHashParts("contender", taskId, agent_id))).slice(0, 32);
+	const forkOpId = await sha256Hex(joinHashParts("fork", taskId, contender_id));
+	const forkName = forkOpId.slice(0, 32);
+
+	const port = productionPort(env);
+	const { repo, created, initialTokenPlaintext } = await forkIdempotent(
+		port,
+		state.task.baseline_repo,
+		forkName,
+	);
+	if (created && initialTokenPlaintext !== null) {
+		// The fork-creation token has the binding default TTL (24h) — too
+		// long for a contender. Revoke it; the contender gets a ≤1h token.
+		await repo.revokeToken(initialTokenPlaintext);
+	}
+	const credentials = await issueContenderCredentials(port, forkName, 3600);
+	const latest_commit = await repo.getHead();
+
+	const contender: ContenderRecord = {
+		contender_id,
+		agent_id,
+		fork_repo: forkName,
+		fork_lineage: { parent_repo: state.task.baseline_repo, parent_commit: state.task.baseline_commit },
+		token_id: credentials.id,
+		status: "forked",
+		claim_work_id: null,
+		latest_commit,
+	};
+	const reg = await doRpc(taskStub(env, taskId), "/contender", { body: { contender } });
+	if (!reg.ok) return json({ error: "contender_register_failed", detail: reg.body }, 502);
+
+	// NOTE: `credentials.plaintext` appears here exactly once — in the
+	// response body. It is never logged, never persisted.
+	return json(
+		{
+			contender_id,
+			fork_repo: forkName,
+			remote: repo.remote,
+			token: credentials.plaintext,
+			expires_at: credentials.expiresAt,
+			created: created,
+		},
+		created ? 201 : 200,
+	);
+}
+
+/**
+ * POST /tasks/:id/evidence — accept an evaluation bundle from the
+ * evaluation domain and record it in the task authority.
+ * SKELETON: currently accepts + records. Production MUST authenticate the
+ * caller as the evaluation domain (spec 3 §2) before recording — evidence
+ * is only admissible from the evaluation domain and committed verifiers
+ * (spec 3 §6, attack 6).
+ */
+export async function handleEvidence(env: Env, taskId: string, request: Request): Promise<Response> {
+	const parsed = await readJsonBody(request);
+	if (!parsed.ok) return parsed.response;
+	const bundle = parsed.body["bundle"] as EvaluationBundle | undefined;
+	if (!bundle || typeof bundle.candidate_sha !== "string") {
+		return json({ error: "invalid_bundle" }, 400);
+	}
+	// TODO: requireEvaluationDomain(request) — mTLS/service-token check that
+	// the caller is the evaluation domain. Without it, contender-supplied
+	// "evidence" would be admissible, violating spec 3 §6.
+	const res = await doRpc(taskStub(env, taskId), "/evidence", { body: { bundle } });
+	return json(res.body, res.status);
+}
+
+/**
+ * POST /tasks/:id/verdict — SKELETON. The verdict seam (spec 1 §9:
+ * non-compensatory AND gates, objective dominance, blind 2-of-3 verifier
+ * vote) is protocol-layer logic owned by the sibling. The platform exposes
+ * the route shape; computation is not implemented here.
+ */
+export async function handleVerdict(_env: Env, _taskId: string, _request: Request): Promise<Response> {
+	return json(
+		{
+			error: "not_implemented",
+			detail:
+				"verdict seam is protocol-layer (spec 1 §9; sibling-owned). Platform skeleton only.",
+		},
+		501,
+	);
+}
+
+/**
+ * POST /tasks/:id/promote — promotion preconditions, PLATFORM SKELETON.
+ * The promotion service is the ONLY canonical writer (spec 3 §2). This
+ * skeleton performs every platform-owned precondition check against the
+ * task authority + Artifacts, and stops before the canonical write:
+ * the write itself executes in the merge sandbox with a merge-scoped token
+ * (spec 5 §7), and permit consumption is a protocol-layer DO transition.
+ */
+export async function handlePromote(
+	env: Env,
+	taskId: string,
+	request: Request,
+): Promise<Response> {
+	const parsed = await readJsonBody(request);
+	if (!parsed.ok) return parsed.response;
+	const permit_id = parsed.body["permit_id"];
+	if (typeof permit_id !== "string" || permit_id === "") {
+		return json({ error: "permit_id_required" }, 400);
+	}
+
+	const stateRes = await doRpc(taskStub(env, taskId), "/state", { method: "GET" });
+	if (!stateRes.ok) return json({ error: "task_not_found", task_id: taskId }, 404);
+	const state = stateRes.body as AuthorityState;
+	const permit = (state.permits as Record<string, PermitRecord>)[permit_id];
+	if (!permit) {
+		return json({ outcome: "UNKNOWN_PERMIT" satisfies PromotionOutcome, permit_id }, 404);
+	}
+	if (permit.consumed) {
+		return json(
+			{ outcome: "ALREADY_CONSUMED" satisfies PromotionOutcome, permit_id },
+			409,
+		);
+	}
+	const quarantine = state.quarantine[permit.contender_id];
+	if (quarantine && quarantine.status === "QUARANTINED") {
+		return json(
+			{ outcome: "QUARANTINED_CANDIDATE" satisfies PromotionOutcome, permit_id },
+			409,
+		);
+	}
+
+	const port = productionPort(env);
+	const destRepo = await port.get(permit.destination_repo);
+	const currentHead = await destRepo.getHead();
+	if (currentHead === null || currentHead !== permit.expected_destination_head) {
+		// Spec 1 §10: the permit expires if the destination HEAD moved (TOCTOU closure).
+		return json(
+			{
+				outcome: "EXPIRED_HEAD_MOVED" satisfies PromotionOutcome,
+				permit_id,
+				expected_destination_head: permit.expected_destination_head,
+				current_destination_head: currentHead,
+			},
+			409,
+		);
+	}
+	const winnerCommit = await destRepo.readCommit(permit.winner_candidate_sha);
+	if (winnerCommit === null || winnerCommit.treeHash !== permit.winning_tree_sha256) {
+		// Spec 3 §6 attack 7: candidate swaps commit after evaluation.
+		return json({ outcome: "TREE_MISMATCH" satisfies PromotionOutcome, permit_id }, 409);
+	}
+
+	const recomputed = await computePermitId({
+		task_hash: permit.task_hash,
+		baseline_commit: permit.baseline_commit,
+		winning_tree_sha256: permit.winning_tree_sha256,
+		evaluation_bundle_hash: permit.evaluation_bundle_hash,
+		selector_policy_hash: permit.selector_policy_hash,
+		expected_destination_head: permit.expected_destination_head,
+	});
+
+	return json({
+		skeleton: true,
+		outcome: "WOULD_PROMOTE",
+		permit_id,
+		checks: {
+			permit_found: true,
+			not_consumed: true,
+			not_quarantined: true,
+			head_matches: true,
+			tree_matches: true,
+			permit_id_valid: recomputed === permit_id,
+		},
+		note: "All platform preconditions hold. Canonical write executes in the merge sandbox with a merge-scoped token (spec 5 §7); permit consumption is a protocol-layer DO transition (sibling).",
+	});
+}
+
+/** GET /tasks/:id/ledger — the task authority's append-only ledger. */
+export async function handleLedger(env: Env, taskId: string): Promise<Response> {
+	const res = await doRpc(taskStub(env, taskId), "/state", { method: "GET" });
+	if (!res.ok) return json({ error: "task_not_found", task_id: taskId }, 404);
+	const state = res.body as AuthorityState;
+	return json({ task_id: taskId, ledger: state.ledger });
+}
+
+/**
+ * GET /tasks/:id/attestation/:pid/verify — platform-level permit
+ * verification: recompute the permit id from its bound fields (spec 1 §10)
+ * and check consumption + destination HEAD. This is NOT the full spec-4
+ * attestation (in-toto + DSSE + Sigstore); that is protocol-layer.
+ */
+export async function handleVerifyAttestation(
+	env: Env,
+	taskId: string,
+	permitId: string,
+): Promise<Response> {
+	const stateRes = await doRpc(taskStub(env, taskId), "/state", { method: "GET" });
+	if (!stateRes.ok) return json({ error: "task_not_found", task_id: taskId }, 404);
+	const state = stateRes.body as AuthorityState;
+	const permit = (state.permits as Record<string, PermitRecord>)[permitId];
+	if (!permit) return json({ error: "unknown_permit", permit_id: permitId }, 404);
+
+	const recomputed = await computePermitId({
+		task_hash: permit.task_hash,
+		baseline_commit: permit.baseline_commit,
+		winning_tree_sha256: permit.winning_tree_sha256,
+		evaluation_bundle_hash: permit.evaluation_bundle_hash,
+		selector_policy_hash: permit.selector_policy_hash,
+		expected_destination_head: permit.expected_destination_head,
+	});
+
+	const port = productionPort(env);
+	let currentHead: string | null = null;
+	try {
+		currentHead = await (await port.get(permit.destination_repo)).getHead();
+	} catch {
+		currentHead = null;
+	}
+
+	return json({
+		permit_id: permitId,
+		permit_id_valid: recomputed === permitId,
+		consumed: permit.consumed,
+		consumed_at: permit.consumed_at,
+		expected_destination_head: permit.expected_destination_head,
+		current_destination_head: currentHead,
+		head_matches: currentHead === permit.expected_destination_head,
+		task_hash: permit.task_hash,
+		winner_candidate_sha: permit.winner_candidate_sha,
+		note: "Platform-level verification only. Full attestation (in-toto + DSSE + Sigstore) is spec 4, protocol-layer.",
+	});
+}
+
+/* ------------------------------------------------------------------ */
+/* Effect execution — the DO returns effects; THIS layer executes them  */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Execute the effects returned by the task authority's /event RPC.
+ * Called by the queue consumer (and, in production, by Workflow steps).
+ * The DO itself never executes side effects (spec 5 §3).
+ */
+export async function executeEffects(port: ArtifactsPort, effects: Effect[]): Promise<void> {
+	for (const effect of effects) {
+		switch (effect.kind) {
+			case "revoke_token": {
+				// Quarantine path (spec 3 §7): kill the contender's write token.
+				try {
+					const repo = await port.get(effect.repo);
+					await repo.revokeToken(effect.token_id);
+				} catch (err) {
+					console.warn(`executeEffects: revoke_token failed for ${effect.repo}:`, err);
+				}
+				break;
+			}
+			case "cancel_workflow": {
+				// SKELETON: Workflow instance cancellation belongs to the
+				// Workflow layer (workflow instance id → terminate). Logged
+				// here so a retry does not silently drop the intent.
+				console.warn(
+					`executeEffects: cancel_workflow skeleton — contender ${effect.contender_id}: no workflow runtime wired`,
+				);
+				break;
+			}
+			case "notify": {
+				// SKELETON: production routes to a notification channel.
+				console.log(`[notify] to=${effect.to.join(",")}: ${effect.message}`);
+				break;
+			}
+			case "canonical_write": {
+				// Canonical writes ONLY happen through the promote route /
+				// merge sandbox (spec 3 §2, spec 5 §7). An effect carrying a
+				// canonical write is a protocol-layer signal; executing it
+				// here would bypass the promotion service. Log and stop.
+				console.warn(
+					`executeEffects: canonical_write effect for ${effect.repo} NOT executed here — canonical writes go through the promotion service only`,
+				);
+				break;
+			}
+		}
+	}
+}
+
+/* ------------------------------------------------------------------ */
+/* fetch router                                                        */
+/* ------------------------------------------------------------------ */
+
+export async function fetch(request: Request, env: Env): Promise<Response> {
+	const url = new URL(request.url);
+	const parts = url.pathname.split("/").filter((p) => p !== "");
+
+	// POST /tasks
+	if (request.method === "POST" && parts.length === 1 && parts[0] === "tasks") {
+		return handleCreateTask(env, request);
+	}
+	// /tasks/:id/...
+	if (parts.length >= 3 && parts[0] === "tasks") {
+		const taskId = parts[1];
+		const action = parts[2];
+		if (request.method === "POST" && action === "claim" && parts.length === 3) {
+			return handleClaim(env, taskId, request);
+		}
+		if (request.method === "POST" && action === "contenders" && parts.length === 3) {
+			return handleCreateContender(env, taskId, request);
+		}
+		if (request.method === "POST" && action === "evidence" && parts.length === 3) {
+			return handleEvidence(env, taskId, request);
+		}
+		if (request.method === "POST" && action === "verdict" && parts.length === 3) {
+			return handleVerdict(env, taskId, request);
+		}
+		if (request.method === "POST" && action === "promote" && parts.length === 3) {
+			return handlePromote(env, taskId, request);
+		}
+		if (request.method === "GET" && action === "ledger" && parts.length === 3) {
+			return handleLedger(env, taskId);
+		}
+		if (
+			request.method === "GET" &&
+			action === "attestation" &&
+			parts.length === 5 &&
+			parts[4] === "verify"
+		) {
+			return handleVerifyAttestation(env, taskId, parts[3]);
+		}
+	}
+
+	return json({ error: "not_found", path: url.pathname }, 404);
+}
+
+/* ------------------------------------------------------------------ */
+/* Queue consumer — ingestion (spec 5 §2–§3)                           */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Queue consumer: each message is `{ task_id, event: QueuePushEvent }`.
+ * Forwards to the task's Durable Object (POST /event) for `event_key`
+ * dedupe + authoritative transition, then executes returned effects.
+ * Returns normally to ACK; throws only on genuine failure so the message
+ * is redelivered (spec 5 §10: MUST NOT drop the event).
+ */
+export async function queue(batch: QueueBatchLike, env: Env): Promise<void> {
+	const port = productionPort(env);
+	for (const msg of batch.messages) {
+		const { task_id, event } = msg.body as { task_id: string; event: QueuePushEvent };
+		if (typeof task_id !== "string" || !event || typeof event.repo !== "string") {
+			throw new Error("queue: malformed message body; redelivering will not help — drop manually");
+		}
+		const res = await doRpc(taskStub(env, task_id), "/event", { body: { event } });
+		if (!res.ok) {
+			throw new Error(`queue: DO /event failed for task ${task_id}: HTTP ${res.status}`);
+		}
+		const { outcome, effects } = res.body as {
+			outcome: string;
+			effects: Effect[];
+			event_key: string;
+		};
+		if (outcome !== "ACK_DUP" && outcome !== "APPLIED_NEW" && outcome !== "REJECTED_OUT_OF_ORDER") {
+			throw new Error(`queue: unexpected outcome ${outcome} for task ${task_id}`);
+		}
+		await executeEffects(port, effects ?? []);
+	}
+}
+
+/* ------------------------------------------------------------------ */
+/* PromotionWorkflow — SKELETON (spec 5 §5)                            */
+/* ------------------------------------------------------------------ */
+
+export interface PromotionWorkflowParams {
+	task_id: string;
+	agent_id: string;
+	candidate_sha?: string;
+	eval_policy_hash?: string;
+	destination_head?: string;
+}
+
+/** Structural stand-in for a Workflow step context. Production: the real
+ *  `WorkflowStep` from "cloudflare:workers"; this class then extends
+ *  `WorkflowEntrypoint<Env, PromotionWorkflowParams>`. */
+export interface WorkflowStepLike {
+	do<T>(name: string, fn: () => Promise<T>): Promise<T>;
+}
+
+/**
+ * SKELETON of the retryable promotion workflow. Step names ARE the
+ * idempotent operation ids from spec 5 §5, so a step retry after a partial
+ * failure converges to the same state instead of duplicating the effect:
+ *   fork     = H(task_id, contender_id)
+ *   evaluate = H(task_id, candidate_sha, eval_policy_hash)
+ *   promote  = H(task_id, candidate_sha, destination_head, policy_hash)
+ *            = permit_id (spec 1 §10)
+ * Step bodies call the SAME route logic as the HTTP handlers above.
+ */
+export class PromotionWorkflow {
+	async run(
+		event: { payload: PromotionWorkflowParams },
+		step: WorkflowStepLike,
+		env: Env,
+	): Promise<Record<string, unknown>> {
+		const p = event.payload;
+
+		const contender_id = (await sha256Hex(joinHashParts("contender", p.task_id, p.agent_id))).slice(
+			0,
+			32,
+		);
+		const forkOpId = await sha256Hex(joinHashParts("fork", p.task_id, contender_id));
+		const forked = await step.do(`fork/${forkOpId}`, async () => {
+			const res = await handleCreateContender(
+				env,
+				p.task_id,
+				new Request("https://workflow/contenders", {
+					method: "POST",
+					headers: { "content-type": "application/json" },
+					body: JSON.stringify({ agent_id: p.agent_id }),
+				}),
+			);
+			return (await res.json()) as unknown;
+		});
+
+		const evalOpId = p.candidate_sha
+			? await sha256Hex(joinHashParts("eval", p.task_id, p.candidate_sha, p.eval_policy_hash ?? ""))
+			: "pending";
+		const evaluated = await step.do(`evaluate/${evalOpId}`, async () => ({
+			status: "skeleton",
+			note: "Evaluation executes in the evaluation domain (spec 3 §4); bundles enter via POST /tasks/:id/evidence. Not implemented in the platform skeleton.",
+		}));
+
+		const promoteOpId = p.candidate_sha
+			? await sha256Hex(
+					joinHashParts(
+						"promote",
+						p.task_id,
+						p.candidate_sha,
+						p.destination_head ?? "",
+						SELECTOR_POLICY_VERSION,
+					),
+				)
+			: "pending";
+		const promoted = await step.do(`promote/${promoteOpId}`, async () => ({
+			status: "skeleton",
+			note: "Promotion executes via POST /tasks/:id/promote + the merge sandbox (spec 5 §7). Not implemented in the platform skeleton.",
+		}));
+
+		return { forked, evaluated, promoted };
+	}
+}
+
+/* ------------------------------------------------------------------ */
+/* Module-worker export shape                                           */
+/* ------------------------------------------------------------------ */
+
+export default {
+	fetch,
+	queue,
+};

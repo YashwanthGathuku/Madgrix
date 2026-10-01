@@ -1,3 +1,5 @@
 node_modules/
 .cloudflare/
 .DS_Store
+
+.slice-output/

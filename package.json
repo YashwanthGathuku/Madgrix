@@ -1,1 +1,24 @@
-{"description":"A governed promotion protocol for autonomous software agents, built on Cloudflare Workers + Artifacts.","devDependencies":{"@cloudflare/vite-plugin":"beta","cf":"^1.0.0-beta.10","typescript":"^7.0.2","vite":"^8.3.0"},"license":"MIT","name":"seam","private":true,"scripts":{"build":"cf build","dev":"cf dev","typecheck":"tsc --noEmit"},"type":"module","version":"0.1.0"}
+{
+  "description": "A governed promotion protocol for autonomous software agents, built on Cloudflare Workers + Artifacts.",
+  "devDependencies": {
+    "@cloudflare/vite-plugin": "beta",
+    "@types/node": "^26.6.3",
+    "cf": "^1.0.0-beta.10",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.0"
+  },
+  "license": "MIT",
+  "name": "seam",
+  "private": true,
+  "scripts": {
+    "build": "cf build",
+    "dev": "cf dev",
+    "typecheck": "tsc --noEmit",
+    "slice": "node src/harness/slice.ts",
+    "verify": "node src/cli/verify.ts",
+    "bench": "node src/lib/benchmark.ts",
+    "test": "node --test \"test/**/*.test.ts\""
+  },
+  "type": "module",
+  "version": "0.1.0"
+}
