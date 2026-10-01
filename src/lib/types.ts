@@ -171,7 +171,7 @@ export interface VerdictReport {
 	candidate_label: string;
 	verdict: VerifierVerdict;
 	reasons: string[];
-	/** Hex signature over canonical_json(report minus signature). */
+	/** Base64 signature over canonical_json(report minus signature). */
 	signature: string;
 	keyid: string;
 }
