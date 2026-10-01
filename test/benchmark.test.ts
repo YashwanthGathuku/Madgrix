@@ -11,7 +11,13 @@
  */
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { BENCHMARK_SEED, runBenchmark } from "../src/lib/benchmark.ts";
+import {
+	BENCHMARK_SEED,
+	formatSummary,
+	generateCandidateSet,
+	runBenchmark,
+	verifierAnonymizedLabels,
+} from "../src/lib/benchmark.ts";
 
 describe("benchmark harness (quick mode, synthetic)", () => {
 	it("report shape is complete per the frozen scope", async () => {
@@ -97,5 +103,59 @@ describe("benchmark harness (quick mode, synthetic)", () => {
 		assert.match(r.adversarial.showcase, /AUTHORIZED_TREE/);
 		assert.match(r.adversarial.showcase, /PRESENTED_TREE/);
 		assert.match(r.adversarial.showcase, /TREE_MISMATCH/);
+	});
+
+	it("seed threads through to the candidate sets (not silently ignored)", async () => {
+		// Same (seed, task) => identical sets.
+		const a = await generateCandidateSet(BENCHMARK_SEED, 0);
+		const b = await generateCandidateSet(BENCHMARK_SEED, 0);
+		assert.deepEqual(a, b);
+		// Different seed => different candidate sets (the seed option must
+		// actually change what the arms see, not just the bootstrap stream).
+		const c = await generateCandidateSet(424242, 0);
+		assert.notEqual(c.task_hash, a.task_hash, "custom seed must change task_hash");
+		assert.notDeepEqual(
+			c.candidates.map((x) => x.candidate_sha),
+			a.candidates.map((x) => x.candidate_sha),
+			"custom seed must change candidate shas",
+		);
+		// runBenchmark honors opts.seed end to end and records it.
+		const r = await runBenchmark({ quick: true, seed: 424242 });
+		assert.equal(r.seed, 424242);
+		const r2 = await runBenchmark({ quick: true, seed: 424242 });
+		assert.deepEqual(r.ordinary.arms, r2.ordinary.arms);
+	});
+
+	it("verifier anonymized labels are collision-free on sha-prefix collisions", () => {
+		// Three candidates sharing the first 4 hex nibbles must still get
+		// distinct anonymized labels (index-based, never sha-prefix-based).
+		const shas = [
+			"abcd" + "1".repeat(60),
+			"abcd" + "2".repeat(60),
+			"abcd" + "3".repeat(60),
+		];
+		const labels = verifierAnonymizedLabels(shas);
+		assert.equal(labels.size, 3, "one label per candidate even with colliding prefixes");
+		const labelSet = new Set(labels.keys());
+		assert.equal(labelSet.size, 3, "labels must be unique");
+		for (const [label, sha] of labels) {
+			assert.ok(shas.includes(sha), `label ${label} maps to a real candidate sha`);
+		}
+	});
+
+	it("every printed section carries the verbatim validation label", async () => {
+		const r = await runBenchmark({ quick: true });
+		assert.equal(r.validation_label, "harness validation, not evidence");
+		const summary = formatSummary(r);
+		assert.match(summary, /\[harness validation, not evidence\]/);
+		for (const line of summary.split("\n")) {
+			if (line.startsWith("--- ")) {
+				assert.match(
+					line,
+					/\[harness validation, not evidence\]/,
+					`section header must carry the label: ${line}`,
+				);
+			}
+		}
 	});
 });

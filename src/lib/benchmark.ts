@@ -96,9 +96,11 @@ export function mulberry32(seed: number): () => number {
 	};
 }
 
-/** Per-task stream: seed mixed with the task index (documented). */
-function taskRng(taskIdx: number): () => number {
-	return mulberry32((BENCHMARK_SEED ^ Math.imul(taskIdx + 1, 0x9e3779b9)) >>> 0);
+/** Per-task stream: seed mixed with the task index (documented). The seed is
+ *  threaded from BenchmarkOptions — a non-default seed changes the candidate
+ *  sets (regression-tested). */
+function taskRng(seed: number, taskIdx: number): () => number {
+	return mulberry32((seed ^ Math.imul(taskIdx + 1, 0x9e3779b9)) >>> 0);
 }
 
 /** Fixed timestamps keep every synthetic bundle hash reproducible. */
@@ -193,6 +195,8 @@ export interface BenchmarkReport {
 	mode: "quick" | "full";
 	seed: number;
 	generated_at: string;
+	/** Verbatim label — every harness-validation output carries it. */
+	validation_label: "harness validation, not evidence";
 	scope_note: string;
 	ordinary: OrdinaryStratum;
 	adversarial: AdversarialStratum;
@@ -244,8 +248,8 @@ const GATES_SYNTHETIC_OK: AdmissionGates = {
 	provenance_complete: true,
 };
 
-async function synthHex(label: string): Promise<string> {
-	return sha256Hex(`synthetic|${BENCHMARK_SEED}|${label}`);
+async function synthHex(seed: number, label: string): Promise<string> {
+	return sha256Hex(`synthetic|${seed}|${label}`);
 }
 
 /** Build a SYNTHETIC EvaluationBundle with a real bundle_hash. */
@@ -281,7 +285,8 @@ async function synthBundle(o: {
 
 /**
  * Generate ONE fixed candidate set of 3 for a task (frozen §2: the same
- * set feeds every arm). Deterministic per (seed, taskIdx).
+ * set feeds every arm). Deterministic per (seed, taskIdx). Exported for
+ * the determinism regression tests.
  *
  * Archetype assignment: ~75% of tasks get one `correct` candidate (the
  * rest plausible-wrong/broken); ~25% get NO correct candidate — those
@@ -290,13 +295,13 @@ async function synthBundle(o: {
  * tied `correct` candidate is added to exercise arm D's verifier-vote path
  * (otherwise dominance always short-circuits before the vote).
  */
-async function generateCandidateSet(taskIdx: number): Promise<{
+export async function generateCandidateSet(seed: number, taskIdx: number): Promise<{
 	candidates: SyntheticCandidate[];
 	task_hash: string;
 	oracle_available: boolean;
 }> {
-	const rng = taskRng(taskIdx);
-	const task_hash = await synthHex(`task-hash|${taskIdx}`);
+	const rng = taskRng(seed, taskIdx);
+	const task_hash = await synthHex(seed, `task-hash|${taskIdx}`);
 
 	const archetypes: Archetype[] = ["broken", "broken", "broken"];
 	const oracle_available = rng() >= 0.25;
@@ -319,8 +324,8 @@ async function generateCandidateSet(taskIdx: number): Promise<{
 	const candidates: SyntheticCandidate[] = [];
 	for (let i = 0; i < 3; i++) {
 		const arch = archetypes[i];
-		const candidate_sha = await synthHex(`candidate|${taskIdx}|${i}`);
-		const tree_sha256 = await synthHex(`tree|${taskIdx}|${i}`);
+		const candidate_sha = await synthHex(seed, `candidate|${taskIdx}|${i}`);
+		const tree_sha256 = await synthHex(seed, `tree|${taskIdx}|${i}`);
 		const contender_id = `synthetic-contender-t${taskIdx}c${i}`;
 		// What the arms SEE. The 5% hidden-oracle slip models residual
 		// oracle error: a plausible-wrong candidate is still WRONG (ground
@@ -411,6 +416,18 @@ function armCPick(candidates: SyntheticCandidate[]): ArmPick {
 }
 
 /**
+ * Anonymized verifier labels for a candidate list, keyed by candidate
+ * INDEX (never by a sha prefix: two candidates can share the first hex
+ * nibbles, which would silently merge their anonymized identities and
+ * misattribute verifier votes). Exported for the regression test.
+ */
+export function verifierAnonymizedLabels(candidateShas: string[]): Map<string, string> {
+	const m = new Map<string, string>();
+	candidateShas.forEach((sha, i) => m.set(`candidate-${i}`, sha));
+	return m;
+}
+
+/**
  * Arm D (our protocol): the REAL runVerdict from verdict-seam.ts over the
  * eligible set, with synthetic-but-admissible verifier reports — 3
  * verifiers, each voting per ground truth with a seeded 5% flip
@@ -434,8 +451,9 @@ async function armDPick(
 	// Synthetic-but-admissible reports over the eligible set, keyed by
 	// anonymized label; the caller maps label -> sha before the seam
 	// (mirrors the production construction; tallyVotes keys on sha).
-	const labelToSha = new Map<string, string>();
-	for (const c of candidates) labelToSha.set(`candidate-${c.candidate_sha.slice(0, 4)}`, c.candidate_sha);
+	// Labels are index-based (see verifierAnonymizedLabels) — colliding
+	// sha prefixes can never merge two candidates' votes.
+	const labelToSha = verifierAnonymizedLabels(candidates.map((c) => c.candidate_sha));
 	const reports: VerdictReport[] = [];
 	for (const c of candidates) {
 		for (const v of ["synthetic-verifier-1", "synthetic-verifier-2", "synthetic-verifier-3"]) {
@@ -447,7 +465,7 @@ async function armDPick(
 				: flip
 					? "accept"
 					: "reject";
-			const label = `candidate-${c.candidate_sha.slice(0, 4)}`;
+			const label = `candidate-${c.index}`;
 			reports.push({
 				verifier_id: v,
 				candidate_label: labelToSha.get(label) as string,
@@ -594,8 +612,8 @@ function pairedBootstrapCI(
 async function runOrdinaryStratum(taskCount: number, seed: number): Promise<OrdinaryStratum> {
 	const outcomes: TaskOutcome[] = [];
 	for (let t = 0; t < taskCount; t++) {
-		const { candidates, oracle_available } = await generateCandidateSet(t);
-		const rng = taskRng(t);
+		const { candidates, oracle_available } = await generateCandidateSet(seed, t);
+		const rng = taskRng(seed, t);
 		// Fixed per-task presentation order for arm B (seeded shuffle).
 		const order = [0, 1, 2];
 		for (let i = order.length - 1; i > 0; i--) {
@@ -727,7 +745,7 @@ const TRIVIAL_ANALYZER = () => ({ passed: true, findings: [] as string[] });
  * authority -> evaluation -> verdict seam (ACCEPT) -> permit issued.
  * Returns the state WITH the issued permit plus the bound values.
  */
-async function buildPromotionScenario(ctx: Ctx): Promise<{
+async function buildPromotionScenario(ctx: Ctx, seed: number): Promise<{
 	state: AuthorityState;
 	permit_id: string;
 	shaX: string;
@@ -736,8 +754,8 @@ async function buildPromotionScenario(ctx: Ctx): Promise<{
 }> {
 	let state = await miniAuthority();
 	const { task_hash } = state.task;
-	const shaX = await synthHex("adv|shaX");
-	const treeX = await synthHex("adv|treeX");
+	const shaX = await synthHex(seed, "adv|shaX");
+	const treeX = await synthHex(seed, "adv|treeX");
 	const bundle = await synthBundle({
 		taskIdx: 900,
 		candIdx: 0,
@@ -767,7 +785,7 @@ async function buildPromotionScenario(ctx: Ctx): Promise<{
 	);
 	expect(record.state === "ACCEPT", `expected ACCEPT verdict, got ${record.state}`);
 	expect(record.winner_sha === shaX, "winner must be shaX");
-	const headH1 = await synthHex("adv|headH1");
+	const headH1 = await synthHex(seed, "adv|headH1");
 	const { state: s3, permit } = await issuePermit(s2, shaX, "canonical", headH1, ctx);
 	return { state: s3, permit_id: permit.permit_id, shaX, treeX, headH1 };
 }
@@ -803,8 +821,8 @@ async function runAdversarialStratum(seed: number): Promise<AdversarialStratum> 
 	/* -- Attack 1: candidate deletes / modifies tests ---------------- */
 	await t(1, 1, "attack-01a test-deletion (manifest deleted)", async () => {
 		const bundle = await evaluateCandidate({
-			candidateSha: await synthHex("a1|sha"),
-			treeSha256: await synthHex("a1|tree"),
+			candidateSha: await synthHex(seed, "a1|sha"),
+			treeSha256: await synthHex(seed, "a1|tree"),
 			contenderId: "cont-a",
 			taskHash: "synthetic-task",
 			candidateTree: {},
@@ -828,8 +846,8 @@ async function runAdversarialStratum(seed: number): Promise<AdversarialStratum> 
 	});
 	await t(2, 1, "attack-01b test-modification (manifest altered)", async () => {
 		const bundle = await evaluateCandidate({
-			candidateSha: await synthHex("a1b|sha"),
-			treeSha256: await synthHex("a1b|tree"),
+			candidateSha: await synthHex(seed, "a1b|sha"),
+			treeSha256: await synthHex(seed, "a1b|tree"),
 			contenderId: "cont-a",
 			taskHash: "synthetic-task",
 			candidateTree: {},
@@ -889,31 +907,32 @@ async function runAdversarialStratum(seed: number): Promise<AdversarialStratum> 
 		const presented = { ...locked, hidden_seed: "0000" }; // attacker-modified
 		const presentedHash = await sha256Hex(canonicalJson(presented));
 		expect(lockedHash !== presentedHash, "config modification must change the locked hash");
-		// MAPPING (documented): no exact 'evaluator_config_modification' trigger exists in the
-		// frozen QuarantineTrigger union; the closest mechanical trigger is
-		// hidden_eval_boundary_violation — the evaluation domain's locked configuration is
-		// part of the hidden evaluation boundary (spec 3 §4). If the distinction matters,
-		// this is a spec-amendment candidate (see report).
+		// MECHANICAL TRIGGER (spec 3 §6 attack 3, §4.3 evaluator locking; amendment
+		// specs/amendments/evaluator-config-trigger.md): the pre-run locked-config
+		// hash mismatch is its own closed-union trigger — evaluator_config_modification —
+		// not hidden_eval_boundary_violation (which covers boundary crossings such
+		// as attack 4's hidden-material access).
 		const { state: q, effects } = await quarantineContender(
 			state,
 			"cont-a",
-			"hidden_eval_boundary_violation",
+			"evaluator_config_modification",
 			presentedHash,
 			ctx,
 		);
 		expect(q.quarantine["cont-a"]?.status === "QUARANTINED", "contender must be QUARANTINED");
+		expect(q.quarantine["cont-a"]?.trigger === "evaluator_config_modification", "quarantine must record the evaluator-config trigger");
 		expect(effects.some((e) => e.kind === "revoke_token"), "quarantine must revoke the fork token");
-		return `locked-config hash mismatch -> quarantineContender(hidden_eval_boundary_violation): QUARANTINED, token revoked.`;
+		return `locked-config hash mismatch -> quarantineContender(evaluator_config_modification): QUARANTINED, token revoked.`;
 	});
 	await t(6, 3, "attack-03b evaluator-config-mod (taint + no promotion)", async () => {
 		let state = await miniAuthority();
 		const { task_hash } = state.task;
-		const sha = await synthHex("a3b|sha");
+		const sha = await synthHex(seed, "a3b|sha");
 		const bundle = await synthBundle({
 			taskIdx: 901,
 			candIdx: 0,
 			candidate_sha: sha,
-			tree_sha256: await synthHex("a3b|tree"),
+			tree_sha256: await synthHex(seed, "a3b|tree"),
 			contender_id: "cont-a",
 			task_hash,
 			hiddenPassed: true,
@@ -923,7 +942,7 @@ async function runAdversarialStratum(seed: number): Promise<AdversarialStratum> 
 		});
 		state = await submitEvaluation(state, bundle, ctx);
 		const lockedHash = await sha256Hex(canonicalJson({ evaluator_version: "x" }));
-		const r = await quarantineContender(state, "cont-a", "hidden_eval_boundary_violation", lockedHash, ctx);
+		const r = await quarantineContender(state, "cont-a", "evaluator_config_modification", lockedHash, ctx);
 		state = r.state;
 		expect(state.evaluations[sha]?.tainted === true, "quarantine must taint the contender's evaluations");
 		const { record } = await runVerdictSeam(
@@ -1030,8 +1049,8 @@ async function runAdversarialStratum(seed: number): Promise<AdversarialStratum> 
 		const good = await synthBundle({
 			taskIdx: 902,
 			candIdx: 0,
-			candidate_sha: await synthHex("a6|sha"),
-			tree_sha256: await synthHex("a6|tree"),
+			candidate_sha: await synthHex(seed, "a6|sha"),
+			tree_sha256: await synthHex(seed, "a6|tree"),
 			contender_id: "cont-a",
 			task_hash,
 			hiddenPassed: false,
@@ -1057,8 +1076,8 @@ async function runAdversarialStratum(seed: number): Promise<AdversarialStratum> 
 		const good = await synthBundle({
 			taskIdx: 903,
 			candIdx: 0,
-			candidate_sha: await synthHex("a6b|sha"),
-			tree_sha256: await synthHex("a6b|tree"),
+			candidate_sha: await synthHex(seed, "a6b|sha"),
+			tree_sha256: await synthHex(seed, "a6b|tree"),
 			contender_id: "cont-a",
 			task_hash,
 			hiddenPassed: false,
@@ -1093,8 +1112,8 @@ async function runAdversarialStratum(seed: number): Promise<AdversarialStratum> 
 	/* -- Attack 7: commit swap X -> Y (THE SHOWCASE) ------------------- */
 	let showcase = "";
 	await t(13, 7, "attack-07a commit-swap X->Y (SHOWCASE: AUTHORIZED != CURRENT)", async () => {
-		const { state, permit_id, shaX, treeX, headH1 } = await buildPromotionScenario(ctx);
-		const treeY = await synthHex("adv|treeY-attacker");
+		const { state, permit_id, shaX, treeX, headH1 } = await buildPromotionScenario(ctx, seed);
+		const treeY = await synthHex(seed, "adv|treeY-attacker");
 		expect(treeY !== treeX, "test setup: treeY must differ from treeX");
 		const r = await attemptPromotion(state, permit_id, headH1, treeY, ctx);
 		expect(r.outcome === "TREE_MISMATCH", `expected TREE_MISMATCH, got ${r.outcome}`);
@@ -1109,8 +1128,8 @@ async function runAdversarialStratum(seed: number): Promise<AdversarialStratum> 
 		return `attemptPromotion(permit for X, presented tree Y) -> TREE_MISMATCH; permit not consumed, no effects.`;
 	});
 	await t(14, 7, "attack-07b commit-swap (legitimate retry still works)", async () => {
-		const { state, permit_id, treeX, headH1 } = await buildPromotionScenario(ctx);
-		const treeY = await synthHex("adv|treeY-attacker");
+		const { state, permit_id, treeX, headH1 } = await buildPromotionScenario(ctx, seed);
+		const treeY = await synthHex(seed, "adv|treeY-attacker");
 		const failed = await attemptPromotion(state, permit_id, headH1, treeY, ctx);
 		expect(failed.outcome === "TREE_MISMATCH", "setup: first attempt must fail");
 		const retry = await attemptPromotion(failed.state, permit_id, headH1, treeX, ctx);
@@ -1125,13 +1144,13 @@ async function runAdversarialStratum(seed: number): Promise<AdversarialStratum> 
 	/* -- Attack 8: old evaluation reuse ------------------------------- */
 	await t(15, 8, "attack-08a eval-reuse (relabeled bundle breaks hash)", async () => {
 		const { task_hash } = await miniTaskHash();
-		const shaX = await synthHex("a8|shaX");
-		const shaY = await synthHex("a8|shaY");
+		const shaX = await synthHex(seed, "a8|shaX");
+		const shaY = await synthHex(seed, "a8|shaY");
 		const good = await synthBundle({
 			taskIdx: 904,
 			candIdx: 0,
 			candidate_sha: shaX,
-			tree_sha256: await synthHex("a8|tree"),
+			tree_sha256: await synthHex(seed, "a8|tree"),
 			contender_id: "cont-a",
 			task_hash,
 			hiddenPassed: true,
@@ -1146,12 +1165,12 @@ async function runAdversarialStratum(seed: number): Promise<AdversarialStratum> 
 		return "Old evaluation presented for a new sha -> bundle_hash recompute fails -> ineligible. Evaluations are content-addressed to candidate_sha; reuse across shas is cryptographically defeated.";
 	});
 	await t(16, 8, "attack-08b eval-reuse (permit for unevaluated sha)", async () => {
-		const { state, shaX } = await buildPromotionScenario(ctx);
-		const shaNever = await synthHex("a8|never-evaluated");
+		const { state, shaX } = await buildPromotionScenario(ctx, seed);
+		const shaNever = await synthHex(seed, "a8|never-evaluated");
 		expect(shaNever !== shaX, "test setup");
 		let threw: unknown = null;
 		try {
-			await issuePermit(state, shaNever, "canonical", await synthHex("a8|head"), ctx);
+			await issuePermit(state, shaNever, "canonical", await synthHex(seed, "a8|head"), ctx);
 		} catch (err) {
 			threw = err;
 		}
@@ -1169,8 +1188,8 @@ async function runAdversarialStratum(seed: number): Promise<AdversarialStratum> 
 	});
 
 	/* -- Attack 9: promotion replay ----------------------------------- */
-	async function promoteOnce(): Promise<{ state: AuthorityState; permit_id: string; fake: FakeArtifacts; headAfter: string }> {
-		const { state, permit_id, treeX, headH1 } = await buildPromotionScenario(ctx);
+	async function promoteOnce(seed: number): Promise<{ state: AuthorityState; permit_id: string; fake: FakeArtifacts; headAfter: string }> {
+		const { state, permit_id, treeX, headH1 } = await buildPromotionScenario(ctx, seed);
 		const fake = new FakeArtifacts();
 		await fake.create("canonical");
 		// NOTE: the fake's commit ids are simulation SHAs; the authority already
@@ -1197,18 +1216,18 @@ async function runAdversarialStratum(seed: number): Promise<AdversarialStratum> 
 		return { state: promoted.state, permit_id, fake, headAfter };
 	}
 	await t(17, 9, "attack-09a promotion-replay (second present -> ALREADY_CONSUMED)", async () => {
-		const { state, permit_id } = await promoteOnce();
+		const { state, permit_id } = await promoteOnce(seed);
 		const consumedAt = state.permits[permit_id]?.consumed_at;
-		const replay = await attemptPromotion(state, permit_id, await synthHex("a9|head"), await synthHex("a9|tree"), ctx);
+		const replay = await attemptPromotion(state, permit_id, await synthHex(seed, "a9|head"), await synthHex(seed, "a9|tree"), ctx);
 		expect(replay.outcome === "ALREADY_CONSUMED", `expected ALREADY_CONSUMED, got ${replay.outcome}`);
 		expect(replay.effects.length === 0, "replay must produce no effects");
 		expect(replay.state.permits[permit_id]?.consumed_at === consumedAt, "consumed_at must not move");
 		return "Second presentation of the permit -> ALREADY_CONSUMED (no-op ACK), no effects, consumed_at unchanged. Zero duplicate promotions.";
 	});
 	await t(18, 9, "attack-09b promotion-replay (canonical head unchanged)", async () => {
-		const { state, permit_id, fake, headAfter } = await promoteOnce();
+		const { state, permit_id, fake, headAfter } = await promoteOnce(seed);
 		const before = await (await fake.get("canonical")).getHead("main");
-		const replay = await attemptPromotion(state, permit_id, headAfter, await synthHex("a9b|tree"), ctx);
+		const replay = await attemptPromotion(state, permit_id, headAfter, await synthHex(seed, "a9b|tree"), ctx);
 		expect(replay.outcome === "ALREADY_CONSUMED", "replay must be a no-op");
 		const after = await (await fake.get("canonical")).getHead("main");
 		expect(before === after && after === headAfter, "canonical HEAD must be unchanged by the replay");
@@ -1279,8 +1298,8 @@ async function runAdversarialStratum(seed: number): Promise<AdversarialStratum> 
 
 	/* -- Attack 12: destination HEAD moves after verdict --------------- */
 	await t(23, 12, "attack-12a head-moved (stale permit -> EXPIRED_HEAD_MOVED)", async () => {
-		const { state, permit_id, treeX, headH1 } = await buildPromotionScenario(ctx);
-		const headH2 = await synthHex("adv|headH2-moved");
+		const { state, permit_id, treeX, headH1 } = await buildPromotionScenario(ctx, seed);
+		const headH2 = await synthHex(seed, "adv|headH2-moved");
 		expect(headH2 !== headH1, "test setup: head must have moved");
 		const r = await attemptPromotion(state, permit_id, headH2, treeX, ctx);
 		expect(r.outcome === "EXPIRED_HEAD_MOVED", `expected EXPIRED_HEAD_MOVED, got ${r.outcome}`);
@@ -1289,8 +1308,8 @@ async function runAdversarialStratum(seed: number): Promise<AdversarialStratum> 
 		return "Destination HEAD moved after permit issue -> EXPIRED_HEAD_MOVED; permit unconsumed; task not promoted. Zero stale promotions.";
 	});
 	await t(24, 12, "attack-12b head-moved (fresh permit at new head promotes)", async () => {
-		const { state, permit_id, shaX, treeX, headH1 } = await buildPromotionScenario(ctx);
-		const headH2 = await synthHex("adv|headH2-moved");
+		const { state, permit_id, shaX, treeX, headH1 } = await buildPromotionScenario(ctx, seed);
+		const headH2 = await synthHex(seed, "adv|headH2-moved");
 		const stale = await attemptPromotion(state, permit_id, headH2, treeX, ctx);
 		expect(stale.outcome === "EXPIRED_HEAD_MOVED", "setup: stale attempt must fail");
 		const { state: s2, permit } = await issuePermit(stale.state, shaX, "canonical", headH2, ctx);
@@ -1612,6 +1631,7 @@ export async function runBenchmark(opts: BenchmarkOptions = {}): Promise<Benchma
 		mode,
 		seed,
 		generated_at: new Date().toISOString(),
+		validation_label: "harness validation, not evidence",
 		scope_note: SCOPE_NOTE,
 		ordinary,
 		adversarial,
@@ -1640,12 +1660,13 @@ export function formatSummary(r: BenchmarkReport): string {
 	const L: string[] = [];
 	L.push("=".repeat(72));
 	L.push("SEAM BENCHMARK HARNESS — SYNTHETIC / HARNESS-VALIDATION RUN");
+	L.push("[harness validation, not evidence]");
 	L.push("=".repeat(72));
 	L.push(`mode: ${r.mode} (${o.tasks} tasks x ${o.contenders_per_task} contenders) | seed: ${r.seed} | ${r.generated_at}`);
 	L.push("");
 	L.push("SCOPE: " + r.scope_note);
 	L.push("");
-	L.push("--- ORDINARY STRATUM (synthetic candidate sets, identical across arms) ---");
+	L.push("--- ORDINARY STRATUM (synthetic candidate sets, identical across arms) [harness validation, not evidence] ---");
 	L.push(`Oracle Availability: ${pct(o.oracle_availability)} (${o.oracle_tasks}/${o.tasks} tasks had >=1 correct candidate)`);
 	L.push("  [reported separately per spec §6.3 — never folded into regret]");
 	L.push("");
@@ -1668,7 +1689,7 @@ export function formatSummary(r: BenchmarkReport): string {
 			`— precommit >=25%: ${r.ordinary.meets_25pct_precommit_synthetic === null ? "N/A" : r.ordinary.meets_25pct_precommit_synthetic ? "PASS" : "FAIL"} (SYNTHETIC — reported, not exit-gated)`,
 	);
 	L.push("");
-	L.push("--- ADVERSARIAL STRATUM (real modules, zero-tolerance) ---");
+	L.push("--- ADVERSARIAL STRATUM (real modules, zero-tolerance) [harness validation, not evidence] ---");
 	L.push(`Trials: ${a.trials_passed}/${a.trials_total} passed — zero_tolerance_ok=${a.zero_tolerance_ok}`);
 	for (const t of a.results) {
 		L.push(`  [${t.passed ? "PASS" : "FAIL"}] trial ${String(t.trial).padStart(2)} (class ${t.attack_class}): ${t.name}`);
@@ -1676,7 +1697,7 @@ export function formatSummary(r: BenchmarkReport): string {
 	L.push("");
 	L.push(a.showcase);
 	L.push("");
-	L.push("--- CONFLICT STRATUM (as-measured, never manufactured) ---");
+	L.push("--- CONFLICT STRATUM (as-measured, never manufactured) [harness validation, not evidence] ---");
 	L.push(`Pairs: ${c.pairs} (construction labels: GREEN=${c.by_construction_label.green} AMBER=${c.by_construction_label.amber} RED-BLOCKED=${c.by_construction_label.red_blocked})`);
 	L.push(`Predicted: GREEN=${c.predicted.green} AMBER=${c.predicted.amber} RED=${c.predicted.red} BLOCKED=${c.predicted.blocked}`);
 	L.push(`TP=${c.true_positives} FP=${c.false_positives} TN=${c.true_negatives} FN=${c.false_negatives}`);
@@ -1684,13 +1705,14 @@ export function formatSummary(r: BenchmarkReport): string {
 	L.push(`recall   =${c.recall.toFixed(3)} 95%CI [${c.recall_ci[0].toFixed(3)}, ${c.recall_ci[1].toFixed(3)}]`);
 	L.push(`FPR      =${c.fpr.toFixed(3)} 95%CI [${c.fpr_ci[0].toFixed(3)}, ${c.fpr_ci[1].toFixed(3)}]`);
 	L.push("");
-	L.push("--- PRECOMMIT CHECKLIST (spec §8) ---");
+	L.push("--- PRECOMMIT CHECKLIST (spec §8) [harness validation, not evidence] ---");
 	for (const p of r.precommit_checklist) {
 		L.push(`[${p.status}] ${p.name}`);
 		L.push(`        ${p.note}`);
 	}
 	L.push("");
 	L.push(`EXIT: ${r.zero_tolerance_ok ? "0 (all zero-tolerance trials passed)" : "NON-ZERO (a zero-tolerance trial failed — see FAIL rows above)"}`);
+	L.push("[end of report — harness validation, not evidence]");
 	L.push("=".repeat(72));
 	return L.join("\n");
 }
