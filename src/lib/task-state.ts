@@ -22,13 +22,21 @@ import {
 	randomHex as defaultRandomHex,
 	sha256Hex as defaultSha256Hex,
 } from "./canonical.ts";
-import { checkPromotion, createPermit } from "./permit.ts";
+import { checkPromotion, buildPermitId, createPermit } from "./permit.ts";
 import { classifyPair, validateClaim, type ClaimInput } from "./claims.ts";
 import { verifyReveal } from "./verifiers.ts";
+import {
+	importEd25519PublicKey,
+	keyidForPublicKey,
+	quarantineDeterminationPayload,
+	verifierReportPayload,
+	verifyEd25519Signature,
+} from "./verifier-keys.ts";
 import { runVerdict, type RankedCandidate } from "./verdict-seam.ts";
 import { SELECTOR_POLICY_VERSION } from "./types.ts";
 import type {
 	AuthorityState,
+	CallerIdentity,
 	ConflictReport,
 	EvaluationBundle,
 	LedgerEntry,
@@ -42,6 +50,8 @@ import type {
 	VerdictRecord,
 	VerdictReport,
 	VerifierCommitment,
+	VerifierPublicKey,
+	TrustZone,
 	WorkClaim,
 } from "./types.ts";
 
@@ -104,6 +114,8 @@ export function createAuthority(task: TaskRecord): AuthorityState {
 		verdicts: [],
 		permits: {},
 		quarantine: {},
+		verifier_keys: {},
+		operator_keys: {},
 		candidate_labels: {},
 		seen_event_keys: [],
 		escalations: [],
@@ -124,6 +136,112 @@ export async function taskHashFor(
 	sha256Hex: (i: string | Uint8Array) => Promise<string>,
 ): Promise<string> {
 	return sha256Hex(canonicalJson(r));
+}
+
+/* ------------------------------------------------------------------ */
+/* Verifier + operator key registration (spec 1 §8, spec 1 §9.4).       */
+/*                                                                     */
+/* Keys are registered at TASK FREEZE, bound to verifier_id (verifiers) */
+/* or keyid (operator-of-record), and are IMMUTABLE afterwards: a       */
+/* second registration for the same id throws. Key-swap after           */
+/* registration would let an attacker replace a verifier's key and      */
+/* then forge that verifier's reports, so immutability is load-bearing. */
+/* ------------------------------------------------------------------ */
+
+/** Public-key material a caller supplies at registration (keyid is derived). */
+export interface NewVerifierKey {
+	verifier_id: string;
+	public_key_der_hex: string;
+}
+
+/**
+ * Register verifier public keys at task freeze. Each key is validated
+ * (must import as an Ed25519 SPKI key — fail closed on garbage) and bound
+ * to its verifier_id; the keyid is derived from the key material, never
+ * caller-supplied. Re-registering a verifier_id throws: keys are
+ * immutable once the task is frozen.
+ */
+export async function registerVerifierKeys(
+	state: AuthorityState,
+	keys: NewVerifierKey[],
+	ctx: Ctx,
+): Promise<AuthorityState> {
+	const registered: Record<string, VerifierPublicKey> = { ...(state.verifier_keys ?? {}) };
+	const seen = new Set<string>();
+	for (const k of keys) {
+		if (typeof k.verifier_id !== "string" || k.verifier_id === "")
+			throw new Error("registerVerifierKeys: verifier_id must be a non-empty string");
+		if (seen.has(k.verifier_id))
+			throw new Error(`registerVerifierKeys: duplicate verifier_id ${k.verifier_id} in one registration`);
+		seen.add(k.verifier_id);
+		if (registered[k.verifier_id])
+			throw new Error(
+				`registerVerifierKeys: key for verifier ${k.verifier_id} is already registered — keys are immutable once the task is frozen`,
+			);
+		let keyid: string;
+		try {
+			keyid = await keyidForPublicKey(k.public_key_der_hex, ctx.sha256Hex);
+			// Import validation: garbage that is not an Ed25519 SPKI key
+			// must not become a registered verifier key.
+			await importEd25519PublicKey(k.public_key_der_hex);
+		} catch (err) {
+			throw new Error(
+				`registerVerifierKeys: invalid public key for verifier ${k.verifier_id}: ${(err as Error).message}`,
+			);
+		}
+		registered[k.verifier_id] = {
+			verifier_id: k.verifier_id,
+			keyid,
+			public_key_der_hex: k.public_key_der_hex,
+		};
+	}
+	const s2: AuthorityState = { ...state, verifier_keys: registered };
+	return appendLedger(
+		s2,
+		"verifier_keys_registered",
+		{
+			verifiers: keys.map((k) => ({
+				verifier_id: k.verifier_id,
+				keyid: registered[k.verifier_id].keyid,
+			})),
+		},
+		ctx,
+	);
+}
+
+/**
+ * Register operator-of-record public keys at task freeze (spec 1 §9.4).
+ * Quarantine determinations (RELEASED/REVOKED) must carry a valid
+ * signature from a registered operator key. Same immutability rule as
+ * verifier keys. Stored keyed by keyid (derived from the key material).
+ */
+export async function registerOperatorKeys(
+	state: AuthorityState,
+	keys: { public_key_der_hex: string }[],
+	ctx: Ctx,
+): Promise<AuthorityState> {
+	const registered: Record<string, string> = { ...(state.operator_keys ?? {}) };
+	for (const k of keys) {
+		let keyid: string;
+		try {
+			keyid = await keyidForPublicKey(k.public_key_der_hex, ctx.sha256Hex);
+			await importEd25519PublicKey(k.public_key_der_hex);
+		} catch (err) {
+			throw new Error(`registerOperatorKeys: invalid public key: ${(err as Error).message}`);
+		}
+		if (registered[keyid])
+			throw new Error(
+				`registerOperatorKeys: operator key ${keyid.slice(0, 12)}… is already registered — keys are immutable once the task is frozen`,
+			);
+		registered[keyid] = k.public_key_der_hex;
+	}
+	const s2: AuthorityState = { ...state, operator_keys: registered };
+	return appendLedger(
+		s2,
+		"operator_keys_registered",
+		{ keyids: Object.keys(registered) },
+		ctx,
+	);
 }
 
 /* ------------------------------------------------------------------ */
@@ -230,21 +348,67 @@ export async function registerClaim(
 /* Evaluations (submitted by the evaluation domain only)                */
 /* ------------------------------------------------------------------ */
 
-/** Store an evaluation bundle. Bundles arrive only from the evaluation
- *  domain; contender-supplied "evidence" is inadmissible by construction
- *  (spec 3 §6 attack #6). Rejects bundles for a different task. */
+/**
+ * Zones allowed to submit evidence, per the spec 3 §5 credential matrix.
+ * Evidence is admissible ONLY from the evaluation domain (and committed
+ * verifiers submit their own reports through the separate verifier path).
+ * Contender-supplied "evidence" is inadmissible by construction
+ * (spec 3 §6 attack #6).
+ */
+const EVIDENCE_SUBMITTER_ZONES: ReadonlySet<TrustZone> = new Set(["evaluation_domain"]);
+
+export type SubmitEvaluationOutcome = "RECORDED" | "ACK_DUP";
+
+/**
+ * Store an evaluation bundle. The caller identity is checked against the
+ * credential matrix IN THE AUTHORITY (spec 3 §5): only the evaluation
+ * domain may submit evidence. Transport-level authentication of that
+ * identity is the edge's job — the DO/worker routes carry an explicit
+ * TODO where mTLS/service-token auth cannot exist locally — but the zone
+ * check itself is enforced here, so a misrouted or forged caller identity
+ * fails closed even if the edge is naive.
+ *
+ * Idempotency: re-submitting the identical bundle (same candidate_sha +
+ * bundle_hash, e.g. an evaluation-domain retry) is an ACK_DUP — no state
+ * change, no ledger entry. Submitting a DIFFERENT bundle for the same
+ * candidate_sha is a re-evaluation: it overwrites (RECORDED). A permit
+ * issued against the superseded bundle no longer verifies at promotion
+ * (spec 1 §11 check 4 → EVAL_BUNDLE_MISMATCH).
+ *
+ * Rejects bundles for a different task.
+ */
 export async function submitEvaluation(
 	state: AuthorityState,
 	bundle: EvaluationBundle,
+	caller: CallerIdentity,
 	ctx: Ctx,
-): Promise<AuthorityState> {
+): Promise<{ state: AuthorityState; outcome: SubmitEvaluationOutcome }> {
+	const zone = caller?.zone ?? "unknown";
+	if (!EVIDENCE_SUBMITTER_ZONES.has(zone)) {
+		if (zone === "contender") {
+			throw new Error(
+				"evidence rejected: caller zone 'contender' is not the evaluation domain — " +
+					"contender-supplied evidence is inadmissible by construction " +
+					"(spec 3 §5 credential matrix; spec 3 §6 attack #6)",
+			);
+		}
+		throw new Error(
+			`evidence rejected: caller zone '${zone}' is not authorized to submit evidence — ` +
+				"only the evaluation domain may submit (spec 3 §5 credential matrix)",
+		);
+	}
 	if (bundle.task_hash !== state.task.task_hash)
 		throw new Error("evaluation rejected: task_hash mismatch");
+	const existing = state.evaluations[bundle.candidate_sha];
+	if (existing && existing.bundle_hash === bundle.bundle_hash) {
+		// Idempotent retry of the same evaluation: converge, don't duplicate.
+		return { state, outcome: "ACK_DUP" };
+	}
 	const s2: AuthorityState = {
 		...state,
 		evaluations: { ...state.evaluations, [bundle.candidate_sha]: bundle },
 	};
-	return appendLedger(
+	const s3 = await appendLedger(
 		s2,
 		"evaluation_submitted",
 		{
@@ -252,9 +416,11 @@ export async function submitEvaluation(
 			bundle_hash: bundle.bundle_hash,
 			contender_id: bundle.contender_id,
 			eligible_hint: bundle.admission.exact_baseline,
+			submitted_by_zone: zone,
 		},
 		ctx,
 	);
+	return { state: s3, outcome: "RECORDED" };
 }
 
 /* ------------------------------------------------------------------ */
@@ -350,6 +516,19 @@ export async function revealVerifier(
  * Submit a signed VerdictReport. Requires a revealed (valid) commitment
  * for vr.verifier_id — a report without one is rejected outright.
  * One report per verifier.
+ *
+ * SIGNATURE ENFORCEMENT (spec 1 §8; spec 3 §6 attack #11): the authority
+ * holds the verifier's public key registered at task freeze
+ * (registerVerifierKeys) and verifies EVERY report:
+ *   - unknown verifier_id (no registered key) → rejected
+ *   - keyid not matching the registered key → rejected (wrong key)
+ *   - empty signature → rejected (unsigned)
+ *   - signature not verifying over canonical_json(report minus signature)
+ *     → rejected (forged or tampered payload)
+ * Each failure is a DISTINCT error so forensics can tell "never
+ * registered" from "forged". An attacker who squats a commitment or
+ * replays the commit→reveal dance without the private key gets no further:
+ * the report is inadmissible without a valid signature.
  */
 export async function submitVerifierReport(
 	state: AuthorityState,
@@ -362,6 +541,35 @@ export async function submitVerifierReport(
 		);
 	if (state.verdict_reports.some((r) => r.verifier_id === vr.verifier_id))
 		throw new Error(`report rejected: verifier ${vr.verifier_id} already reported (one report per verifier)`);
+	const registered: VerifierPublicKey | undefined = (state.verifier_keys ?? {})[vr.verifier_id];
+	if (!registered)
+		throw new Error(
+			`report rejected: unknown verifier_id "${vr.verifier_id}" — no verifier key registered for this task; ` +
+				`reports must be signed by a registered verifier key (spec 1 §8)`,
+		);
+	if (vr.keyid !== registered.keyid)
+		throw new Error(
+			`report rejected: keyid mismatch for verifier ${vr.verifier_id} — report carries keyid ` +
+				`${vr.keyid.slice(0, 12)}… but the registered key is ${registered.keyid.slice(0, 12)}… (wrong key)`,
+		);
+	if (!vr.signature)
+		throw new Error(
+			`report rejected: unsigned report from verifier ${vr.verifier_id} — verifier reports must be signed (spec 1 §8)`,
+		);
+	const payload = new TextEncoder().encode(
+		verifierReportPayload({
+			verifier_id: vr.verifier_id,
+			candidate_label: vr.candidate_label,
+			verdict: vr.verdict,
+			reasons: vr.reasons,
+			keyid: vr.keyid,
+		}),
+	);
+	const valid = await verifyEd25519Signature(registered.public_key_der_hex, payload, vr.signature);
+	if (!valid)
+		throw new Error(
+			`report rejected: signature verification failed for verifier ${vr.verifier_id} — forged or tampered report`,
+		);
 	const s2: AuthorityState = {
 		...state,
 		verdict_reports: [...state.verdict_reports, vr],
@@ -369,7 +577,13 @@ export async function submitVerifierReport(
 	return appendLedger(
 		s2,
 		"verifier_report_submitted",
-		{ verifier_id: vr.verifier_id, candidate_label: vr.candidate_label, verdict: vr.verdict },
+		{
+			verifier_id: vr.verifier_id,
+			candidate_label: vr.candidate_label,
+			verdict: vr.verdict,
+			keyid: vr.keyid,
+			signature_valid: true,
+		},
 		ctx,
 	);
 }
@@ -381,8 +595,6 @@ export async function submitVerifierReport(
 export interface CandidateEvidence {
 	contender_id: string;
 	candidate_sha: string;
-	tree_sha256: string;
-	bundle: EvaluationBundle;
 	blast_radius: number;
 	change_surface: number;
 }
@@ -393,20 +605,43 @@ export interface CandidateEvidence {
  * and routes task_status: ACCEPT/ABSTAIN → verdict_reached,
  * REJECT → rejected, ESCALATE → escalated (+ escalation record;
  * promotion BLOCKED while escalated).
+ *
+ * TRUST BOUNDARY: the caller names candidates (contender_id,
+ * candidate_sha) and supplies the control-plane-computed dominance
+ * dimensions (blast_radius, change_surface). The EVIDENCE ITSELF — the
+ * evaluation bundle — is resolved from the authority's own stored state,
+ * never taken from the caller. Evidence enters the authority only via
+ * submitEvaluation (zone-gated to the evaluation domain); the seam cannot
+ * be fed a caller-forged bundle, even by a compromised caller. A
+ * candidate with no stored evaluation, or whose stored bundle names a
+ * different contender, is a fail-closed error, not a silent skip.
  */
 export async function runVerdictSeam(
 	state: AuthorityState,
 	candidates: CandidateEvidence[],
 	ctx: Ctx,
 ): Promise<{ state: AuthorityState; record: VerdictRecord }> {
-	const ranked: RankedCandidate[] = candidates.map((c) => ({
-		contender_id: c.contender_id,
-		candidate_sha: c.candidate_sha,
-		tree_sha256: c.tree_sha256,
-		bundle: c.bundle,
-		blast_radius: c.blast_radius,
-		change_surface: c.change_surface,
-	}));
+	const ranked: RankedCandidate[] = candidates.map((c) => {
+		const bundle = state.evaluations[c.candidate_sha];
+		if (!bundle)
+			throw new Error(
+				`runVerdictSeam: no stored evaluation for candidate ${c.candidate_sha} — ` +
+					`evidence must be submitted by the evaluation domain before the verdict (spec 3 §6)`,
+			);
+		if (bundle.contender_id !== c.contender_id)
+			throw new Error(
+				`runVerdictSeam: stored evaluation for ${c.candidate_sha} names contender ` +
+					`${bundle.contender_id}, not ${c.contender_id} — refusing to mix evidence across contenders`,
+			);
+		return {
+			contender_id: c.contender_id,
+			candidate_sha: c.candidate_sha,
+			tree_sha256: bundle.tree_sha256,
+			bundle,
+			blast_radius: c.blast_radius,
+			change_surface: c.change_surface,
+		};
+	});
 	const quarantinedContenderIds = Object.values(state.quarantine)
 		.filter((q) => q.status === "QUARANTINED")
 		.map((q) => q.contender_id);
@@ -475,6 +710,27 @@ export async function issuePermit(
 		throw new Error("issuePermit: promotion BLOCKED — task is escalated (spec 1 §9.4)");
 	const ev = state.evaluations[winner_sha];
 	if (!ev) throw new Error(`issuePermit: no evaluation bundle for winner ${winner_sha}`);
+	// Idempotent issuance: the permit_id is deterministic over the bound
+	// fields (spec 5 §5: promote = permit_id is the idempotent operation
+	// id), so a retry of the issue step converges to the SAME record.
+	// CRITICAL: never overwrite an existing permit — a fresh record would
+	// reset consumed=false and resurrect a consumed permit, breaking
+	// single-use. Return the stored record unchanged (no ledger entry: an
+	// idempotent no-op is not a transition, mirroring ingestQueueEvent's
+	// ACK_DUP).
+	const permitId = await buildPermitId(
+		{
+			task_hash: state.task.task_hash,
+			baseline_commit: state.task.baseline_commit,
+			winning_tree_sha256: ev.tree_sha256,
+			evaluation_bundle_hash: ev.bundle_hash,
+			selector_policy_hash: ctx.selectorPolicyHash,
+			expected_destination_head: destination_head,
+		},
+		ctx.sha256Hex,
+	);
+	const existing = state.permits[permitId];
+	if (existing) return { state, permit: existing };
 	const permit = await createPermit(
 		{
 			task_hash: state.task.task_hash,
@@ -501,10 +757,14 @@ export async function issuePermit(
  * Attempt promotion with a permit (spec 1 §11), in order:
  * unknown → UNKNOWN_PERMIT; consumed → ALREADY_CONSUMED (no-op ACK, not
  * an error); expected_destination_head != current HEAD →
- * EXPIRED_HEAD_MOVED; tree mismatch → TREE_MISMATCH; winner's contender
- * quarantined → QUARANTINED_CANDIDATE (quarantine registry consulted per
- * spec 3 §7). Any failure → promotion ABORTED, permit NOT consumed, so a
- * legitimate retry after re-evaluation remains possible.
+ * EXPIRED_HEAD_MOVED; tree mismatch → TREE_MISMATCH; stored evaluation
+ * bundle hash != the permit's bound bundle hash → EVAL_BUNDLE_MISMATCH
+ * (spec 1 §11 check 4: the permit authorizes promotion under THIS exact
+ * evidence — a re-evaluation after issuance supersedes the old permit);
+ * winner's contender quarantined → QUARANTINED_CANDIDATE (quarantine
+ * registry consulted per spec 3 §7). Any failure → promotion ABORTED,
+ * permit NOT consumed, so a legitimate retry after re-evaluation remains
+ * possible.
  * On success: permit consumed (+consumed_at), task promoted, and the
  * single canonical_write effect for the platform layer to execute.
  */
@@ -528,6 +788,26 @@ export async function attemptPromotion(
 	if (!check.ok) {
 		const s2 = await appendLedger(state, "promotion_aborted", { permit_id, error: check.error }, ctx);
 		return { state: s2, outcome: check.error, effects: [] };
+	}
+	// Spec 1 §11 check (4): the permit binds evaluation_bundle_hash. If the
+	// candidate was re-evaluated after the permit was issued, the stored
+	// bundle no longer matches the bound evidence — the permit authorizes
+	// promotion under the OLD evidence only. Abort WITHOUT consuming, so a
+	// fresh permit issued after the re-evaluation can promote.
+	const storedBundle = state.evaluations[permit.winner_candidate_sha];
+	if (!storedBundle || storedBundle.bundle_hash !== permit.evaluation_bundle_hash) {
+		const s2 = await appendLedger(
+			state,
+			"promotion_aborted",
+			{
+				permit_id,
+				error: "EVAL_BUNDLE_MISMATCH",
+				permit_bundle_hash: permit.evaluation_bundle_hash,
+				stored_bundle_hash: storedBundle?.bundle_hash ?? null,
+			},
+			ctx,
+		);
+		return { state: s2, outcome: "EVAL_BUNDLE_MISMATCH", effects: [] };
 	}
 	const consumed: PermitRecord = { ...permit, consumed: true, consumed_at: ctx.now() };
 	const s2: AuthorityState = {
@@ -611,33 +891,105 @@ export async function quarantineContender(
 }
 
 /**
- * Operator-of-record review of a quarantine. RELEASED requires a note
- * that non-trivially asserts a mechanical false positive (enforced:
- * note.length >= 20 — a bare "ok" is not a determination) AND passing
- * re-verification (the platform re-runs verification; the release only
- * records the determination). REVOKED terminates the contender.
+ * The control plane's re-run of the mechanical check that fired the
+ * quarantine trigger (spec 1 §9.5: RELEASED requires "a determination of
+ * mechanical false positive plus passing re-verification"). Produced by
+ * the control plane re-executing the check — e.g. recomputing the locked
+ * evaluator-config digest, re-reading the test manifest, re-checking token
+ * scope — NOT by agent testimony.
+ */
+export interface QuarantineRecheck {
+	/** MUST equal the quarantine record's trigger. */
+	trigger: QuarantineTrigger;
+	/** true = the mechanical check now passes (the trigger was a false positive). */
+	passed: boolean;
+	detail: string;
+	checked_at: string;
+}
+
+/**
+ * The operator-of-record's signed determination on a quarantine review.
+ * The signature (Ed25519, base64) is over
+ * canonical_json({contender_id, trigger, decision, note}) and must verify
+ * against a key registered via registerOperatorKeys.
+ */
+export interface SignedDetermination {
+	note: string;
+	keyid: string;
+	signature: string;
+}
+
+/**
+ * Operator-of-record review of a quarantine (spec 1 §9.5, spec 3 §7).
+ *
+ * RELEASED requires BOTH:
+ *   (a) the re-run mechanical check passes (recheck.passed === true AND
+ *       recheck.trigger === the quarantine record's trigger — the
+ *       re-verification must re-run the check that actually fired), AND
+ *   (b) a valid operator-signed determination.
+ * If the re-check reproduces the violation, RELEASED is DENIED — the
+ * false-positive determination is contradicted by measurement, and the
+ * only honest path is REVOKED.
+ *
+ * REVOKED requires a valid operator-signed determination (the recheck must
+ * still name the firing trigger, so the review is anchored to the
+ * mechanical finding). Revocation terminates the contender and keeps the
+ * evidence taint.
+ *
  * A quarantined candidate state can NEVER be promoted; salvage is a new
  * SHA with full re-evaluation (spec 1 §9.5).
  */
 export async function reviewQuarantine(
 	state: AuthorityState,
 	contender_id: string,
-	reviewed_by: string,
 	decision: "RELEASED" | "REVOKED",
-	note: string,
+	recheck: QuarantineRecheck,
+	determination: SignedDetermination,
 	ctx: Ctx,
 ): Promise<{ state: AuthorityState }> {
 	const record = state.quarantine[contender_id];
 	if (!record) throw new Error(`review: no quarantine record for ${contender_id}`);
-	if (decision === "RELEASED" && note.length < 20)
+	if (record.status !== "QUARANTINED")
 		throw new Error(
-			"review: RELEASED requires a note of >= 20 characters asserting a mechanical false positive (spec 1 §9.5)",
+			`review: quarantine record for ${contender_id} is already ${record.status} — reviews are single-shot`,
+		);
+	if (recheck.trigger !== record.trigger)
+		throw new Error(
+			`review: recheck trigger "${recheck.trigger}" does not match the quarantine trigger ` +
+				`"${record.trigger}" — the re-verification must re-run the mechanical check that fired`,
+		);
+	const operatorKey: string | undefined = (state.operator_keys ?? {})[determination.keyid];
+	if (!operatorKey)
+		throw new Error(
+			`review: unknown operator keyid ${determination.keyid.slice(0, 12)}… — ` +
+				`determinations must be signed by a registered operator-of-record key (spec 1 §9.4)`,
+		);
+	if (!determination.note || determination.note.trim() === "")
+		throw new Error("review: a determination note is required — the operator must state the basis for the decision");
+	const payload = new TextEncoder().encode(
+		quarantineDeterminationPayload({
+			contender_id,
+			trigger: record.trigger,
+			decision,
+			note: determination.note,
+		}),
+	);
+	const sigValid = await verifyEd25519Signature(operatorKey, payload, determination.signature);
+	if (!sigValid)
+		throw new Error(
+			`review: operator determination signature invalid for ${contender_id} — refusing to act on an unsigned determination`,
+		);
+	if (decision === "RELEASED" && !recheck.passed)
+		throw new Error(
+			`review: RELEASED denied — the mechanical re-check reproduced the violation ` +
+				`(trigger: ${record.trigger}; detail: ${recheck.detail}); the false-positive ` +
+				`determination is contradicted by measurement. The honest path is REVOKED.`,
 		);
 	const updated: QuarantineRecord = {
 		...record,
 		status: decision,
-		reviewed_by,
-		review_note: note,
+		reviewed_by: determination.keyid,
+		review_note: determination.note,
 	};
 	const contender = state.contenders[contender_id];
 	const contenders = contender
@@ -668,7 +1020,14 @@ export async function reviewQuarantine(
 	const s3 = await appendLedger(
 		s2,
 		"quarantine_reviewed",
-		{ contender_id, decision, reviewed_by },
+		{
+			contender_id,
+			decision,
+			reviewed_by_keyid: determination.keyid,
+			trigger: record.trigger,
+			recheck_passed: recheck.passed,
+			recheck_detail: recheck.detail,
+		},
 		ctx,
 	);
 	return { state: s3 };

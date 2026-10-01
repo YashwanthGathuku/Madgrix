@@ -15,6 +15,7 @@
     "dev": "cf dev",
     "typecheck": "tsc --noEmit",
     "slice": "node src/harness/slice.ts",
+    "headmove": "node src/harness/head-move.ts",
     "verify": "node src/cli/verify.ts",
     "bench": "node src/lib/benchmark.ts",
     "test": "node --test \"test/**/*.test.ts\""

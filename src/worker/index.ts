@@ -407,7 +407,15 @@ export async function handleCreateTask(env: Env, request: Request): Promise<Resp
 		...task_record_fields,
 	};
 
-	const res = await doRpc(taskStub(env, task_id), "/init", { body: { task } });
+	// Verifier + operator keys are registered at task freeze (spec 1 §8,
+	// §9.4); the control plane supplies them with the create-task request
+	// and the DO registers them immutably. Both are optional arrays; the
+	// DO validates key material (fail closed on garbage).
+	const verifier_keys = parsed.body["verifier_keys"];
+	const operator_keys = parsed.body["operator_keys"];
+	const res = await doRpc(taskStub(env, task_id), "/init", {
+		body: { task, verifier_keys, operator_keys },
+	});
 	if (!res.ok) return json({ error: "authority_init_failed", detail: res.body }, 502);
 	return json({ task_id, task_hash, frozen_at }, 201);
 }
@@ -526,10 +534,16 @@ export async function handleEvidence(env: Env, taskId: string, request: Request)
 	if (!bundle || typeof bundle.candidate_sha !== "string") {
 		return json({ error: "invalid_bundle" }, 400);
 	}
-	// TODO: requireEvaluationDomain(request) — mTLS/service-token check that
-	// the caller is the evaluation domain. Without it, contender-supplied
-	// "evidence" would be admissible, violating spec 3 §6.
-	const res = await doRpc(taskStub(env, taskId), "/evidence", { body: { bundle } });
+	// Caller identity is enforced INSIDE the authority (zone check in
+	// submitEvaluation is what actually decides admissibility).
+	// TODO: requireEvaluationDomain(request) — mTLS/service-token check
+	// that the caller is the evaluation domain. Without it,
+	// contender-supplied "evidence" reaches the DO asserting whatever
+	// zone the body claims (spec 3 §6). The authority's fail-closed default
+	// ("unknown" zone) is the only defense until this is bound to real
+	// transport auth.
+	const caller = parsed.body["caller"] ?? { zone: "unknown" };
+	const res = await doRpc(taskStub(env, taskId), "/evidence", { body: { bundle, caller } });
 	return json(res.body, res.status);
 }
 
@@ -611,6 +625,20 @@ export async function handlePromote(
 		// Spec 3 §6 attack 7: candidate swaps commit after evaluation.
 		return json({ outcome: "TREE_MISMATCH" satisfies PromotionOutcome, permit_id }, 409);
 	}
+	const storedBundle = state.evaluations[permit.winner_candidate_sha];
+	if (!storedBundle || storedBundle.bundle_hash !== permit.evaluation_bundle_hash) {
+		// Spec 1 §11 check (4): the permit binds the exact evidence it was
+		// issued under — a re-evaluation after issuance supersedes it.
+		return json(
+			{
+				outcome: "EVAL_BUNDLE_MISMATCH" satisfies PromotionOutcome,
+				permit_id,
+				permit_bundle_hash: permit.evaluation_bundle_hash,
+				stored_bundle_hash: storedBundle?.bundle_hash ?? null,
+			},
+			409,
+		);
+	}
 
 	const recomputed = await computePermitId({
 		task_hash: permit.task_hash,
@@ -631,6 +659,7 @@ export async function handlePromote(
 			not_quarantined: true,
 			head_matches: true,
 			tree_matches: true,
+			evaluation_bundle_matches: true,
 			permit_id_valid: recomputed === permit_id,
 		},
 		note: "All platform preconditions hold. Canonical write executes in the merge sandbox with a merge-scoped token (spec 5 §7); permit consumption is a protocol-layer DO transition (sibling).",

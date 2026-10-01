@@ -13,9 +13,14 @@
  *   4. Simulated contender pushes (correct / off-by-one / test tampering).
  *   5. Queue ingestion: dedupe (ACK_DUP) + unknown-repo rejection.
  *   6. Evaluation domain: admission gates, hidden oracle, tamper →
- *      quarantine, token revocation enforced on the fake.
- *   7. Blind verifiers: commit → judge (anonymized) → reveal → report;
- *      one invalid reveal → inadmissible, no retry.
+ *      quarantine, token revocation enforced on the fake. Evidence is
+ *      admitted only from the evaluation domain (zone check inside the
+ *      authority); contender-zone callers are rejected.
+ *   7. Blind verifiers: keys registered at freeze → commit → judge
+ *      (anonymized) → reveal → report; every report carries an Ed25519
+ *      signature from the verifier's OWN key and the authority verifies it
+ *      against the registered key (wrong key / unsigned / forged →
+ *      rejected); one invalid reveal → inadmissible, no retry.
  *   8. Verdict seam → ACCEPT, winner = contender-1.
  *   9. Exact-state single-use permit; replay → ALREADY_CONSUMED.
  *  10. in-toto attestation chain → signed promotion bundle on disk.
@@ -29,7 +34,8 @@
  *         uses Sigstore; the DSSE envelope shape is identical).
  *   REAL: the task-state machine, claim validation + conflict graph,
  *         admission gates, evaluation bundle construction, blind-verifier
- *         commit/reveal mechanics, the verdict seam (gates → dominance →
+ *         commit/reveal mechanics + report signature verification against
+ *         registered keys, the verdict seam (gates → dominance →
  *         vote), exact-state permits, and the in-toto/DSSE attestation
  *         shapes — all production code paths, no slice-only forks.
  *
@@ -62,6 +68,8 @@ import {
 	issuePermit,
 	quarantineContender,
 	registerClaim,
+	registerOperatorKeys,
+	registerVerifierKeys,
 	revealVerifier,
 	runVerdictSeam,
 	submitEvaluation,
@@ -94,6 +102,7 @@ import { SELECTOR_POLICY_INPUT } from "../do/TaskAuthority.ts";
 import {
 	SELECTOR_POLICY_VERSION,
 	type AuthorityState,
+	type CallerIdentity,
 	type ContenderRecord,
 	type EvaluationBundle,
 	type QueuePushEvent,
@@ -244,6 +253,33 @@ export async function runSlice(opts: SliceOptions = {}): Promise<SliceResult> {
 	log(`task_id=${task_id}`);
 	log(`task_hash=${task_hash}`);
 	log(`behavior contract: "${behavior_contract}"`);
+
+	// KEY FREEZE (spec 1 §8, §9.4): every verifier's Ed25519 public key and
+	// the operator-of-record's key are registered NOW, bound to
+	// verifier_id, and are IMMUTABLE for the task's lifetime. From this
+	// point on, submitVerifierReport rejects any report not signed by the
+	// registered key — a forged report cannot be injected. Each verifier
+	// holds its own private key; the slice signer here is the harness's
+	// stand-in for per-verifier key custody (SIMULATION SUBSTRATE:
+	// production uses Sigstore per spec 4 §6; the DSSE envelope shape is
+	// identical, only the key backend differs).
+	const verifierSignerIds = ["verifier-1-correctness", "verifier-2-security", "verifier-3-minimality"];
+	const verifierSigners: Record<string, ReturnType<typeof createEd25519Signer>> = {};
+	for (const vid of verifierSignerIds) verifierSigners[vid] = createEd25519Signer();
+	state = await registerVerifierKeys(
+		state,
+		verifierSignerIds.map((verifier_id) => ({
+			verifier_id,
+			public_key_der_hex: verifierSigners[verifier_id].publicKeyDerHex,
+		})),
+		ctx,
+	);
+	const operatorSigner = createEd25519Signer();
+	state = await registerOperatorKeys(state, [{ public_key_der_hex: operatorSigner.publicKeyDerHex }], ctx);
+	log(
+		`keys frozen: ${verifierSignerIds.length} verifier keys + 1 operator key ` +
+			`(keyids immutable; reports/determinations must verify)`,
+	);
 
 	/* ================= [2] WORK CLAIMS ================= */
 	section("2/11", "WORK CLAIMS — registration + conflict classification");
@@ -523,7 +559,12 @@ export async function runSlice(opts: SliceOptions = {}): Promise<SliceResult> {
 			gates,
 			sha256Hex,
 		});
-		state = await submitEvaluation(state, bundle, ctx);
+		// Evidence enters the authority only from the evaluation domain
+		// (the zone check is enforced inside submitEvaluation, spec 3 §5).
+		const evalCaller: CallerIdentity = { zone: "evaluation_domain" };
+		const evalRes = await submitEvaluation(state, bundle, evalCaller, ctx);
+		check(evalRes.outcome === "RECORDED", `evidence for ${cid} must be RECORDED (got ${evalRes.outcome})`);
+		state = evalRes.state;
 		bundles[cid] = bundle;
 		log(
 			`${cid}: bundle ${short(bundle.bundle_hash)} — hidden_oracle ${bundle.hidden_oracle.passed ? "PASS" : "FAIL"} ` +
@@ -569,10 +610,13 @@ export async function runSlice(opts: SliceOptions = {}): Promise<SliceResult> {
 	log(`ASSERT: contender-3 QUARANTINED, token revoked, bundle tainted`);
 
 	/* ================= [7] BLIND VERIFIERS ================= */
-	section("7/11", "BLIND VERIFIERS — commit → anonymized judge → reveal → report");
-	// The slice Ed25519 signer. SIMULATION SUBSTRATE: production uses
-	// Sigstore per spec 4 §6; the DSSE envelope shape is identical, only
-	// the key backend differs. The key lives in the control plane only.
+	section("7/11", "BLIND VERIFIERS — commit → anonymized judge → reveal → signed report");
+	// The authority's attestation signer (in-toto envelopes, §10). This is
+	// NOT a verifier key — the verifiers' own signers were created and
+	// their keys registered at task freeze above. SIMULATION SUBSTRATE:
+	// production uses Sigstore per spec 4 §6; the DSSE envelope shape is
+	// identical, only the key backend differs. The key lives in the
+	// control plane only.
 	const signer = createEd25519Signer();
 
 	function makeVerifier(verifier_id: string, aspect: string): DeterministicVerifier {
@@ -662,19 +706,23 @@ export async function runSlice(opts: SliceOptions = {}): Promise<SliceResult> {
 		// Blind judging: anonymized label + bundle only.
 		const judged = v.judge(labelOf("contender-1"), bundles["contender-1"]);
 		log(`  judged ${labelOf("contender-1")} on aspect '${v.aspect}' → ${judged.verdict.toUpperCase()}`);
+		// Each verifier signs with ITS OWN key; the authority verifies the
+		// signature against the key registered for verifier_id at freeze.
+		const vSigner = verifierSigners[v.verifier_id];
 		const unsigned = {
 			verifier_id: v.verifier_id,
 			candidate_label: labelOf("contender-1"),
 			verdict: judged.verdict,
 			reasons: judged.reasons,
-			keyid: signer.keyid,
+			keyid: vSigner.keyid,
 		};
-		const sig = await signer.sign(new TextEncoder().encode(canonicalJson(unsigned)));
+		const sig = await vSigner.sign(new TextEncoder().encode(canonicalJson(unsigned)));
 		const report: VerdictReport = { ...unsigned, signature: sig.signature };
-		// The harness verifies the report signature before submission.
-		// (Observation: submitVerifierReport itself does not verify — the
-		// authority would need registered verifier keys for that.)
-		const sigOk = await signer.verify(
+		// The harness sanity-checks the signature before submission; the
+		// AUTHORITY re-verifies it in submitVerifierReport against the
+		// registered key — an unsigned, wrong-key, or forged report is
+		// rejected there (spec 1 §8).
+		const sigOk = await vSigner.verify(
 			new TextEncoder().encode(canonicalJson(unsigned)),
 			report.signature,
 			report.keyid,
@@ -739,11 +787,13 @@ export async function runSlice(opts: SliceOptions = {}): Promise<SliceResult> {
 		const tree = candidateTrees[cid];
 		return Object.keys(tree).filter((k) => tree[k] !== baselineTree[k]).length;
 	};
+	// NOTE: the caller names candidates and supplies the control-plane
+	// dominance dimensions (blast_radius, change_surface) — the EVIDENCE
+	// (evaluation bundles) is resolved from the authority's own stored
+	// state inside runVerdictSeam, never from caller-supplied objects.
 	const candidates: CandidateEvidence[] = contenderIds.map((cid) => ({
 		contender_id: cid,
 		candidate_sha: candidateShas[cid],
-		tree_sha256: state.evaluations[candidateShas[cid]].tree_sha256,
-		bundle: state.evaluations[candidateShas[cid]],
 		blast_radius: blastRadius(cid),
 		change_surface: changeSurface(cid),
 	}));

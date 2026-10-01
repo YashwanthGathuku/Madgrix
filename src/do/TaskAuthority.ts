@@ -29,6 +29,8 @@ import {
 	createAuthority,
 	ingestQueueEvent,
 	registerClaim,
+	registerOperatorKeys,
+	registerVerifierKeys,
 	submitEvaluation,
 	type Ctx,
 	type Effect,
@@ -36,6 +38,7 @@ import {
 } from "../lib/task-state.ts";
 import type {
 	AuthorityState,
+	CallerIdentity,
 	ContenderRecord,
 	EvaluationBundle,
 	QueuePushEvent,
@@ -140,12 +143,25 @@ export class TaskAuthority {
 			if (!task || typeof task.task_id !== "string" || typeof task.task_hash !== "string") {
 				return json({ error: "invalid_task", detail: "body.task must be a TaskRecord" }, 400);
 			}
+			// Optional: verifier + operator public keys, registered at task
+			// freeze (spec 1 §8, §9.4). Keys are immutable once registered.
+			const body = parsed.body as {
+				verifier_keys?: { verifier_id: string; public_key_der_hex: string }[];
+				operator_keys?: { public_key_der_hex: string }[];
+			};
+			const ctx = await productionCtx();
 			return this.doState.storage.transaction(async () => {
 				const existing = await this.loadState();
 				if (existing !== null) {
-					return json({ error: "already_initialized", task_id: existing.task.task_id }, 409);
+					return json({ error: "already_initialized", task_id: existing.task.task_id }, 404);
 				}
-				const state = createAuthority(task);
+				let state = createAuthority(task);
+				try {
+					state = await registerVerifierKeys(state, body.verifier_keys ?? [], ctx);
+					state = await registerOperatorKeys(state, body.operator_keys ?? [], ctx);
+				} catch (err) {
+					return json({ error: "key_registration_failed", detail: (err as Error).message }, 400);
+				}
 				await this.doState.storage.put(STATE_KEY, state);
 				return json({ task_id: task.task_id, task_hash: task.task_hash, initialized: true });
 			});
@@ -236,18 +252,27 @@ export class TaskAuthority {
 		if (request.method === "POST" && path === "/evidence") {
 			const parsed = await readJsonBody(request);
 			if (!parsed.ok) return parsed.response;
-			const bundle = (parsed.body as { bundle?: EvaluationBundle }).bundle;
-			if (!bundle || typeof bundle.candidate_sha !== "string") {
+			const body = parsed.body as { bundle?: EvaluationBundle; caller?: CallerIdentity };
+			if (!body.bundle || typeof body.bundle.candidate_sha !== "string") {
 				return json({ error: "invalid_bundle" }, 400);
 			}
+			// Caller identity is enforced INSIDE the authority (the zone
+			// check in submitEvaluation is what actually decides). Transport-
+			// level authentication of this claim is NOT yet verified here —
+			// TODO: bind to mTLS / service-token auth at the edge before
+			// production. Until then, an unauthenticated local caller defaults
+			// to "unknown", which submitEvaluation rejects (fail closed).
+			const caller: CallerIdentity = body.caller ?? { zone: "unknown" };
 			const ctx = await productionCtx();
 			return this.doState.storage.transaction(async () => {
 				const state = await this.loadState();
 				if (state === null) return json({ error: "not_initialized" }, 404);
 				try {
-					const next = await submitEvaluation(state, bundle, ctx);
+					const { state: next, outcome } = await submitEvaluation(state, body.bundle!, caller, ctx);
+					if (outcome === "ACK_DUP")
+						return json({ recorded: true, candidate_sha: body.bundle!.candidate_sha, outcome: "ACK_DUP" });
 					await this.doState.storage.put(STATE_KEY, next);
-					return json({ recorded: true, candidate_sha: bundle.candidate_sha });
+					return json({ recorded: true, candidate_sha: body.bundle!.candidate_sha });
 				} catch (err) {
 					return json({ error: "evidence_rejected", detail: (err as Error).message }, 422);
 				}

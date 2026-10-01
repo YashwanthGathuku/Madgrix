@@ -130,6 +130,54 @@ describe("runVerdict", () => {
 		assert.match(r.reasons.join(" "), /policy_valid/);
 	});
 
+	it("ANTI-COMPENSATION (vicious): ineligible candidate dominating every secondary + winning the verifier vote still loses", async () => {
+		// Candidate A: failed MANDATORY gates (security_policy failed AND
+		// no_eval_tampering false) but PERFECT secondaries — hidden oracle
+		// 10/10, zero blast radius, minimal change surface — plus a
+		// unanimous 3-verifier accept. A weighted/compensation scheme would
+		// crown A by a landslide.
+		const a = await makeBundle({
+			candidate_sha: "sha-a",
+			tree_sha256: "tree-a",
+			contender_id: "contender-a",
+			admission: { ...GATES_OK, no_eval_tampering: false },
+			security_policy: { passed: false, findings: ["hardcoded secret"] },
+			hidden_oracle: { passed: true, total: 10, failed: [] as string[] },
+		});
+		// Candidate B: eligible, but weak — barely-passing hidden oracle
+		// (6/10), huge blast radius, large change surface, no verifier
+		// reports at all.
+		const b = await makeBundle({
+			candidate_sha: "sha-b",
+			tree_sha256: "tree-b",
+			contender_id: "contender-b",
+			hidden_oracle: { passed: true, total: 10, failed: ["h1", "h2", "h3", "h4"] },
+		});
+		const aElig = await eligibility(a, sha256Hex);
+		assert.equal(aElig.eligible, false, "A must be ineligible");
+		assert.ok(aElig.failed.includes("policy_valid"), "A must fail policy_valid");
+		assert.ok(
+			aElig.failed.includes("evaluation_integrity_valid"),
+			"A must fail evaluation_integrity_valid",
+		);
+		const r = await runVerdict({
+			...BASE_INPUT,
+			candidates: [
+				candidate({ bundle: a, contender_id: "contender-a", blast_radius: 0, change_surface: 1 }),
+				candidate({ bundle: b, contender_id: "contender-b", blast_radius: 9, change_surface: 15 }),
+			],
+			reports: [
+				report("v1", "sha-a", "accept"),
+				report("v2", "sha-a", "accept"),
+				report("v3", "sha-a", "accept"),
+			],
+		});
+		// A is ineligible: its perfect secondaries and its 3 verifier
+		// accepts count for NOTHING. B — eligible, weakest possible — wins.
+		assert.equal(r.state, "ACCEPT");
+		assert.equal(r.winner_sha, "sha-b", "the eligible-but-weak candidate must win; no compensation");
+	});
+
 	it("no eligible candidate → REJECT with per-candidate gate reasons", async () => {
 		const b = await makeBundle({ admission: { ...GATES_OK, exact_baseline: false } });
 		const r = await runVerdict({ ...BASE_INPUT, candidates: [candidate({ bundle: b })], reports: [] });

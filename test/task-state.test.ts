@@ -17,6 +17,7 @@ import {
 	issuePermit,
 	quarantineContender,
 	registerClaim,
+	registerOperatorKeys,
 	revealVerifier,
 	reviewQuarantine,
 	runVerdictSeam,
@@ -24,9 +25,14 @@ import {
 	submitVerifierReport,
 	taskHashFor,
 	type Ctx,
+	type QuarantineRecheck,
+	type SignedDetermination,
 } from "../src/lib/task-state.ts";
+import { createEd25519Signer } from "../src/lib/signer-node.ts";
+import { quarantineDeterminationPayload } from "../src/lib/verifier-keys.ts";
 import type {
 	AuthorityState,
+	CallerIdentity,
 	ContenderRecord,
 	EvaluationBundle,
 	QueuePushEvent,
@@ -109,15 +115,14 @@ async function makeBundle(overrides: Partial<EvaluationBundle> = {}): Promise<Ev
 /** Drive a fresh authority to an ACCEPT verdict for one candidate. */
 async function authorityWithAccept(ctx: Ctx, bundle: EvaluationBundle) {
 	let state = stateWithContender(ctx);
-	state = await submitEvaluation(state, bundle, ctx);
+	const evalCaller: CallerIdentity = { zone: "evaluation_domain" };
+	state = (await submitEvaluation(state, bundle, evalCaller, ctx)).state;
 	const { state: s2, record } = await runVerdictSeam(
 		state,
 		[
 			{
 				contender_id: bundle.contender_id,
 				candidate_sha: bundle.candidate_sha,
-				tree_sha256: bundle.tree_sha256,
-				bundle,
 				blast_radius: 1,
 				change_surface: 1,
 			},
@@ -126,6 +131,35 @@ async function authorityWithAccept(ctx: Ctx, bundle: EvaluationBundle) {
 	);
 	assert.equal(record.state, "ACCEPT");
 	return s2;
+}
+
+/** Operator-key helpers for quarantine-review tests. */
+async function makeOperator() {
+	const signer = createEd25519Signer();
+	return {
+		signer,
+		keyid: signer.keyid,
+		publicKeyDerHex: signer.publicKeyDerHex,
+		async register(state: AuthorityState, ctx: Ctx) {
+			return registerOperatorKeys(state, [{ public_key_der_hex: signer.publicKeyDerHex }], ctx);
+		},
+		async determine(
+			contender_id: string,
+			trigger: "tool_status_fabrication",
+			decision: "RELEASED" | "REVOKED",
+			note: string,
+		): Promise<SignedDetermination> {
+			const payload = new TextEncoder().encode(
+				quarantineDeterminationPayload({ contender_id, trigger, decision, note }),
+			);
+			const sig = await signer.sign(payload);
+			return { note, keyid: signer.keyid, signature: sig.signature };
+		},
+	};
+}
+
+function makeRecheck(trigger: "tool_status_fabrication", passed: boolean, detail: string): QuarantineRecheck {
+	return { trigger, passed, detail, checked_at: "2026-10-01T19:00:00Z" };
 }
 
 describe("ingestQueueEvent", () => {
@@ -393,7 +427,7 @@ describe("quarantine", () => {
 		const ctx = makeCtx();
 		const bundle = await makeBundle();
 		let state = stateWithContender(ctx);
-		state = await submitEvaluation(state, bundle, ctx);
+		state = (await submitEvaluation(state, bundle, { zone: "evaluation_domain" }, ctx)).state;
 		const { state: qstate, effects } = await quarantineContender(
 			state,
 			"contender-1",
@@ -415,34 +449,87 @@ describe("quarantine", () => {
 		]);
 	});
 
-	it("RELEASED needs a substantive false-positive note; REVOKED terminates", async () => {
+	it("RELEASED requires a passing re-check of the firing trigger + signed determination; REVOKED terminates", async () => {
 		const ctx = makeCtx();
 		const bundle = await makeBundle();
 		let state = stateWithContender(ctx);
-		state = await submitEvaluation(state, bundle, ctx);
+		state = (await submitEvaluation(state, bundle, { zone: "evaluation_domain" }, ctx)).state;
+		const operator = await makeOperator();
+		state = await operator.register(state, ctx);
 		const q = await quarantineContender(state, "contender-1", "tool_status_fabrication", "ev", ctx);
+
+		// Unsigned determination (unknown keyid) → rejected, even with a passing re-check.
 		await assert.rejects(
-			reviewQuarantine(q.state, "contender-1", "operator", "RELEASED", "ok", ctx),
-			/>= 20 characters/,
+			reviewQuarantine(
+				q.state,
+				"contender-1",
+				"RELEASED",
+				makeRecheck("tool_status_fabrication", true, "re-run passes"),
+				{ note: "false positive", keyid: "unknown-keyid", signature: "bogus" },
+				ctx,
+			),
+			/unknown operator keyid/,
+		);
+
+		// Passing re-check + signed determination → RELEASED.
+		const relDet = await operator.determine(
+			"contender-1",
+			"tool_status_fabrication",
+			"RELEASED",
+			"re-verification shows the tool receipt was valid; trigger was a mechanical false positive",
 		);
 		const rel = await reviewQuarantine(
 			q.state,
 			"contender-1",
-			"operator",
 			"RELEASED",
-			"re-verification shows the tool receipt was valid; trigger was a mechanical false positive",
+			makeRecheck("tool_status_fabrication", true, "re-run of the tool-status check passes"),
+			relDet,
 			ctx,
 		);
 		assert.equal(rel.state.quarantine["contender-1"].status, "RELEASED");
 		assert.equal(rel.state.contenders["contender-1"].status, "released");
 		assert.equal(rel.state.evaluations["csha1"].tainted, false);
 
+		// Re-check reproduces the violation → RELEASED denied even with a valid signature.
+		const badRelDet = await operator.determine(
+			"contender-1",
+			"tool_status_fabrication",
+			"RELEASED",
+			"operator claims false positive anyway",
+		);
+		await assert.rejects(
+			reviewQuarantine(
+				q.state,
+				"contender-1",
+				"RELEASED",
+				makeRecheck("tool_status_fabrication", false, "re-run reproduces the fabricated receipt"),
+				badRelDet,
+				ctx,
+			),
+			/RELEASED denied/,
+		);
+
+		// Re-check naming the WRONG trigger → rejected (must re-run the check that fired).
+		const revDet = await operator.determine("contender-1", "tool_status_fabrication", "REVOKED", "confirmed fabrication");
+		await assert.rejects(
+			reviewQuarantine(
+				q.state,
+				"contender-1",
+				"REVOKED",
+				makeRecheck("eval_file_modification", true, "wrong trigger"),
+				revDet,
+				ctx,
+			),
+			/does not match the quarantine trigger/,
+		);
+
+		// REVOKED with a valid signed determination → terminates, keeps the taint.
 		const rev = await reviewQuarantine(
 			q.state,
 			"contender-1",
-			"operator",
 			"REVOKED",
-			"confirmed fabrication",
+			makeRecheck("tool_status_fabrication", false, "re-run reproduces the fabricated receipt"),
+			revDet,
 			ctx,
 		);
 		assert.equal(rev.state.quarantine["contender-1"].status, "REVOKED");
@@ -457,7 +544,7 @@ describe("quarantine", () => {
 		const ctx = makeCtx();
 		const bundle = await makeBundle();
 		let state = stateWithContender(ctx);
-		state = await submitEvaluation(state, bundle, ctx);
+		state = (await submitEvaluation(state, bundle, { zone: "evaluation_domain" }, ctx)).state;
 		const locked = { evaluator_version: "eval-domain/0.3.1", hidden_seed: "9f2c", policy: "strict" };
 		const lockedHash = await ctx.sha256Hex(canonicalJson(locked));
 		const presented = { ...locked, hidden_seed: "0000" }; // attacker-modified config

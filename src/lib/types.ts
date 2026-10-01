@@ -17,6 +17,44 @@
  */
 
 /* ------------------------------------------------------------------ */
+/* Trust zones & caller identity (spec 3 §2, §5 — credential matrix)    */
+/* ------------------------------------------------------------------ */
+
+/**
+ * The five trust zones (spec 3 §2) plus "unknown" for unauthenticated
+ * callers. The authority maps caller identity → zone → allowed actions;
+ * transport-level authentication of that identity is the edge's job
+ * (marked TODO where it cannot exist locally).
+ */
+export type TrustZone =
+	| "control_plane"
+	| "contender"
+	| "evaluation_domain"
+	| "verdict_plane"
+	| "promotion"
+	| "unknown";
+
+/** Who is invoking an authority transition. */
+export interface CallerIdentity {
+	zone: TrustZone;
+	/** Optional actor label for audit (contender_id, service name…). Never trusted for authorization. */
+	actor?: string;
+}
+
+/**
+ * A verifier's registered public key, bound to its verifier_id at task
+ * freeze (spec 1 §8). The authority rejects any report that is not signed
+ * by the registered key.
+ */
+export interface VerifierPublicKey {
+	verifier_id: string;
+	/** SHA-256 hex over the SPKI DER — derived from the key material. */
+	keyid: string;
+	/** SPKI DER of the Ed25519 public key, hex-encoded. */
+	public_key_der_hex: string;
+}
+
+/* ------------------------------------------------------------------ */
 /* Task                                                               */
 /* ------------------------------------------------------------------ */
 
@@ -219,6 +257,7 @@ export type PromotionOutcome =
 	| "ALREADY_CONSUMED"
 	| "EXPIRED_HEAD_MOVED"
 	| "TREE_MISMATCH"
+	| "EVAL_BUNDLE_MISMATCH"
 	| "QUARANTINED_CANDIDATE"
 	| "UNKNOWN_PERMIT";
 
@@ -292,6 +331,19 @@ export interface AuthorityState {
 	permits: Record<string, PermitRecord>;
 	/** Keyed by contender_id. */
 	quarantine: Record<string, QuarantineRecord>;
+	/**
+	 * Verifier public keys, keyed by verifier_id, registered at task freeze
+	 * (spec 1 §8). Every submitted VerdictReport must carry a valid
+	 * signature from the registered key — unsigned/forged reports are
+	 * rejected. Keys are immutable once registered.
+	 */
+	verifier_keys: Record<string, VerifierPublicKey>;
+	/**
+	 * Operator-of-record public keys, keyed by keyid, registered at task
+	 * freeze (spec 1 §9.4). Quarantine determinations (RELEASED/REVOKED)
+	 * must carry a valid signature from a registered operator key.
+	 */
+	operator_keys: Record<string, string>;
 	/**
 	 * Anonymized candidate label → candidate_sha, assigned by the control
 	 * plane when handing candidates to blind verifiers (spec 1 §8).

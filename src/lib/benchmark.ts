@@ -768,15 +768,13 @@ async function buildPromotionScenario(ctx: Ctx, seed: number): Promise<{
 		regressionsPassed: true,
 		regressionFailed: [],
 	});
-	state = await submitEvaluation(state, bundle, ctx);
+	state = (await submitEvaluation(state, bundle, { zone: "evaluation_domain" }, ctx)).state;
 	const { state: s2, record } = await runVerdictSeam(
 		state,
 		[
 			{
 				contender_id: "cont-a",
 				candidate_sha: shaX,
-				tree_sha256: treeX,
-				bundle,
 				blast_radius: 1,
 				change_surface: 1,
 			},
@@ -940,7 +938,7 @@ async function runAdversarialStratum(seed: number): Promise<AdversarialStratum> 
 			regressionsPassed: true,
 			regressionFailed: [],
 		});
-		state = await submitEvaluation(state, bundle, ctx);
+		state = (await submitEvaluation(state, bundle, { zone: "evaluation_domain" }, ctx)).state;
 		const lockedHash = await sha256Hex(canonicalJson({ evaluator_version: "x" }));
 		const r = await quarantineContender(state, "cont-a", "evaluator_config_modification", lockedHash, ctx);
 		state = r.state;
@@ -951,8 +949,6 @@ async function runAdversarialStratum(seed: number): Promise<AdversarialStratum> 
 				{
 					contender_id: "cont-a",
 					candidate_sha: sha,
-					tree_sha256: bundle.tree_sha256,
-					bundle: state.evaluations[sha],
 					blast_radius: 1,
 					change_surface: 1,
 				},
