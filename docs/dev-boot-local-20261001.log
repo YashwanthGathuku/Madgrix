@@ -1,0 +1,10 @@
+│  Delegating to npx vite
+
+  VITE v8.3.2  ready in 3039 ms
+
+  ➜  Local:   http://localhost:5173/
+  ➜  Network: use --host to expose
+  ➜  Debug:   http://localhost:5173/__debug
+11:01:11 PM [vite] server restarted.
+11:01:13 PM [vite] server restarted.
+11:01:16 PM [vite] server restarted.

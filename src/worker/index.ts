@@ -416,9 +416,26 @@ export async function handleCreateTask(env: Env, request: Request): Promise<Resp
 export async function handleClaim(env: Env, taskId: string, request: Request): Promise<Response> {
 	const parsed = await readJsonBody(request);
 	if (!parsed.ok) return parsed.response;
-	const claim = parsed.body["claim"] as WorkClaim | undefined;
-	if (!claim || typeof claim.work_id !== "string") {
-		return json({ error: "invalid_claim", detail: "body.claim must be a WorkClaim" }, 400);
+	// The contender supplies the claim INPUT (no work_id/status/version —
+	// the authority assigns those; see TaskAuthority POST /claim and
+	// ClaimInput = Omit<WorkClaim, "work_id"|"status"|"version">). The
+	// authority is the sole validator of the full shape; the edge only
+	// does a light structural check so malformed bodies fail fast.
+	const claim = parsed.body["claim"] as Record<string, unknown> | undefined;
+	if (
+		!claim ||
+		typeof claim !== "object" ||
+		"work_id" in claim ||
+		typeof claim["agent"] !== "string" ||
+		claim["agent"] === ""
+	) {
+		return json(
+			{
+				error: "invalid_claim",
+				detail: "body.claim must be a claim input (no work_id; the authority assigns it)",
+			},
+			400,
+		);
 	}
 	const res = await doRpc(taskStub(env, taskId), "/claim", { body: { claim } });
 	return json(res.body, res.status);
