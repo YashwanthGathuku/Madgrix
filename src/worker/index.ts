@@ -62,10 +62,11 @@ import { SELECTOR_POLICY_VERSION } from "../lib/types.ts";
 import type { Effect } from "../lib/task-state.ts";
 import { taskHashFor } from "../lib/task-state.ts";
 import { computePermitId, TaskAuthority } from "../do/TaskAuthority.ts";
+import { PromotionContainer } from "../do/PromotionContainer.ts";
 
 /** Re-exported so the runtime can register the Durable Object class from
  *  the entry module (classic DO wiring). */
-export { TaskAuthority };
+export { TaskAuthority, PromotionContainer };
 
 /* ------------------------------------------------------------------ */
 /* Small HTTP helpers                                                  */
@@ -92,6 +93,11 @@ async function readJsonBody(
 function taskStub(env: Env, taskId: string): DoStub {
 	const ns = env.TASK_AUTHORITY;
 	return ns.get(ns.idFromName(taskId));
+}
+
+function promotionStub(env: Env, permitId: string): DoStub {
+	const ns = env.PROMOTION_CONTAINER;
+	return ns.get(ns.idFromName(permitId));
 }
 
 async function doRpc(
@@ -667,57 +673,16 @@ export async function handlePromote(
 	if (!stateRes.ok) return json({ error: "task_not_found", task_id: taskId }, 404);
 	const state = stateRes.body as AuthorityState;
 	const permit = (state.permits as Record<string, PermitRecord>)[permit_id];
-	if (!permit) {
-		return json({ outcome: "UNKNOWN_PERMIT" satisfies PromotionOutcome, permit_id }, 404);
-	}
+	if (!permit) return json({ outcome: "UNKNOWN_PERMIT" satisfies PromotionOutcome, permit_id }, 404);
 	if (permit.consumed) {
-		return json(
-			{ outcome: "ALREADY_CONSUMED" satisfies PromotionOutcome, permit_id },
-			409,
-		);
+		return json({ outcome: "ALREADY_CONSUMED" satisfies PromotionOutcome, permit_id }, 200);
 	}
 	const quarantine = state.quarantine[permit.contender_id];
-	if (quarantine && quarantine.status === "QUARANTINED") {
-		return json(
-			{ outcome: "QUARANTINED_CANDIDATE" satisfies PromotionOutcome, permit_id },
-			409,
-		);
+	if (quarantine?.status === "QUARANTINED") {
+		return json({ outcome: "QUARANTINED_CANDIDATE" satisfies PromotionOutcome, permit_id }, 409);
 	}
-
-	const port = productionPort(env);
-	const destRepo = await port.get(permit.destination_repo);
-	const currentHead = await destRepo.getHead();
-	if (currentHead === null || currentHead !== permit.expected_destination_head) {
-		// Spec 1 §10: the permit expires if the destination HEAD moved (TOCTOU closure).
-		return json(
-			{
-				outcome: "EXPIRED_HEAD_MOVED" satisfies PromotionOutcome,
-				permit_id,
-				expected_destination_head: permit.expected_destination_head,
-				current_destination_head: currentHead,
-			},
-			409,
-		);
-	}
-	const winnerCommit = await destRepo.readCommit(permit.winner_candidate_sha);
-	if (winnerCommit === null || winnerCommit.treeHash !== permit.winning_tree_sha256) {
-		// Spec 3 §6 attack 7: candidate swaps commit after evaluation.
-		return json({ outcome: "TREE_MISMATCH" satisfies PromotionOutcome, permit_id }, 409);
-	}
-	const storedBundle = state.evaluations[permit.winner_candidate_sha];
-	if (!storedBundle || storedBundle.bundle_hash !== permit.evaluation_bundle_hash) {
-		// Spec 1 §11 check (4): the permit binds the exact evidence it was
-		// issued under — a re-evaluation after issuance supersedes it.
-		return json(
-			{
-				outcome: "EVAL_BUNDLE_MISMATCH" satisfies PromotionOutcome,
-				permit_id,
-				permit_bundle_hash: permit.evaluation_bundle_hash,
-				stored_bundle_hash: storedBundle?.bundle_hash ?? null,
-			},
-			409,
-		);
-	}
+	const contender = state.contenders[permit.contender_id];
+	if (!contender) return json({ error: "winner_contender_not_found", permit_id }, 409);
 
 	const recomputed = await computePermitId({
 		task_hash: permit.task_hash,
@@ -727,22 +692,108 @@ export async function handlePromote(
 		selector_policy_hash: permit.selector_policy_hash,
 		expected_destination_head: permit.expected_destination_head,
 	});
+	if (recomputed !== permit_id) return json({ error: "permit_id_invalid", permit_id }, 409);
 
-	return json({
-		skeleton: true,
-		outcome: "WOULD_PROMOTE",
-		permit_id,
-		checks: {
-			permit_found: true,
-			not_consumed: true,
-			not_quarantined: true,
-			head_matches: true,
-			tree_matches: true,
-			evaluation_bundle_matches: true,
-			permit_id_valid: recomputed === permit_id,
-		},
-		note: "All platform preconditions hold. Canonical write executes in the merge sandbox with a merge-scoped token (spec 5 §7); permit consumption is a protocol-layer DO transition (sibling).",
-	});
+	const storedBundle = state.evaluations[permit.winner_candidate_sha];
+	if (!storedBundle || storedBundle.bundle_hash !== permit.evaluation_bundle_hash) {
+		return json({
+			outcome: "EVAL_BUNDLE_MISMATCH" satisfies PromotionOutcome,
+			permit_id,
+			permit_bundle_hash: permit.evaluation_bundle_hash,
+			stored_bundle_hash: storedBundle?.bundle_hash ?? null,
+		}, 409);
+	}
+
+	const port = productionPort(env);
+	const sourceRepo = await port.get(contender.fork_repo);
+	const candidate = await sourceRepo.readCommit(permit.winner_candidate_sha);
+	if (candidate === null) {
+		return json({ outcome: "TREE_MISMATCH" satisfies PromotionOutcome, permit_id, detail: "candidate commit missing from contender repo" }, 409);
+	}
+	const destinationRepo = await port.get(permit.destination_repo);
+	const currentHead = await destinationRepo.getHead();
+	// Pre-check only. The Git push inside the trusted promotion container is
+	// the final compare-and-swap and catches a race after this read.
+	if (currentHead !== permit.expected_destination_head) {
+		// A retry after a successful push is reconciled by the promotion
+		// container, so only reject immediately when the permit cannot have
+		// been our own previous exact-state write.
+		// We do not know that deterministic commit id here; let the container
+		// compute it and distinguish ALREADY_WRITTEN from a foreign head move.
+	}
+
+	// The only credentials with canonical write authority are minted here and
+	// live for at most five minutes. They are never persisted or logged.
+	const sourceToken = await sourceRepo.createToken("read", 300);
+	const destinationToken = await destinationRepo.createToken("write", 300);
+	try {
+		const promoRes = await promotionStub(env, permit_id).fetch(
+			new Request("https://promotion/run", {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({
+					permit_id,
+					source_remote: sourceRepo.remote,
+					source_token: sourceToken.plaintext,
+					candidate_sha: permit.winner_candidate_sha,
+					destination_remote: destinationRepo.remote,
+					destination_token: destinationToken.plaintext,
+					expected_destination_head: permit.expected_destination_head,
+					winning_tree_sha256: permit.winning_tree_sha256,
+					issued_at: permit.issued_at,
+				}),
+			}),
+		);
+		const promotion = (await promoRes.json()) as {
+			outcome?: string;
+			promoted_sha?: string;
+			tree_sha256?: string;
+			parent?: string;
+			detail?: string;
+		};
+		if (!promoRes.ok) {
+			const status = promotion.outcome === "EXPIRED_HEAD_MOVED" || promotion.outcome === "TREE_MISMATCH" ? 409 : 502;
+			return json({ ...promotion, permit_id }, status);
+		}
+		if (
+			(promotion.outcome !== "PROMOTED" && promotion.outcome !== "ALREADY_WRITTEN") ||
+			promotion.tree_sha256 !== permit.winning_tree_sha256 ||
+			promotion.parent !== permit.expected_destination_head
+		) {
+			return json({ error: "promotion_container_invalid_result", permit_id, promotion }, 502);
+		}
+
+		// Consume the permit only AFTER the canonical write is known to exist.
+		// If this RPC is lost after the Git push, retry reconciliation returns
+		// ALREADY_WRITTEN and this same finalization safely runs again.
+		const finalized = await doRpc(taskStub(env, taskId), "/promotion/finalize", {
+			body: {
+				permit_id,
+				verified_parent: permit.expected_destination_head,
+				tree_sha256: permit.winning_tree_sha256,
+			},
+		});
+		if (!finalized.ok) {
+			return json({
+				error: "promotion_written_but_finalize_pending",
+				permit_id,
+				promoted_sha: promotion.promoted_sha,
+				detail: finalized.body,
+			}, 503);
+		}
+		return json({
+			outcome: "PROMOTED" satisfies PromotionOutcome,
+			permit_id,
+			promoted_sha: promotion.promoted_sha,
+			reconciled_existing_write: promotion.outcome === "ALREADY_WRITTEN",
+		});
+	} finally {
+		// Revocation is best-effort but happens even when Git/evaluation fails.
+		await Promise.allSettled([
+			sourceRepo.revokeToken(sourceToken.id),
+			destinationRepo.revokeToken(destinationToken.id),
+		]);
+	}
 }
 
 /** GET /tasks/:id/ledger — the task authority's append-only ledger. */
