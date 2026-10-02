@@ -25,11 +25,10 @@
  * - Zone credentials (spec 3 §5): `issueContenderCredentials` (WRITE, own
  *   fork only, ≤1h), `issueEvaluatorCredentials` (READ, per-evaluation),
  *   verifiers get NONE.
- * - The promotion service is the ONLY canonical writer (spec 3 §2). The
- *   `/promote` route below is a skeleton that performs the platform-owned
- *   preconditions (permit lookup, consumed check, quarantine check,
- *   destination-HEAD check, tree check); the canonical write itself happens
- *   in the merge sandbox with a merge-scoped token (spec 5 §7).
+ * - The promotion service is the ONLY canonical writer (spec 3 §2).
+ *   `/promote` validates authority state, mints short-lived Git credentials,
+ *   invokes the trusted promotion Container, and finalizes the permit only
+ *   after the exact reviewed candidate is canonical.
  *
  * No credentials in code or logs. No network calls from this module beyond
  * the platform's own RPCs. Plaintext tokens are returned once in a response
@@ -697,10 +696,8 @@ export async function handleEvaluatorCredentials(env: Env, taskId: string, reque
 /**
  * POST /tasks/:id/evidence — accept an evaluation bundle from the
  * evaluation domain and record it in the task authority.
- * SKELETON: currently accepts + records. Production MUST authenticate the
- * caller as the evaluation domain (spec 3 §2) before recording — evidence
- * is only admissible from the evaluation domain and committed verifiers
- * (spec 3 §6, attack 6).
+ * The Worker authenticates the evaluation-domain service identity before
+ * recording. Caller-supplied JSON cannot self-assert this trust zone.
  */
 export async function handleEvidence(env: Env, taskId: string, request: Request): Promise<Response> {
 	if (!(await requireEvaluationDomain(request, env))) {
@@ -1059,7 +1056,8 @@ export async function executeEffects(port: ArtifactsPort, effects: Effect[]): Pr
 				break;
 			}
 			case "notify": {
-				// SKELETON: production routes to a notification channel.
+				// Competition runner uses structured logs for operator notification;
+				// external paging/chat integration is optional post-competition hardening.
 				console.log(`[notify] to=${effect.to.join(",")}: ${effect.message}`);
 				break;
 			}
