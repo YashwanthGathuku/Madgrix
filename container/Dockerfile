@@ -7,8 +7,8 @@ RUN apt-get update \
 RUN git config --system protocol.version 2 \
     && git config --system init.defaultBranch main
 
-COPY container/promote.sh /opt/madgrix/promote.sh
-COPY container/copy-baseline.sh /opt/madgrix/copy-baseline.sh
+COPY promote.sh /opt/madgrix/promote.sh
+COPY copy-baseline.sh /opt/madgrix/copy-baseline.sh
 RUN chmod 0555 /opt/madgrix/promote.sh /opt/madgrix/copy-baseline.sh
 
 CMD ["sleep", "infinity"]
