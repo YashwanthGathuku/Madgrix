@@ -90,6 +90,8 @@ interface Env {
 	TASK_AUTHORITY: DoNamespace;
 	/** Secret used only at the Worker edge to authenticate evaluation-domain submissions. */
 	EVALUATION_SERVICE_TOKEN: string;
+	CONTROL_SERVICE_TOKEN: string;
+	AGENT_SERVICE_TOKEN: string;
 	PROMOTION_CONTAINER: DoNamespace;
 }
 
