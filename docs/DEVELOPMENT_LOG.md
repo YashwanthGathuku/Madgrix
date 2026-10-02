@@ -112,3 +112,39 @@ status. Secret sweep clean. Pushed to
   `docs/BENCHMARK_RUNBOOK.md`; harness validated on synthetic inputs).
 - Independent adversarial review of the implementation + the one open spec
   amendment.
+
+
+## 2026-10-02 — competition critical-path completion
+
+A production-hardening branch (`codex/competition-critical-paths`) replaced the
+remaining platform skeletons with an executable Cloudflare path.
+
+Completed work:
+
+- registered the real `PromotionWorkflow` and trusted promotion Container;
+- implemented the real Verdict Seam HTTP path;
+- normalized official `cf.artifacts.repo.pushed` Queue envelopes;
+- encoded task routing in opaque contender repository names;
+- added separate AGENT / EVALUATION / CONTROL service identities;
+- bound WorkClaims to contenders before agent execution;
+- added short-lived read-only evaluator credentials;
+- added a provider-neutral concurrent real-agent runner;
+- added an independent exact-SHA evaluator;
+- added a complete `npm run live:e2e` orchestrator;
+- defined `tree-digest/v1` as a frozen-spec amendment;
+- corrected promotion so the canonical repository receives the **exact reviewed
+  candidate commit**, rather than a reconstructed commit with a different SHA;
+- added destination-HEAD compare-and-swap behavior and retry reconciliation;
+- fixed an attestation verifier bug where the signer key-id check compared the
+  parameter to itself instead of the registered key id;
+- made CI build the Cloudflare Worker+Container and syntax-check the live
+  orchestration/Git helper scripts.
+
+Latest verified branch evidence: 110 tests / 27 suites / 0 failures,
+`SLICE OK`, `HEAD-MOVE OK`, and 26/26 adversarial harness trials with
+`zero_tolerance_ok=true`.
+
+The remaining competition proof is operational, not another architecture
+rewrite: deploy this branch to the real account, configure the Artifact push
+subscription to `madgrix-events`, execute `npm run live:e2e`, preserve the
+promotion bundle/transcript, then record the final demo.

@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - codex/**
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+      - name: Install
+        run: npm install
+      - name: Typecheck
+        run: npm run typecheck
+      - name: Cloudflare build
+        run: npm run build
+      - name: Validate live-run scripts
+        run: |
+          node --check scripts/run-contenders.mjs
+          node --check scripts/evaluate-candidate.ts
+          node --check scripts/live-e2e.ts
+          bash -n container/promote.sh
+          bash -n container/copy-baseline.sh
+      - name: Unit and integration tests
+        run: npm test
+      - name: Vertical slice
+        run: npm run slice
+      - name: Destination head-move scenario
+        run: npm run headmove
+      - name: Harness validation benchmark
+        run: npm run bench

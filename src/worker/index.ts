@@ -1,15 +1,16 @@
 /**
- * Worker entry point for the seam platform layer (internal codename: seam —
- * NOT a public brand).
+ * Worker entry point for MADGRIX.
  *
  * # What this file is
  *
- * FAITHFUL SKELETON. It MUST typecheck (strict, erasable syntax only) but
- * it will NOT run end-to-end on this machine: workerd cannot reach the
- * remote Artifacts binding through this sandbox's TLS egress proxy, and the
- * Durable Object / Queue / Workflow runtime is not exercised here
- * (see ../SETUP_STATUS.md). The full vertical slice runs locally via a Node
- * harness driving the same pure logic (task-state.ts) and FakeArtifacts.
+ * Production Cloudflare control-plane wiring for the competition path:
+ * Artifacts, Queue ingestion, per-task Durable Object authority, independent
+ * trust-zone identities, Verdict Seam execution, durable promotion Workflow,
+ * and exact-state canonical Git promotion through the trusted container.
+ *
+ * The local deterministic slice still uses FakeArtifacts for repeatable tests;
+ * scripts/live-e2e.ts is the real-infrastructure path and intentionally fails
+ * unless real Artifacts push events reach Queue → TaskAuthority.
  *
  * # Architecture (spec 5)
  *
@@ -24,16 +25,18 @@
  * - Zone credentials (spec 3 §5): `issueContenderCredentials` (WRITE, own
  *   fork only, ≤1h), `issueEvaluatorCredentials` (READ, per-evaluation),
  *   verifiers get NONE.
- * - The promotion service is the ONLY canonical writer (spec 3 §2). The
- *   `/promote` route below is a skeleton that performs the platform-owned
- *   preconditions (permit lookup, consumed check, quarantine check,
- *   destination-HEAD check, tree check); the canonical write itself happens
- *   in the merge sandbox with a merge-scoped token (spec 5 §7).
+ * - The promotion service is the ONLY canonical writer (spec 3 §2).
+ *   `/promote` validates authority state, mints short-lived Git credentials,
+ *   invokes the trusted promotion Container, and finalizes the permit only
+ *   after the exact reviewed candidate is canonical.
  *
  * No credentials in code or logs. No network calls from this module beyond
  * the platform's own RPCs. Plaintext tokens are returned once in a response
  * body and never logged.
  */
+
+import { WorkflowEntrypoint } from "cloudflare:workers";
+import type { WorkflowEvent, WorkflowStep } from "cloudflare:workers";
 
 import type {
 	ArtifactsPort,
@@ -48,6 +51,7 @@ import type {
 import { forkIdempotent } from "../lib/artifacts-port.ts";
 import type { SimulatedGit } from "../lib/artifacts-port.ts";
 import { joinHashParts, randomHex, sha256Hex } from "../lib/canonical.ts";
+import { contenderRepoName, normalizeArtifactQueueBody } from "../lib/artifact-events.ts";
 import type {
 	AuthorityState,
 	ContenderRecord,
@@ -62,10 +66,11 @@ import { SELECTOR_POLICY_VERSION } from "../lib/types.ts";
 import type { Effect } from "../lib/task-state.ts";
 import { taskHashFor } from "../lib/task-state.ts";
 import { computePermitId, TaskAuthority } from "../do/TaskAuthority.ts";
+import { PromotionContainer } from "../do/PromotionContainer.ts";
 
 /** Re-exported so the runtime can register the Durable Object class from
  *  the entry module (classic DO wiring). */
-export { TaskAuthority };
+export { TaskAuthority, PromotionContainer };
 
 /* ------------------------------------------------------------------ */
 /* Small HTTP helpers                                                  */
@@ -92,6 +97,11 @@ async function readJsonBody(
 function taskStub(env: Env, taskId: string): DoStub {
 	const ns = env.TASK_AUTHORITY;
 	return ns.get(ns.idFromName(taskId));
+}
+
+function promotionStub(env: Env, permitId: string): DoStub {
+	const ns = env.PROMOTION_CONTAINER;
+	return ns.get(ns.idFromName(permitId));
 }
 
 async function doRpc(
@@ -356,12 +366,49 @@ export function verifierCredentials(): null {
 	return null;
 }
 
+async function constantTimeTokenEqual(a: string, b: string): Promise<boolean> {
+	const enc = new TextEncoder();
+	const [ha, hb] = await Promise.all([
+		crypto.subtle.digest("SHA-256", enc.encode(a)),
+		crypto.subtle.digest("SHA-256", enc.encode(b)),
+	]);
+	const aa = new Uint8Array(ha);
+	const bb = new Uint8Array(hb);
+	let diff = aa.length ^ bb.length;
+	for (let i = 0; i < Math.min(aa.length, bb.length); i++) diff |= aa[i] ^ bb[i];
+	return diff === 0;
+}
+
+async function requireBearer(request: Request, configured: string | undefined): Promise<boolean> {
+	if (typeof configured !== "string" || configured.length < 16) return false;
+	const auth = request.headers.get("authorization") ?? "";
+	if (!auth.startsWith("Bearer ")) return false;
+	return constantTimeTokenEqual(auth.slice(7), configured);
+}
+
+async function requireControlPlane(request: Request, env: Env): Promise<boolean> {
+	return requireBearer(request, env.CONTROL_SERVICE_TOKEN);
+}
+
+async function requireAgentDomain(request: Request, env: Env): Promise<boolean> {
+	return requireBearer(request, env.AGENT_SERVICE_TOKEN);
+}
+
+async function requireAgentOrControl(request: Request, env: Env): Promise<boolean> {
+	return (await requireAgentDomain(request, env)) || (await requireControlPlane(request, env));
+}
+
+async function requireEvaluationDomain(request: Request, env: Env): Promise<boolean> {
+	return requireBearer(request, env.EVALUATION_SERVICE_TOKEN);
+}
+
 /* ------------------------------------------------------------------ */
 /* Route logic (also called by Workflow steps)                         */
 /* ------------------------------------------------------------------ */
 
 /** POST /tasks — freeze a task and seed its task authority. */
 export async function handleCreateTask(env: Env, request: Request): Promise<Response> {
+	if (!(await requireControlPlane(request, env))) return json({ error: "control_plane_auth_required" }, 401);
 	const parsed = await readJsonBody(request);
 	if (!parsed.ok) return parsed.response;
 	const { intent, baseline_repo, baseline_commit, behavior_contract } = parsed.body;
@@ -422,6 +469,7 @@ export async function handleCreateTask(env: Env, request: Request): Promise<Resp
 
 /** POST /tasks/:id/claim — forward a WorkClaim to the task authority. */
 export async function handleClaim(env: Env, taskId: string, request: Request): Promise<Response> {
+	if (!(await requireAgentOrControl(request, env))) return json({ error: "agent_auth_required" }, 401);
 	const parsed = await readJsonBody(request);
 	if (!parsed.ok) return parsed.response;
 	// The contender supplies the claim INPUT (no work_id/status/version —
@@ -462,34 +510,98 @@ export async function handleCreateContender(
 	taskId: string,
 	request: Request,
 ): Promise<Response> {
+	if (!(await requireAgentOrControl(request, env))) return json({ error: "agent_auth_required" }, 401);
 	const parsed = await readJsonBody(request);
 	if (!parsed.ok) return parsed.response;
 	const agent_id = parsed.body["agent_id"];
+	const claim_work_id = parsed.body["claim_work_id"];
 	if (typeof agent_id !== "string" || agent_id === "") {
 		return json({ error: "agent_id_required" }, 400);
+	}
+	if (claim_work_id !== undefined && (typeof claim_work_id !== "string" || claim_work_id === "")) {
+		return json({ error: "invalid_claim_work_id" }, 400);
 	}
 
 	const stateRes = await doRpc(taskStub(env, taskId), "/state", { method: "GET" });
 	if (!stateRes.ok) return json({ error: "task_not_found", task_id: taskId }, 404);
 	const state = stateRes.body as AuthorityState;
+	let boundClaimWorkId: string | null = null;
+	if (typeof claim_work_id === "string") {
+		const claim = state.claims.find((x) => x.work_id === claim_work_id);
+		if (!claim) return json({ error: "claim_not_found", claim_work_id }, 404);
+		if (claim.agent !== agent_id) {
+			return json({ error: "claim_agent_mismatch", claim_work_id, claim_agent: claim.agent, agent_id }, 409);
+		}
+		boundClaimWorkId = claim.work_id;
+	}
 
 	const contender_id = (await sha256Hex(joinHashParts("contender", taskId, agent_id))).slice(0, 32);
 	const forkOpId = await sha256Hex(joinHashParts("fork", taskId, contender_id));
-	const forkName = forkOpId.slice(0, 32);
+	const forkName = contenderRepoName(taskId, forkOpId);
 
 	const port = productionPort(env);
-	const { repo, created, initialTokenPlaintext } = await forkIdempotent(
+	const { repo, created, initialTokenPlaintext, viaImportFallback } = await forkIdempotent(
 		port,
 		state.task.baseline_repo,
 		forkName,
 	);
-	if (created && initialTokenPlaintext !== null) {
+
+	// Cloudflare's Artifacts beta fork endpoint is currently broken
+	// server-side. forkIdempotent falls back to creating an empty repo; when
+	// that happens we reproduce fork semantics by copying the frozen baseline
+	// commit through the trusted Git container before issuing a contender
+	// credential.
+	if (created && viaImportFallback) {
+		if (initialTokenPlaintext === null) {
+			return json({ error: "fork_fallback_missing_write_token", fork_repo: forkName }, 502);
+		}
+		const baseline = await port.get(state.task.baseline_repo);
+		const sourceToken = await baseline.createToken("read", 300);
+		try {
+			const copyRes = await promotionStub(env, `fork-${forkOpId}`).fetch(
+				new Request("https://promotion/copy-baseline", {
+					method: "POST",
+					headers: { "content-type": "application/json" },
+					body: JSON.stringify({
+						action: "copy_baseline",
+						op_id: forkOpId,
+						source_remote: baseline.remote,
+						source_token: sourceToken.plaintext,
+						source_commit: state.task.baseline_commit,
+						destination_remote: repo.remote,
+						destination_token: initialTokenPlaintext,
+					}),
+				}),
+			);
+			const copy = (await copyRes.json()) as { outcome?: string; head?: string; error?: string };
+			if (!copyRes.ok || (copy.outcome !== "IMPORTED" && copy.outcome !== "ALREADY_IMPORTED")) {
+				return json({ error: "fork_baseline_import_failed", detail: copy }, 502);
+			}
+			if (copy.head !== state.task.baseline_commit) {
+				return json({ error: "fork_baseline_head_mismatch", expected: state.task.baseline_commit, actual: copy.head }, 502);
+			}
+		} finally {
+			await Promise.allSettled([
+				baseline.revokeToken(sourceToken.id),
+				repo.revokeToken(initialTokenPlaintext),
+			]);
+		}
+	} else if (created && initialTokenPlaintext !== null) {
 		// The fork-creation token has the binding default TTL (24h) — too
 		// long for a contender. Revoke it; the contender gets a ≤1h token.
 		await repo.revokeToken(initialTokenPlaintext);
 	}
+
 	const credentials = await issueContenderCredentials(port, forkName, 3600);
 	const latest_commit = await repo.getHead();
+	if (latest_commit !== state.task.baseline_commit) {
+		await repo.revokeToken(credentials.id);
+		return json({
+			error: "contender_fork_not_at_frozen_baseline",
+			expected: state.task.baseline_commit,
+			actual: latest_commit,
+		}, 409);
+	}
 
 	const contender: ContenderRecord = {
 		contender_id,
@@ -498,7 +610,7 @@ export async function handleCreateContender(
 		fork_lineage: { parent_repo: state.task.baseline_repo, parent_commit: state.task.baseline_commit },
 		token_id: credentials.id,
 		status: "forked",
-		claim_work_id: null,
+		claim_work_id: boundClaimWorkId,
 		latest_commit,
 	};
 	const reg = await doRpc(taskStub(env, taskId), "/contender", { body: { contender } });
@@ -519,64 +631,184 @@ export async function handleCreateContender(
 	);
 }
 
+/** GET /tasks/:id/context — non-secret frozen task + work graph context. */
+export async function handleTaskContext(env: Env, taskId: string, request: Request): Promise<Response> {
+	if (!(await requireAgentOrControl(request, env))) return json({ error: "task_context_auth_required" }, 401);
+	const stateRes = await doRpc(taskStub(env, taskId), "/state", { method: "GET" });
+	if (!stateRes.ok) return json({ error: "task_not_found", task_id: taskId }, 404);
+	const state = stateRes.body as AuthorityState;
+	return json({
+		task: state.task,
+		task_status: state.task_status,
+		claims: state.claims,
+		contenders: Object.values(state.contenders).map((x) => ({
+			contender_id: x.contender_id,
+			agent_id: x.agent_id,
+			fork_repo: x.fork_repo,
+			claim_work_id: x.claim_work_id,
+			latest_commit: x.latest_commit,
+			status: x.status,
+		})),
+	});
+}
+
+/**
+ * POST /tasks/:id/evaluator-credentials — short-lived READ access to one
+ * contender fork. This route is evaluation-domain authenticated and never
+ * mints canonical write authority.
+ */
+export async function handleEvaluatorCredentials(env: Env, taskId: string, request: Request): Promise<Response> {
+	if (!(await requireEvaluationDomain(request, env))) {
+		return json({ error: "evaluation_domain_auth_required" }, 401);
+	}
+	const parsed = await readJsonBody(request);
+	if (!parsed.ok) return parsed.response;
+	const contender_id = parsed.body["contender_id"];
+	if (typeof contender_id !== "string" || contender_id === "") {
+		return json({ error: "contender_id_required" }, 400);
+	}
+	const stateRes = await doRpc(taskStub(env, taskId), "/state", { method: "GET" });
+	if (!stateRes.ok) return json({ error: "task_not_found", task_id: taskId }, 404);
+	const state = stateRes.body as AuthorityState;
+	const contender = state.contenders[contender_id];
+	if (!contender) return json({ error: "contender_not_found", contender_id }, 404);
+	if (state.quarantine[contender_id]?.status === "QUARANTINED") {
+		return json({ error: "contender_quarantined", contender_id }, 409);
+	}
+	const port = productionPort(env);
+	const repo = await port.get(contender.fork_repo);
+	const credentials = await issueEvaluatorCredentials(port, contender.fork_repo, 300);
+	return json({
+		contender_id,
+		fork_repo: contender.fork_repo,
+		remote: repo.remote,
+		token: credentials.plaintext,
+		expires_at: credentials.expiresAt,
+		task_hash: state.task.task_hash,
+		baseline_commit: state.task.baseline_commit,
+		claim: contender.claim_work_id
+			? state.claims.find((x) => x.work_id === contender.claim_work_id) ?? null
+			: null,
+		latest_commit: contender.latest_commit,
+	});
+}
+
 /**
  * POST /tasks/:id/evidence — accept an evaluation bundle from the
  * evaluation domain and record it in the task authority.
- * SKELETON: currently accepts + records. Production MUST authenticate the
- * caller as the evaluation domain (spec 3 §2) before recording — evidence
- * is only admissible from the evaluation domain and committed verifiers
- * (spec 3 §6, attack 6).
+ * The Worker authenticates the evaluation-domain service identity before
+ * recording. Caller-supplied JSON cannot self-assert this trust zone.
  */
 export async function handleEvidence(env: Env, taskId: string, request: Request): Promise<Response> {
+	if (!(await requireEvaluationDomain(request, env))) {
+		return json({ error: "evaluation_domain_auth_required" }, 401);
+	}
 	const parsed = await readJsonBody(request);
 	if (!parsed.ok) return parsed.response;
 	const bundle = parsed.body["bundle"] as EvaluationBundle | undefined;
 	if (!bundle || typeof bundle.candidate_sha !== "string") {
 		return json({ error: "invalid_bundle" }, 400);
 	}
-	// Caller identity is enforced INSIDE the authority (zone check in
-	// submitEvaluation is what actually decides admissibility).
-	// TODO: requireEvaluationDomain(request) — mTLS/service-token check
-	// that the caller is the evaluation domain. Without it,
-	// contender-supplied "evidence" reaches the DO asserting whatever
-	// zone the body claims (spec 3 §6). The authority's fail-closed default
-	// ("unknown" zone) is the only defense until this is bound to real
-	// transport auth.
-	const caller = parsed.body["caller"] ?? { zone: "unknown" };
+	// Trust-zone identity is derived by the Worker after transport
+	// authentication. The caller cannot self-assert its zone in JSON.
+	const caller = { zone: "evaluation_domain" as const };
 	const res = await doRpc(taskStub(env, taskId), "/evidence", { body: { bundle, caller } });
 	return json(res.body, res.status);
 }
 
 /**
- * POST /tasks/:id/verdict — SKELETON. The verdict seam (spec 1 §9:
- * non-compensatory AND gates, objective dominance, blind 2-of-3 verifier
- * vote) is protocol-layer logic owned by the sibling. The platform exposes
- * the route shape; computation is not implemented here.
+ * POST /tasks/:id/verifiers/commit — record a blind-verifier commitment.
+ * Verifier report authenticity is ultimately enforced by the verifier's
+ * Ed25519 key registered when the task was frozen.
  */
-export async function handleVerdict(_env: Env, _taskId: string, _request: Request): Promise<Response> {
-	return json(
-		{
-			error: "not_implemented",
-			detail:
-				"verdict seam is protocol-layer (spec 1 §9; sibling-owned). Platform skeleton only.",
+export async function handleVerifierCommit(env: Env, taskId: string, request: Request): Promise<Response> {
+	if (!(await requireControlPlane(request, env))) return json({ error: "control_plane_auth_required" }, 401);
+	const parsed = await readJsonBody(request);
+	if (!parsed.ok) return parsed.response;
+	const res = await doRpc(taskStub(env, taskId), "/verifier/commit", { body: { commitment: parsed.body["commitment"] } });
+	return json(res.body, res.status);
+}
+
+/** POST /tasks/:id/verifiers/labels — assign labels only after commitments. */
+export async function handleCandidateLabels(env: Env, taskId: string, request: Request): Promise<Response> {
+	if (!(await requireControlPlane(request, env))) return json({ error: "control_plane_auth_required" }, 401);
+	const parsed = await readJsonBody(request);
+	if (!parsed.ok) return parsed.response;
+	const res = await doRpc(taskStub(env, taskId), "/candidate-labels", { body: { candidate_shas: parsed.body["candidate_shas"] } });
+	return json(res.body, res.status);
+}
+
+/** POST /tasks/:id/verifiers/reveal — verify commit→reveal. */
+export async function handleVerifierReveal(env: Env, taskId: string, request: Request): Promise<Response> {
+	if (!(await requireControlPlane(request, env))) return json({ error: "control_plane_auth_required" }, 401);
+	const parsed = await readJsonBody(request);
+	if (!parsed.ok) return parsed.response;
+	const res = await doRpc(taskStub(env, taskId), "/verifier/reveal", {
+		body: {
+			verifier_id: parsed.body["verifier_id"],
+			report: parsed.body["report"],
+			nonce: parsed.body["nonce"],
 		},
-		501,
-	);
+	});
+	return json(res.body, res.status);
+}
+
+/** POST /tasks/:id/verifiers/report — submit a signed blind-verifier report. */
+export async function handleVerifierReport(env: Env, taskId: string, request: Request): Promise<Response> {
+	if (!(await requireControlPlane(request, env))) return json({ error: "control_plane_auth_required" }, 401);
+	const parsed = await readJsonBody(request);
+	if (!parsed.ok) return parsed.response;
+	const res = await doRpc(taskStub(env, taskId), "/verifier/report", { body: { report: parsed.body["report"] } });
+	return json(res.body, res.status);
 }
 
 /**
- * POST /tasks/:id/promote — promotion preconditions, PLATFORM SKELETON.
- * The promotion service is the ONLY canonical writer (spec 3 §2). This
- * skeleton performs every platform-owned precondition check against the
- * task authority + Artifacts, and stops before the canonical write:
- * the write itself executes in the merge sandbox with a merge-scoped token
- * (spec 5 §7), and permit consumption is a protocol-layer DO transition.
+ * POST /tasks/:id/verdict — execute the frozen Verdict Seam against
+ * authority-held evidence and issue an exact-state permit only on ACCEPT.
+ */
+export async function handleVerdict(env: Env, taskId: string, request: Request): Promise<Response> {
+	if (!(await requireControlPlane(request, env))) return json({ error: "control_plane_auth_required" }, 401);
+	const parsed = await readJsonBody(request);
+	if (!parsed.ok) return parsed.response;
+	const candidates = parsed.body["candidates"];
+	const destination_repo = parsed.body["destination_repo"];
+	if (!Array.isArray(candidates) || candidates.length === 0) {
+		return json({ error: "candidates_required" }, 400);
+	}
+	if (typeof destination_repo !== "string" || destination_repo === "") {
+		return json({ error: "destination_repo_required" }, 400);
+	}
+
+	const vr = await doRpc(taskStub(env, taskId), "/verdict", { body: { candidates } });
+	if (!vr.ok) return json(vr.body, vr.status);
+	const verdict = (vr.body as { verdict?: { state?: string; winner_sha?: string | null } }).verdict;
+	if (!verdict) return json({ error: "verdict_authority_invalid_response" }, 502);
+	if (verdict.state !== "ACCEPT" || !verdict.winner_sha) {
+		return json({ verdict, permit: null }, 200);
+	}
+
+	const dest = await productionPort(env).get(destination_repo);
+	const destination_head = await dest.getHead();
+	if (!destination_head) return json({ error: "destination_head_not_found", destination_repo }, 409);
+	const pr = await doRpc(taskStub(env, taskId), "/permit", {
+		body: { winner_sha: verdict.winner_sha, destination_repo, destination_head },
+	});
+	if (!pr.ok) return json({ verdict, error: "permit_issue_failed", detail: pr.body }, pr.status);
+	return json({ verdict, ...(pr.body as Record<string, unknown>) }, 200);
+}
+
+/**
+ * POST /tasks/:id/promote — exact-state canonical promotion.
+ * The Worker validates the permit/evidence, mints short-lived Git
+ * capabilities, delegates the single canonical write to the trusted
+ * promotion container, then atomically finalizes/consumes the permit.
  */
 export async function handlePromote(
 	env: Env,
 	taskId: string,
 	request: Request,
 ): Promise<Response> {
+	if (!(await requireControlPlane(request, env))) return json({ error: "control_plane_auth_required" }, 401);
 	const parsed = await readJsonBody(request);
 	if (!parsed.ok) return parsed.response;
 	const permit_id = parsed.body["permit_id"];
@@ -588,57 +820,16 @@ export async function handlePromote(
 	if (!stateRes.ok) return json({ error: "task_not_found", task_id: taskId }, 404);
 	const state = stateRes.body as AuthorityState;
 	const permit = (state.permits as Record<string, PermitRecord>)[permit_id];
-	if (!permit) {
-		return json({ outcome: "UNKNOWN_PERMIT" satisfies PromotionOutcome, permit_id }, 404);
-	}
+	if (!permit) return json({ outcome: "UNKNOWN_PERMIT" satisfies PromotionOutcome, permit_id }, 404);
 	if (permit.consumed) {
-		return json(
-			{ outcome: "ALREADY_CONSUMED" satisfies PromotionOutcome, permit_id },
-			409,
-		);
+		return json({ outcome: "ALREADY_CONSUMED" satisfies PromotionOutcome, permit_id }, 200);
 	}
 	const quarantine = state.quarantine[permit.contender_id];
-	if (quarantine && quarantine.status === "QUARANTINED") {
-		return json(
-			{ outcome: "QUARANTINED_CANDIDATE" satisfies PromotionOutcome, permit_id },
-			409,
-		);
+	if (quarantine?.status === "QUARANTINED") {
+		return json({ outcome: "QUARANTINED_CANDIDATE" satisfies PromotionOutcome, permit_id }, 409);
 	}
-
-	const port = productionPort(env);
-	const destRepo = await port.get(permit.destination_repo);
-	const currentHead = await destRepo.getHead();
-	if (currentHead === null || currentHead !== permit.expected_destination_head) {
-		// Spec 1 §10: the permit expires if the destination HEAD moved (TOCTOU closure).
-		return json(
-			{
-				outcome: "EXPIRED_HEAD_MOVED" satisfies PromotionOutcome,
-				permit_id,
-				expected_destination_head: permit.expected_destination_head,
-				current_destination_head: currentHead,
-			},
-			409,
-		);
-	}
-	const winnerCommit = await destRepo.readCommit(permit.winner_candidate_sha);
-	if (winnerCommit === null || winnerCommit.treeHash !== permit.winning_tree_sha256) {
-		// Spec 3 §6 attack 7: candidate swaps commit after evaluation.
-		return json({ outcome: "TREE_MISMATCH" satisfies PromotionOutcome, permit_id }, 409);
-	}
-	const storedBundle = state.evaluations[permit.winner_candidate_sha];
-	if (!storedBundle || storedBundle.bundle_hash !== permit.evaluation_bundle_hash) {
-		// Spec 1 §11 check (4): the permit binds the exact evidence it was
-		// issued under — a re-evaluation after issuance supersedes it.
-		return json(
-			{
-				outcome: "EVAL_BUNDLE_MISMATCH" satisfies PromotionOutcome,
-				permit_id,
-				permit_bundle_hash: permit.evaluation_bundle_hash,
-				stored_bundle_hash: storedBundle?.bundle_hash ?? null,
-			},
-			409,
-		);
-	}
+	const contender = state.contenders[permit.contender_id];
+	if (!contender) return json({ error: "winner_contender_not_found", permit_id }, 409);
 
 	const recomputed = await computePermitId({
 		task_hash: permit.task_hash,
@@ -648,22 +839,113 @@ export async function handlePromote(
 		selector_policy_hash: permit.selector_policy_hash,
 		expected_destination_head: permit.expected_destination_head,
 	});
+	if (recomputed !== permit_id) return json({ error: "permit_id_invalid", permit_id }, 409);
 
-	return json({
-		skeleton: true,
-		outcome: "WOULD_PROMOTE",
-		permit_id,
-		checks: {
-			permit_found: true,
-			not_consumed: true,
-			not_quarantined: true,
-			head_matches: true,
-			tree_matches: true,
-			evaluation_bundle_matches: true,
-			permit_id_valid: recomputed === permit_id,
-		},
-		note: "All platform preconditions hold. Canonical write executes in the merge sandbox with a merge-scoped token (spec 5 §7); permit consumption is a protocol-layer DO transition (sibling).",
-	});
+	const storedBundle = state.evaluations[permit.winner_candidate_sha];
+	if (!storedBundle || storedBundle.bundle_hash !== permit.evaluation_bundle_hash) {
+		return json({
+			outcome: "EVAL_BUNDLE_MISMATCH" satisfies PromotionOutcome,
+			permit_id,
+			permit_bundle_hash: permit.evaluation_bundle_hash,
+			stored_bundle_hash: storedBundle?.bundle_hash ?? null,
+		}, 409);
+	}
+
+	const port = productionPort(env);
+	const sourceRepo = await port.get(contender.fork_repo);
+	const candidate = await sourceRepo.readCommit(permit.winner_candidate_sha);
+	if (candidate === null) {
+		return json({ outcome: "TREE_MISMATCH" satisfies PromotionOutcome, permit_id, detail: "candidate commit missing from contender repo" }, 409);
+	}
+	const destinationRepo = await port.get(permit.destination_repo);
+	const currentHead = await destinationRepo.getHead();
+	// Pre-check only. The Git push inside the trusted promotion container is
+	// the final compare-and-swap and catches a race after this read.
+	if (currentHead !== permit.expected_destination_head) {
+		// A retry after a successful push is reconciled by the promotion
+		// container, so only reject immediately when the permit cannot have
+		// been our own previous exact-state write.
+		// We do not know that deterministic commit id here; let the container
+		// compute it and distinguish ALREADY_WRITTEN from a foreign head move.
+	}
+
+	// The only credentials with canonical write authority are minted here and
+	// live for at most five minutes. They are never persisted or logged.
+	const sourceToken = await sourceRepo.createToken("read", 300);
+	const destinationToken = await destinationRepo.createToken("write", 300);
+	try {
+		const promoRes = await promotionStub(env, permit_id).fetch(
+			new Request("https://promotion/run", {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({
+					permit_id,
+					source_remote: sourceRepo.remote,
+					source_token: sourceToken.plaintext,
+					candidate_sha: permit.winner_candidate_sha,
+					destination_remote: destinationRepo.remote,
+					destination_token: destinationToken.plaintext,
+					expected_destination_head: permit.expected_destination_head,
+					winning_tree_sha256: permit.winning_tree_sha256,
+					issued_at: permit.issued_at,
+				}),
+			}),
+		);
+		const promotion = (await promoRes.json()) as {
+			outcome?: string;
+			promoted_sha?: string;
+			tree_sha256?: string;
+			parent?: string;
+			detail?: string;
+		};
+		if (!promoRes.ok) {
+			const status =
+				promotion.outcome === "EXPIRED_HEAD_MOVED" ||
+				promotion.outcome === "TREE_MISMATCH" ||
+				promotion.outcome === "BASELINE_MISMATCH"
+					? 409
+					: 502;
+			return json({ ...promotion, permit_id }, status);
+		}
+		if (
+			(promotion.outcome !== "PROMOTED" && promotion.outcome !== "ALREADY_WRITTEN") ||
+			promotion.tree_sha256 !== permit.winning_tree_sha256 ||
+			promotion.parent !== permit.expected_destination_head
+		) {
+			return json({ error: "promotion_container_invalid_result", permit_id, promotion }, 502);
+		}
+
+		// Consume the permit only AFTER the canonical write is known to exist.
+		// If this RPC is lost after the Git push, retry reconciliation returns
+		// ALREADY_WRITTEN and this same finalization safely runs again.
+		const finalized = await doRpc(taskStub(env, taskId), "/promotion/finalize", {
+			body: {
+				permit_id,
+				verified_parent: permit.expected_destination_head,
+				tree_sha256: permit.winning_tree_sha256,
+			},
+		});
+		if (!finalized.ok) {
+			return json({
+				error: "promotion_written_but_finalize_pending",
+				permit_id,
+				promoted_sha: promotion.promoted_sha,
+				detail: finalized.body,
+			}, 503);
+		}
+		return json({
+			outcome: "PROMOTED" satisfies PromotionOutcome,
+			permit_id,
+			promoted_sha: promotion.promoted_sha,
+			reconciled_existing_write: promotion.outcome === "ALREADY_WRITTEN",
+		});
+	} finally {
+		// Revocation is best-effort but happens even when Git/evaluation fails.
+		await Promise.allSettled([
+			sourceRepo.revokeToken(sourceToken.id),
+			destinationRepo.revokeToken(destinationToken.id),
+		]);
+	}
 }
 
 /** GET /tasks/:id/ledger — the task authority's append-only ledger. */
@@ -708,17 +990,29 @@ export async function handleVerifyAttestation(
 		currentHead = null;
 	}
 
+	const destinationState =
+		permit.consumed
+			? currentHead === permit.winner_candidate_sha
+				? "PROMOTED_EXACT_CANDIDATE"
+				: "PROMOTED_BUT_DESTINATION_MOVED_AFTERWARD"
+			: currentHead === permit.expected_destination_head
+				? "UNCONSUMED_AT_EXPECTED_PARENT"
+				: "UNCONSUMED_DESTINATION_MOVED";
+
 	return json({
 		permit_id: permitId,
 		permit_id_valid: recomputed === permitId,
 		consumed: permit.consumed,
 		consumed_at: permit.consumed_at,
 		expected_destination_head: permit.expected_destination_head,
-		current_destination_head: currentHead,
-		head_matches: currentHead === permit.expected_destination_head,
-		task_hash: permit.task_hash,
 		winner_candidate_sha: permit.winner_candidate_sha,
-		note: "Platform-level verification only. Full attestation (in-toto + DSSE + Sigstore) is spec 4, protocol-layer.",
+		current_destination_head: currentHead,
+		destination_state: destinationState,
+		exact_reviewed_candidate_current:
+			permit.consumed && currentHead === permit.winner_candidate_sha,
+		task_hash: permit.task_hash,
+		note:
+			"Platform-level permit/destination check. Full offline evidence verification uses promotion.bundle via src/cli/verify.ts.",
 	});
 }
 
@@ -745,16 +1039,25 @@ export async function executeEffects(port: ArtifactsPort, effects: Effect[]): Pr
 				break;
 			}
 			case "cancel_workflow": {
-				// SKELETON: Workflow instance cancellation belongs to the
-				// Workflow layer (workflow instance id → terminate). Logged
-				// here so a retry does not silently drop the intent.
-				console.warn(
-					`executeEffects: cancel_workflow skeleton — contender ${effect.contender_id}: no workflow runtime wired`,
+				/*
+				 * The competition live path launches contender processes outside
+				 * Cloudflare Workflows and does not create a per-contender Workflow
+				 * instance. By the time evaluation can quarantine a candidate, that
+				 * process has already pushed and exited. Revoking the fork token plus
+				 * the authority's QUARANTINED state are therefore the effective kill
+				 * switches: no further write is authorized and the candidate cannot
+				 * reach verdict/promotion. Keep this effect explicit for protocol
+				 * compatibility; a future in-Cloudflare contender Workflow can map
+				 * contender_id to WorkflowInstance.terminate().
+				 */
+				console.info(
+					`executeEffects: contender ${effect.contender_id} quarantined; no active per-contender Workflow instance in the competition runner`,
 				);
 				break;
 			}
 			case "notify": {
-				// SKELETON: production routes to a notification channel.
+				// Competition runner uses structured logs for operator notification;
+				// external paging/chat integration is optional post-competition hardening.
 				console.log(`[notify] to=${effect.to.join(",")}: ${effect.message}`);
 				break;
 			}
@@ -794,8 +1097,20 @@ export async function fetch(request: Request, env: Env): Promise<Response> {
 		if (request.method === "POST" && action === "contenders" && parts.length === 3) {
 			return handleCreateContender(env, taskId, request);
 		}
+		if (request.method === "GET" && action === "context" && parts.length === 3) {
+			return handleTaskContext(env, taskId, request);
+		}
+		if (request.method === "POST" && action === "evaluator-credentials" && parts.length === 3) {
+			return handleEvaluatorCredentials(env, taskId, request);
+		}
 		if (request.method === "POST" && action === "evidence" && parts.length === 3) {
 			return handleEvidence(env, taskId, request);
+		}
+		if (request.method === "POST" && action === "verifiers" && parts.length === 4) {
+			if (parts[3] === "commit") return handleVerifierCommit(env, taskId, request);
+			if (parts[3] === "labels") return handleCandidateLabels(env, taskId, request);
+			if (parts[3] === "reveal") return handleVerifierReveal(env, taskId, request);
+			if (parts[3] === "report") return handleVerifierReport(env, taskId, request);
 		}
 		if (request.method === "POST" && action === "verdict" && parts.length === 3) {
 			return handleVerdict(env, taskId, request);
@@ -824,8 +1139,11 @@ export async function fetch(request: Request, env: Env): Promise<Response> {
 /* ------------------------------------------------------------------ */
 
 /**
- * Queue consumer: each message is `{ task_id, event: QueuePushEvent }`.
- * Forwards to the task's Durable Object (POST /event) for `event_key`
+ * Queue consumer accepts Cloudflare's official `cf.artifacts.repo.pushed`
+ * envelope (plus the deterministic internal test envelope). Contender repo
+ * names encode the opaque task id, so pushes route to the correct per-task
+ * authority without a mutable global registry. Forwards to the task's
+ * Durable Object (POST /event) for `event_key`
  * dedupe + authoritative transition, then executes returned effects.
  * Returns normally to ACK; throws only on genuine failure so the message
  * is redelivered (spec 5 §10: MUST NOT drop the event).
@@ -833,10 +1151,12 @@ export async function fetch(request: Request, env: Env): Promise<Response> {
 export async function queue(batch: QueueBatchLike, env: Env): Promise<void> {
 	const port = productionPort(env);
 	for (const msg of batch.messages) {
-		const { task_id, event } = msg.body as { task_id: string; event: QueuePushEvent };
-		if (typeof task_id !== "string" || !event || typeof event.repo !== "string") {
-			throw new Error("queue: malformed message body; redelivering will not help — drop manually");
-		}
+		const routed = normalizeArtifactQueueBody(msg.body);
+		// Event subscriptions may share a queue with unrelated Artifacts
+		// lifecycle events or pushes to baseline/canonical repositories.
+		// Those are intentionally acknowledged without mutating task state.
+		if (routed === null) continue;
+		const { task_id, event } = routed;
 		const res = await doRpc(taskStub(env, task_id), "/event", { body: { event } });
 		if (!res.ok) {
 			throw new Error(`queue: DO /event failed for task ${task_id}: HTTP ${res.status}`);
@@ -854,85 +1174,46 @@ export async function queue(batch: QueueBatchLike, env: Env): Promise<void> {
 }
 
 /* ------------------------------------------------------------------ */
-/* PromotionWorkflow — SKELETON (spec 5 §5)                            */
+/* PromotionWorkflow — durable retry wrapper (spec 5 §5)               */
 /* ------------------------------------------------------------------ */
 
 export interface PromotionWorkflowParams {
 	task_id: string;
-	agent_id: string;
-	candidate_sha?: string;
-	eval_policy_hash?: string;
-	destination_head?: string;
-}
-
-/** Structural stand-in for a Workflow step context. Production: the real
- *  `WorkflowStep` from "cloudflare:workers"; this class then extends
- *  `WorkflowEntrypoint<Env, PromotionWorkflowParams>`. */
-export interface WorkflowStepLike {
-	do<T>(name: string, fn: () => Promise<T>): Promise<T>;
+	permit_id: string;
 }
 
 /**
- * SKELETON of the retryable promotion workflow. Step names ARE the
- * idempotent operation ids from spec 5 §5, so a step retry after a partial
- * failure converges to the same state instead of duplicating the effect:
- *   fork     = H(task_id, contender_id)
- *   evaluate = H(task_id, candidate_sha, eval_policy_hash)
- *   promote  = H(task_id, candidate_sha, destination_head, policy_hash)
- *            = permit_id (spec 1 §10)
- * Step bodies call the SAME route logic as the HTTP handlers above.
+ * Durable wrapper around the exact-state promotion operation. The permit id
+ * is the idempotent step name. A retry after a lost response is safe because
+ * the promotion container deterministically reconstructs the same commit and
+ * reports ALREADY_WRITTEN; the task authority then consumes the same permit.
  */
-export class PromotionWorkflow {
-	async run(
-		event: { payload: PromotionWorkflowParams },
-		step: WorkflowStepLike,
-		env: Env,
-	): Promise<Record<string, unknown>> {
+export class PromotionWorkflow extends WorkflowEntrypoint<Env, PromotionWorkflowParams> {
+	async run(event: WorkflowEvent<PromotionWorkflowParams>, step: WorkflowStep) {
 		const p = event.payload;
-
-		const contender_id = (await sha256Hex(joinHashParts("contender", p.task_id, p.agent_id))).slice(
-			0,
-			32,
-		);
-		const forkOpId = await sha256Hex(joinHashParts("fork", p.task_id, contender_id));
-		const forked = await step.do(`fork/${forkOpId}`, async () => {
-			const res = await handleCreateContender(
-				env,
+		if (!p || typeof p.task_id !== "string" || typeof p.permit_id !== "string") {
+			throw new Error("PromotionWorkflow: invalid payload");
+		}
+		return step.do(`promote/${p.permit_id}`, async () => {
+			const res = await handlePromote(
+				this.env,
 				p.task_id,
-				new Request("https://workflow/contenders", {
+				new Request("https://workflow/promote", {
 					method: "POST",
-					headers: { "content-type": "application/json" },
-					body: JSON.stringify({ agent_id: p.agent_id }),
+					headers: {
+						"content-type": "application/json",
+						authorization: `Bearer ${this.env.CONTROL_SERVICE_TOKEN}`,
+					},
+					body: JSON.stringify({ permit_id: p.permit_id }),
 				}),
 			);
-			return (await res.json()) as unknown;
+			const body = await res.json();
+			// 5xx means an infrastructure/transient failure: let Workflows retry.
+			if (res.status >= 500) {
+				throw new Error(`promotion transient failure: HTTP ${res.status} ${JSON.stringify(body)}`);
+			}
+			return { status: res.status, body };
 		});
-
-		const evalOpId = p.candidate_sha
-			? await sha256Hex(joinHashParts("eval", p.task_id, p.candidate_sha, p.eval_policy_hash ?? ""))
-			: "pending";
-		const evaluated = await step.do(`evaluate/${evalOpId}`, async () => ({
-			status: "skeleton",
-			note: "Evaluation executes in the evaluation domain (spec 3 §4); bundles enter via POST /tasks/:id/evidence. Not implemented in the platform skeleton.",
-		}));
-
-		const promoteOpId = p.candidate_sha
-			? await sha256Hex(
-					joinHashParts(
-						"promote",
-						p.task_id,
-						p.candidate_sha,
-						p.destination_head ?? "",
-						SELECTOR_POLICY_VERSION,
-					),
-				)
-			: "pending";
-		const promoted = await step.do(`promote/${promoteOpId}`, async () => ({
-			status: "skeleton",
-			note: "Promotion executes via POST /tasks/:id/promote + the merge sandbox (spec 5 §7). Not implemented in the platform skeleton.",
-		}));
-
-		return { forked, evaluated, promoted };
 	}
 }
 

@@ -1,3 +1,23 @@
+declare module "cloudflare:workers" {
+	export interface WorkflowEvent<T = unknown> {
+		payload: T;
+		instanceId?: string;
+	}
+	export interface WorkflowStep {
+		do<T>(name: string, fn: () => Promise<T>): Promise<T>;
+		do<T>(
+			name: string,
+			options: Record<string, unknown>,
+			fn: () => Promise<T>,
+		): Promise<T>;
+	}
+	export abstract class WorkflowEntrypoint<E = unknown, P = unknown> {
+		protected env: E;
+		constructor(ctx: unknown, env: E);
+		abstract run(event: WorkflowEvent<P>, step: WorkflowStep): Promise<unknown>;
+	}
+}
+
 /**
  * Minimal ambient declarations for the Durable Object / Worker edge.
  *
@@ -14,7 +34,22 @@
  *   - `Env` is the Worker's environment: the Artifacts port abstraction
  *     plus the task-authority Durable Object namespace (structural).
  */
+interface ContainerExecOutput {
+	exitCode: number;
+	stdout: ArrayBuffer;
+	stderr: ArrayBuffer;
+}
+interface ContainerExecProcess {
+	output(): Promise<ContainerExecOutput>;
+}
+interface ContainerHandle {
+	running: boolean;
+	start(options?: { env?: Record<string, string>; entrypoint?: string[]; enableInternet?: boolean }): void;
+	exec(cmd: string[], options?: { env?: Record<string, string> }): Promise<ContainerExecProcess>;
+}
+
 interface DurableObjectState {
+	container?: ContainerHandle;
 	storage: {
 		get<T>(k: string): Promise<T | undefined>;
 		put<T>(k: string, v: T): Promise<void>;
@@ -53,9 +88,15 @@ interface DoNamespace {
 interface Env {
 	ARTIFACTS: import("../lib/artifacts-port.ts").ArtifactsPort;
 	TASK_AUTHORITY: DoNamespace;
+	/** Secret used only at the Worker edge to authenticate evaluation-domain submissions. */
+	EVALUATION_SERVICE_TOKEN: string;
+	CONTROL_SERVICE_TOKEN: string;
+	AGENT_SERVICE_TOKEN: string;
+	PROMOTION_CONTAINER: DoNamespace;
 }
 
 /** Queue consumer batch shape (structural; mirrors MessageBatch). */
 interface QueueBatchLike {
-	messages: Array<{ body: { task_id: string; event: import("../lib/types.ts").QueuePushEvent } }>;
+	/** Cloudflare Event Subscription messages arrive as product-defined envelopes. */
+	messages: Array<{ body: unknown }>;
 }

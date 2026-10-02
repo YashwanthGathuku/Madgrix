@@ -35,8 +35,8 @@ export function createEd25519Signer(): LocalEd25519Signer {
 			const sig = cryptoSign(null, payload, privateKey);
 			return { signature: sig.toString("base64"), keyid };
 		},
-		async verify(payload: Uint8Array, signature: string, keyid: string): Promise<boolean> {
-			if (keyid !== keyid) return false;
+		async verify(payload: Uint8Array, signature: string, requestedKeyid: string): Promise<boolean> {
+			if (requestedKeyid !== keyid) return false;
 			try {
 				return cryptoVerify(null, payload, publicKey, Buffer.from(signature, "base64"));
 			} catch {

@@ -588,6 +588,55 @@ export async function submitVerifierReport(
 	);
 }
 
+/**
+ * Assign collision-free anonymized labels after verifier commitments are
+ * recorded and before candidates are shown to verifiers (spec 1 §8).
+ *
+ * Labels are authority-owned and stable for the task lifetime. Repeating
+ * the same assignment is idempotent; attempting to bind an existing label
+ * to a different candidate fails closed.
+ */
+export async function assignCandidateLabels(
+	state: AuthorityState,
+	candidateShas: string[],
+	ctx: Ctx,
+): Promise<{ state: AuthorityState; labels: Record<string, string> }> {
+	if (candidateShas.length === 0) throw new Error("assignCandidateLabels: at least one candidate is required");
+	const registered = Object.keys(state.verifier_keys ?? {});
+	for (const verifierId of registered) {
+		if (!state.verifier_commitments[verifierId]) {
+			throw new Error(
+				`assignCandidateLabels: verifier ${verifierId} has not committed — candidates cannot be exposed before commit (spec 1 §8)`,
+			);
+		}
+	}
+	const nextLabels: Record<string, string> = { ...state.candidate_labels };
+	const assigned: Record<string, string> = {};
+	for (let i = 0; i < candidateShas.length; i++) {
+		const sha = candidateShas[i];
+		if (typeof sha !== "string" || sha === "") throw new Error("assignCandidateLabels: invalid candidate sha");
+		const label = `candidate-${i}`;
+		const existing = nextLabels[label];
+		if (existing !== undefined && existing !== sha) {
+			throw new Error(`assignCandidateLabels: label ${label} is already bound to a different candidate`);
+		}
+		nextLabels[label] = sha;
+		assigned[label] = sha;
+	}
+	const unchanged =
+		Object.keys(assigned).every((label) => state.candidate_labels[label] === assigned[label]) &&
+		Object.keys(assigned).length > 0;
+	if (unchanged) return { state, labels: assigned };
+	const s2: AuthorityState = { ...state, candidate_labels: nextLabels };
+	const s3 = await appendLedger(
+		s2,
+		"candidate_labels_assigned",
+		{ labels: Object.keys(assigned), candidate_count: candidateShas.length },
+		ctx,
+	);
+	return { state: s3, labels: assigned };
+}
+
 /* ------------------------------------------------------------------ */
 /* Verdict seam                                                        */
 /* ------------------------------------------------------------------ */
