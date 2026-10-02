@@ -244,27 +244,21 @@ try {
 	const bundle = { ...withoutHash, bundle_hash };
 
 	await postJson(`${baseUrl}/tasks/${encodeURIComponent(taskId)}/evidence`, { bundle });
-	console.log(
-		JSON.stringify(
-			{
-				task_id: taskId,
-				contender_id: contenderId,
-				candidate_sha: candidateSha,
-				tree_sha256,
-				bundle_hash,
-				changed_files: files,
-				admission: bundle.admission,
-				hidden_oracle: bundle.hidden_oracle,
-				regressions: bundle.regressions,
-				static_analysis: bundle.static_analysis,
-				semantic_checks: bundle.semantic_checks,
-				security_policy: bundle.security_policy,
-				provenance: { model: modelName, harness_version: harnessVersion },
-			},
-			null,
-			2,
-		),
-	);
+	const result = {
+		task_id: taskId,
+		contender_id: contenderId,
+		candidate_sha: candidateSha,
+		tree_sha256,
+		bundle_hash,
+		changed_files: files,
+		bundle,
+		provenance: { model: modelName, harness_version: harnessVersion },
+	};
+	if (process.env.MADGRIX_RESULT_PATH) {
+		const { writeFile } = await import("node:fs/promises");
+		await writeFile(process.env.MADGRIX_RESULT_PATH, JSON.stringify(result, null, 2) + "\n", "utf8");
+	}
+	console.log(JSON.stringify(result, null, 2));
 } finally {
 	await rm(dir, { recursive: true, force: true });
 }
