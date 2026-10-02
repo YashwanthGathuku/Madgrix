@@ -72,6 +72,74 @@ Five zones (see `ARCHITECTURE.md` for the full table):
   the Artifacts remote). The exact allowlist mechanism in the Sandbox API is still an
   OPEN question in the spec.
 
+## Process environment boundaries
+
+The live-run scripts run on an operator host whose shell typically holds all three
+MADGRIX service tokens at once, often alongside Cloudflare and other credentials. No
+child process inherits that environment. Every spawn in `scripts/live-e2e.ts`,
+`scripts/run-contenders.mjs` and `scripts/evaluate-candidate.ts` goes through
+`minimalEnv(extra)` (`scripts/lib/child-env.mjs`): `PATH`, `HOME`, `LANG`, `TMPDIR` and
+`TERM` copied from the parent when set, plus exactly the extras the spawning code names.
+The amendment recording this is `specs/amendments/process-env-boundaries.md`.
+
+| Process | Started by | Service token it receives | Other variables beyond `minimalEnv()` |
+|---|---|---|---|
+| `live-e2e.ts` | operator | all three (it orchestrates every zone) | operator's environment |
+| `run-contenders.mjs` | `live-e2e.ts` | AGENT only | runner settings, allowlisted variables |
+| coding-agent command | `run-contenders.mjs` | **none** | `MADGRIX_AGENT_ID`, `MADGRIX_CONTENDER_ID`, `MADGRIX_TASK_ID`, `MADGRIX_BASELINE_SHA`, `MADGRIX_WORKSPACE`, allowlisted variables |
+| `evaluate-candidate.ts` | `live-e2e.ts` | EVALUATION only | evaluation settings and commands |
+| hidden, regression, semantic, static, security commands | `evaluate-candidate.ts` | **none** | none |
+| `git` clone / commit / push / checkout | runner or evaluator | none (the Artifacts token travels in a per-invocation `-c http.extraHeader`) | none |
+| `src/cli/verify.ts` | `live-e2e.ts` | none | none |
+
+- **No login shell.** The agent command and the five evaluation commands run under
+  `bash -c`, not `bash -lc`. A login shell re-reads `/etc/profile` and `~/.profile`,
+  which would re-export whatever the operator's profile exports (for example
+  `CLOUDFLARE_API_TOKEN`) even into a scrubbed environment. `PATH` now comes from the
+  parent, so start the run from a shell where the agent CLI is already on `PATH`.
+- **The agent's own model key.** `MADGRIX_AGENT_ENV_ALLOWLIST` is a comma-separated
+  list of variable names the operator passes through to the agent command, for
+  example `MADGRIX_AGENT_ENV_ALLOWLIST=ANTHROPIC_API_KEY`. Both `live-e2e.ts` and
+  `run-contenders.mjs` exit 2 before any Worker call if an entry is not a variable
+  name, or names a `MADGRIX_*`, `*SERVICE_TOKEN*`, `*CLOUDFLARE*` or `CF_*` variable.
+  The guard is by name only: what a differently named variable holds is the operator's
+  responsibility. Allowlisted variables never reach the evaluator or its commands.
+- **Git settings from the environment are gone.** Proxy (`HTTPS_PROXY`), CA bundle
+  (`GIT_SSL_CAINFO`, `SSL_CERT_FILE`) and agent-socket (`SSH_AUTH_SOCK`) variables no
+  longer reach `git`. `HOME` is passed, so put proxy and CA settings in `~/.gitconfig`
+  (`http.proxy`, `http.sslCAInfo`). Because `SSH_AUTH_SOCK` is not passed, a global
+  `commit.gpgsign` that signs through an SSH agent cannot reach that agent when the
+  runner makes the contender commit.
+
+`test/env-isolation.test.ts` runs the three scripts against a local HTTP mock of the
+Worker and local bare Git repos (no network). The operator environment it supplies
+holds all three tokens, Cloudflare/GitHub/signing variables, and a login profile that
+exports one more secret. It asserts that the `env` dumps of the agent command and of
+all five evaluation commands contain no variable matching
+`/SERVICE_TOKEN|CLOUDFLARE|API_TOKEN|SECRET/`, no injected credential value under any
+name, and nothing beyond `minimalEnv()` plus their explicit extras. It also asserts
+that, in a full `live-e2e.ts` run, the contender runner received only the AGENT token,
+each evaluator only the EVALUATION token, and the offline verifier none (observed
+through a `node` shim on `PATH`), and that the agent never saw an evaluation command.
+Finally, it asserts that an allowlist naming a zone or Cloudflare credential is refused.
+Before this change the same test failed. In a `live-e2e.ts` run, the agent command
+received all three service tokens, the Cloudflare/GitHub/signing variables, and
+`MADGRIX_HIDDEN_TEST_COMMAND` along with the other four evaluation commands. The
+evaluation commands received the CONTROL and AGENT tokens.
+
+What this boundary does **not** do:
+
+- **It is not an OS boundary.** The agent and evaluation commands run as the
+  operator's OS user with the operator's `HOME`. Files there (shell profiles, CLI
+  credential stores) stay readable, and a process running as the same user can
+  generally read another's `/proc/<pid>/environ`, including that of `live-e2e.ts`,
+  which holds all three tokens. Against an adversarial agent, the boundary is the
+  separate sandbox per contender required by spec 3 §2–§3, or at least a separate OS
+  user or container on the operator host.
+- **Artifacts tokens on git's command line** (`-c http.extraHeader=...`) are visible to
+  other local processes while that `git` process runs. This section does not change
+  that.
+
 ## The honest sandbox constraint
 
 One sandbox is not an adversarial boundary: processes inside it share the filesystem

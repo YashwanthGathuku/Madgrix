@@ -26,6 +26,10 @@
  * evaluator host. This protects evaluator credentials/authority and destroys
  * persistence after the run; it does NOT claim hidden test contents are secret
  * from arbitrary malicious candidate code executing on the same host.
+ *
+ * Every child (git and the evaluation commands) runs with minimalEnv() only;
+ * the evaluation commands run under `bash -c`, not a login shell. See
+ * docs/SECURITY.md "Process environment boundaries".
  */
 
 import { createHash } from "node:crypto";
@@ -36,6 +40,7 @@ import { spawn } from "node:child_process";
 
 import { canonicalJson, sha256Hex } from "../src/lib/canonical.ts";
 import { globMatchesPath } from "../src/lib/claims.ts";
+import { minimalEnv } from "./lib/child-env.mjs";
 
 const baseUrl = process.env.MADGRIX_BASE_URL?.replace(/\/$/, "");
 const taskId = process.env.MADGRIX_TASK_ID;
@@ -60,7 +65,7 @@ if (!baseUrl || !taskId || !contenderId || !candidateSha || !serviceToken || !mo
 
 function capture(cmd: string, args: string[], cwd: string): Promise<Buffer> {
 	return new Promise((resolve, reject) => {
-		const child = spawn(cmd, args, { cwd, stdio: ["ignore", "pipe", "pipe"] });
+		const child = spawn(cmd, args, { cwd, env: minimalEnv(), stdio: ["ignore", "pipe", "pipe"] });
 		const out: Buffer[] = [];
 		const err: Buffer[] = [];
 		child.stdout.on("data", (b: Buffer) => out.push(b));
@@ -77,13 +82,11 @@ function capture(cmd: string, args: string[], cwd: string): Promise<Buffer> {
 
 function exitCode(command: string, cwd: string): Promise<{ passed: boolean; detail: string }> {
 	return new Promise((resolve, reject) => {
-		const child = spawn("bash", ["-lc", command], {
+		// Candidate code runs here: no service token, no Artifacts token, no
+		// other operator credential, and no login profile re-imported.
+		const child = spawn("bash", ["-c", command], {
 			cwd,
-			env: {
-				...process.env,
-				// The test process never receives Artifacts or evaluation-service tokens.
-				MADGRIX_EVALUATION_SERVICE_TOKEN: undefined,
-			},
+			env: minimalEnv(),
 			stdio: ["ignore", "pipe", "pipe"],
 		});
 		let out = "";
@@ -154,6 +157,7 @@ async function isAncestor(repoDir: string, baseline: string, candidate: string):
 	return new Promise((resolve) => {
 		const child = spawn("git", ["merge-base", "--is-ancestor", baseline, candidate], {
 			cwd: repoDir,
+			env: minimalEnv(),
 			stdio: "ignore",
 		});
 		child.on("error", () => resolve(false));
@@ -187,7 +191,7 @@ try {
 		const child = spawn(
 			"git",
 			["-c", `http.extraHeader=${authHeader}`, "clone", "--quiet", "--no-checkout", creds.remote, dir],
-			{ stdio: "inherit" },
+			{ env: minimalEnv(), stdio: "inherit" },
 		);
 		child.on("error", reject);
 		child.on("exit", (code) => (code === 0 ? resolve() : reject(new Error(`git clone failed: ${code}`))));

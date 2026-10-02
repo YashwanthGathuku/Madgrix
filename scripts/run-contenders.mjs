@@ -11,16 +11,26 @@
  *   MADGRIX_AGENT_IDS=agent-a,agent-b,agent-c   (default)
  *   MADGRIX_KEEP_WORKSPACES=1
  *   MADGRIX_WORK_ROOT=/tmp
+ *   MADGRIX_AGENT_ENV_ALLOWLIST=NAME[,NAME...]  variables passed through to
+ *     the agent command, for the agent's own model API key
  *
  * The command is intentionally provider-neutral. Examples can point at Codex,
  * Claude Code, Aider, or an internal AOS launcher. The runner never writes
  * Artifacts tokens into .git/config or command-line remote URLs.
+ *
+ * The agent command runs under `bash -c` (not a login shell, so profile files
+ * are not re-read) with minimalEnv() plus MADGRIX_AGENT_ID,
+ * MADGRIX_CONTENDER_ID, MADGRIX_TASK_ID, MADGRIX_BASELINE_SHA,
+ * MADGRIX_WORKSPACE and the allowlisted variables. It receives no service
+ * token. See docs/SECURITY.md "Process environment boundaries".
  */
 
 import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
+
+import { minimalEnv, parseAgentEnvAllowlist, pickEnv } from "./lib/child-env.mjs";
 
 const baseUrl = process.env.MADGRIX_BASE_URL?.replace(/\/$/, "");
 const taskId = process.env.MADGRIX_TASK_ID;
@@ -41,12 +51,19 @@ if (agentIds.length < 2) {
 	console.error("MADGRIX requires at least two concurrent agents; the competition demo should use three.");
 	process.exit(2);
 }
+let agentEnvAllowlist;
+try {
+	agentEnvAllowlist = parseAgentEnvAllowlist(process.env.MADGRIX_AGENT_ENV_ALLOWLIST);
+} catch (err) {
+	console.error(err.message);
+	process.exit(2);
+}
 
 function run(cmd, args, opts = {}) {
 	return new Promise((resolve, reject) => {
 		const child = spawn(cmd, args, {
 			cwd: opts.cwd,
-			env: opts.env ?? process.env,
+			env: opts.env ?? minimalEnv(),
 			stdio: opts.stdio ?? "inherit",
 		});
 		child.on("error", reject);
@@ -61,7 +78,7 @@ function capture(cmd, args, opts = {}) {
 	return new Promise((resolve, reject) => {
 		const child = spawn(cmd, args, {
 			cwd: opts.cwd,
-			env: opts.env ?? process.env,
+			env: opts.env ?? minimalEnv(),
 			stdio: ["ignore", "pipe", "pipe"],
 		});
 		let out = "";
@@ -152,16 +169,18 @@ async function runOne(agentId) {
 		await run("git", ["-c", `http.extraHeader=${auth}`, "clone", "--quiet", "--single-branch", "--branch", "main", remote, dir]);
 		const baseline = await capture("git", ["rev-parse", "HEAD"], { cwd: dir });
 
-		const env = {
-			...process.env,
+		// No service token and no other operator credential: only the agent's
+		// own identifiers plus what the operator explicitly allowlisted.
+		const env = minimalEnv({
+			...pickEnv(agentEnvAllowlist),
 			MADGRIX_AGENT_ID: agentId,
 			MADGRIX_CONTENDER_ID: contenderId,
 			MADGRIX_TASK_ID: taskId,
 			MADGRIX_BASELINE_SHA: baseline,
 			MADGRIX_WORKSPACE: dir,
-		};
+		});
 		console.error(`[madgrix] starting ${agentId} in isolated repo ${forkRepo}`);
-		await run("bash", ["-lc", agentCommand], { cwd: dir, env });
+		await run("bash", ["-c", agentCommand], { cwd: dir, env });
 
 		const dirty = await capture("git", ["status", "--porcelain"], { cwd: dir });
 		if (dirty) {

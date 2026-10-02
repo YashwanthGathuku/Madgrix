@@ -26,7 +26,17 @@
  *   MADGRIX_EVENT_TIMEOUT_MS       default 60000
  *   MADGRIX_BUNDLE_PATH            default .madgrix-live/promotion.bundle
  *   MADGRIX_CLAIM_TEMPLATE         passed through to contender runner
+ *   MADGRIX_AGENT_ENV_ALLOWLIST    variables passed through to the agent
+ *                                  command (the agent's own model API key)
+ *   MADGRIX_KEEP_WORKSPACES / MADGRIX_WORK_ROOT / GIT_AUTHOR_NAME /
+ *   GIT_AUTHOR_EMAIL               passed through to contender runner
  *   MADGRIX_REGRESSION_COMMAND / SEMANTIC / STATIC / SECURITY commands
+ *   MADGRIX_HARNESS_VERSION        passed through to the evaluator
+ *
+ * This process holds all three service tokens; no child inherits its
+ * environment. The contender runner receives only the AGENT token, each
+ * evaluator only the EVALUATION token, and the offline verifier none. See
+ * docs/SECURITY.md "Process environment boundaries".
  */
 
 import {
@@ -56,6 +66,7 @@ import { createCommitment } from "../src/lib/verifiers.ts";
 import { verifierReportPayload } from "../src/lib/verifier-keys.ts";
 import { SELECTOR_POLICY_INPUT } from "../src/do/TaskAuthority.ts";
 import { SELECTOR_POLICY_VERSION, type ReferenceReport } from "../src/lib/types.ts";
+import { minimalEnv, parseAgentEnvAllowlist, pickEnv } from "./lib/child-env.mjs";
 
 const env = process.env;
 const baseUrl = env.MADGRIX_BASE_URL?.replace(/\/$/, "");
@@ -91,6 +102,13 @@ if (missing.length) {
 	console.error("Missing required environment:", missing.map(([k]) => k).join(", "));
 	process.exit(2);
 }
+let agentEnvAllowlist: string[];
+try {
+	agentEnvAllowlist = parseAgentEnvAllowlist(env.MADGRIX_AGENT_ENV_ALLOWLIST);
+} catch (err) {
+	console.error((err as Error).message);
+	process.exit(2);
+}
 
 function bearer(token: string): Record<string, string> {
 	return { authorization: `Bearer ${token}` };
@@ -118,7 +136,7 @@ async function requestJson(
 function run(command: string, args: string[], options: { env?: NodeJS.ProcessEnv; stdio?: any } = {}): Promise<void> {
 	return new Promise((resolve, reject) => {
 		const child = spawn(command, args, {
-			env: options.env ?? process.env,
+			env: options.env ?? minimalEnv(),
 			stdio: options.stdio ?? "inherit",
 		});
 		child.on("error", reject);
@@ -234,14 +252,24 @@ const temp = await mkdtemp(path.join(os.tmpdir(), "madgrix-live-"));
 try {
 	console.error("[madgrix-live] 3/9 launch real coding agents concurrently");
 	const contenderResultPath = path.join(temp, "contenders.json");
+	// Agent zone: the AGENT token only. The runner forwards the allowlisted
+	// variables, and nothing else, to the agent command.
 	await run("node", ["scripts/run-contenders.mjs"], {
-		env: {
-			...env,
+		env: minimalEnv({
+			...pickEnv(agentEnvAllowlist),
 			MADGRIX_BASE_URL: baseUrl,
 			MADGRIX_TASK_ID: taskId,
 			MADGRIX_AGENT_SERVICE_TOKEN: agentToken,
+			MADGRIX_AGENT_COMMAND: agentCommand,
+			MADGRIX_AGENT_IDS: env.MADGRIX_AGENT_IDS,
+			MADGRIX_AGENT_ENV_ALLOWLIST: env.MADGRIX_AGENT_ENV_ALLOWLIST,
+			MADGRIX_CLAIM_TEMPLATE: env.MADGRIX_CLAIM_TEMPLATE,
+			MADGRIX_KEEP_WORKSPACES: env.MADGRIX_KEEP_WORKSPACES,
+			MADGRIX_WORK_ROOT: env.MADGRIX_WORK_ROOT,
+			GIT_AUTHOR_NAME: env.GIT_AUTHOR_NAME,
+			GIT_AUTHOR_EMAIL: env.GIT_AUTHOR_EMAIL,
 			MADGRIX_RESULT_PATH: contenderResultPath,
-		},
+		}),
 	});
 	const contenderRun = JSON.parse(await readFile(contenderResultPath, "utf8"));
 	const candidates = contenderRun.candidates as Array<{
@@ -279,17 +307,23 @@ try {
 	const evalResults = await Promise.all(
 		candidates.map(async (candidate, i) => {
 			const resultPath = path.join(temp, `evaluation-${i}.json`);
+			// Evaluation domain: the EVALUATION token only.
 			await run("node", ["scripts/evaluate-candidate.ts"], {
-				env: {
-					...env,
+				env: minimalEnv({
 					MADGRIX_BASE_URL: baseUrl,
 					MADGRIX_TASK_ID: taskId,
 					MADGRIX_CONTENDER_ID: candidate.contender_id,
 					MADGRIX_CANDIDATE_SHA: candidate.candidate_sha,
 					MADGRIX_EVALUATION_SERVICE_TOKEN: evaluationToken,
 					MADGRIX_MODEL_NAME: modelName,
+					MADGRIX_HIDDEN_TEST_COMMAND: hiddenCommand,
+					MADGRIX_REGRESSION_COMMAND: env.MADGRIX_REGRESSION_COMMAND,
+					MADGRIX_SEMANTIC_COMMAND: env.MADGRIX_SEMANTIC_COMMAND,
+					MADGRIX_STATIC_COMMAND: env.MADGRIX_STATIC_COMMAND,
+					MADGRIX_SECURITY_COMMAND: env.MADGRIX_SECURITY_COMMAND,
+					MADGRIX_HARNESS_VERSION: env.MADGRIX_HARNESS_VERSION,
 					MADGRIX_RESULT_PATH: resultPath,
-				},
+				}),
 			});
 			return JSON.parse(await readFile(resultPath, "utf8"));
 		}),
@@ -456,7 +490,8 @@ try {
 	if (!verified.verified) throw new Error(`new promotion bundle failed self-verification: ${JSON.stringify(verified.lines)}`);
 	await mkdir(path.dirname(bundlePath), { recursive: true });
 	await writeFile(bundlePath, JSON.stringify(bundle, null, 2) + "\n", "utf8");
-	await run("node", ["src/cli/verify.ts", bundlePath]);
+	// Offline verification needs no credential.
+	await run("node", ["src/cli/verify.ts", bundlePath], { env: minimalEnv() });
 
 	console.log(
 		JSON.stringify(
