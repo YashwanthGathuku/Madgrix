@@ -35,6 +35,9 @@
  * body and never logged.
  */
 
+import { WorkflowEntrypoint } from "cloudflare:workers";
+import type { WorkflowEvent, WorkflowStep } from "cloudflare:workers";
+
 import type {
 	ArtifactsPort,
 	ArtifactsRepo,
@@ -1040,85 +1043,43 @@ export async function queue(batch: QueueBatchLike, env: Env): Promise<void> {
 }
 
 /* ------------------------------------------------------------------ */
-/* PromotionWorkflow — SKELETON (spec 5 §5)                            */
+/* PromotionWorkflow — durable retry wrapper (spec 5 §5)               */
 /* ------------------------------------------------------------------ */
 
 export interface PromotionWorkflowParams {
 	task_id: string;
-	agent_id: string;
-	candidate_sha?: string;
-	eval_policy_hash?: string;
-	destination_head?: string;
-}
-
-/** Structural stand-in for a Workflow step context. Production: the real
- *  `WorkflowStep` from "cloudflare:workers"; this class then extends
- *  `WorkflowEntrypoint<Env, PromotionWorkflowParams>`. */
-export interface WorkflowStepLike {
-	do<T>(name: string, fn: () => Promise<T>): Promise<T>;
+	permit_id: string;
 }
 
 /**
- * SKELETON of the retryable promotion workflow. Step names ARE the
- * idempotent operation ids from spec 5 §5, so a step retry after a partial
- * failure converges to the same state instead of duplicating the effect:
- *   fork     = H(task_id, contender_id)
- *   evaluate = H(task_id, candidate_sha, eval_policy_hash)
- *   promote  = H(task_id, candidate_sha, destination_head, policy_hash)
- *            = permit_id (spec 1 §10)
- * Step bodies call the SAME route logic as the HTTP handlers above.
+ * Durable wrapper around the exact-state promotion operation. The permit id
+ * is the idempotent step name. A retry after a lost response is safe because
+ * the promotion container deterministically reconstructs the same commit and
+ * reports ALREADY_WRITTEN; the task authority then consumes the same permit.
  */
-export class PromotionWorkflow {
-	async run(
-		event: { payload: PromotionWorkflowParams },
-		step: WorkflowStepLike,
-		env: Env,
-	): Promise<Record<string, unknown>> {
+export class PromotionWorkflow extends WorkflowEntrypoint<Env, PromotionWorkflowParams> {
+	async run(event: WorkflowEvent<PromotionWorkflowParams>, step: WorkflowStep) {
 		const p = event.payload;
-
-		const contender_id = (await sha256Hex(joinHashParts("contender", p.task_id, p.agent_id))).slice(
-			0,
-			32,
-		);
-		const forkOpId = await sha256Hex(joinHashParts("fork", p.task_id, contender_id));
-		const forked = await step.do(`fork/${forkOpId}`, async () => {
-			const res = await handleCreateContender(
-				env,
+		if (!p || typeof p.task_id !== "string" || typeof p.permit_id !== "string") {
+			throw new Error("PromotionWorkflow: invalid payload");
+		}
+		return step.do(`promote/${p.permit_id}`, async () => {
+			const res = await handlePromote(
+				this.env,
 				p.task_id,
-				new Request("https://workflow/contenders", {
+				new Request("https://workflow/promote", {
 					method: "POST",
 					headers: { "content-type": "application/json" },
-					body: JSON.stringify({ agent_id: p.agent_id }),
+					body: JSON.stringify({ permit_id: p.permit_id }),
 				}),
 			);
-			return (await res.json()) as unknown;
+			const body = await res.json();
+			// 5xx means an infrastructure/transient failure: let Workflows retry.
+			if (res.status >= 500) {
+				throw new Error(`promotion transient failure: HTTP ${res.status} ${JSON.stringify(body)}`);
+			}
+			return { status: res.status, body };
 		});
-
-		const evalOpId = p.candidate_sha
-			? await sha256Hex(joinHashParts("eval", p.task_id, p.candidate_sha, p.eval_policy_hash ?? ""))
-			: "pending";
-		const evaluated = await step.do(`evaluate/${evalOpId}`, async () => ({
-			status: "skeleton",
-			note: "Evaluation executes in the evaluation domain (spec 3 §4); bundles enter via POST /tasks/:id/evidence. Not implemented in the platform skeleton.",
-		}));
-
-		const promoteOpId = p.candidate_sha
-			? await sha256Hex(
-					joinHashParts(
-						"promote",
-						p.task_id,
-						p.candidate_sha,
-						p.destination_head ?? "",
-						SELECTOR_POLICY_VERSION,
-					),
-				)
-			: "pending";
-		const promoted = await step.do(`promote/${promoteOpId}`, async () => ({
-			status: "skeleton",
-			note: "Promotion executes via POST /tasks/:id/promote + the merge sandbox (spec 5 §7). Not implemented in the platform skeleton.",
-		}));
-
-		return { forked, evaluated, promoted };
 	}
 }
 
