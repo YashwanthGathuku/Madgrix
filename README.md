@@ -1,259 +1,241 @@
-# Madgrix
+# MADGRIX
 
-**A governed promotion protocol for autonomous software agents** — built on Cloudflare Workers + Artifacts.
+**A governed promotion protocol for autonomous software agents** — built on Cloudflare Workers, Artifacts, Queues, Durable Objects, Workflows, and Containers.
 
-*Madgrix* is the product. Inside the architecture, the verdict layer keeps its
-design name: the **Verdict Seam** — the governed boundary every candidate must
-cross before it can ship.
-
-## What it is
-
-A governed path from an agent's *intent* to shipped code:
+MADGRIX turns concurrent agent work into a controlled software-change pipeline:
 
 ```
-INTENT → competing implementations → independent evidence
-       → VERDICT → exact-state authorization → promotion → verifiable history
+INTENT → work claims → isolated contenders → independent evidence
+       → VERDICT SEAM → exact-state permit → canonical promotion
+       → verifiable history
 ```
 
-Git records *what changed*. Madgrix records everything else: *why the work began,
-what alternatives were tried, what each one claimed, what was independently checked,
-why one was chosen, what authority permitted shipping — and whether the shipped state
-is exactly the reviewed state.*
+Git records *what changed*. MADGRIX records why the work began, what alternatives were tried, what was independently checked, why one candidate was allowed to ship, and whether the state that shipped is exactly the state that was reviewed.
 
-## Why it matters
+## Why it exists
 
-Giving each agent its own fork is commodity infrastructure now. The hard part — and the
-invention here — is **adjudication plus enforcement**:
+Fork-per-agent is becoming commodity infrastructure. The difficult problem is **adjudication plus enforcement**:
 
-1. **Competing implementations, one task.** Several agents (contenders) tackle the same
-   frozen task in isolated forks.
-2. **Independent evidence.** Each candidate is tested against checks the agents never
-   see, then judged by blind verifiers who score anonymized code.
-3. **A verdict with fixed rules.** Selection follows a published order — correctness,
-   then regressions, then security, then blast radius, then minimality — followed by a
-   blind 2-of-3 vote. No vibes, no loudest-agent-wins, and ties mean *abstain*, not a
-   coin flip.
-4. **Exact-state authorization.** The permit to ship binds the *exact* reviewed code,
-   baseline, and destination. If anything moved since the review, the permit dies.
-5. **Proof you can check offline.** The whole chain is signed into a promotion bundle
-   anyone can verify with no network and no trusted server.
+1. **Competing implementations.** Multiple agents can work on one frozen task in isolated Artifact repositories.
+2. **Intent before action.** Each agent registers a machine-readable WorkClaim before writing code; deterministic conflict logic tracks path, symbol, dependency, contract, interface, and schema interactions.
+3. **Independent evidence.** Candidate evidence enters through a separately authenticated evaluation domain with read-only repository credentials.
+4. **No LLM authority.** Mandatory gates are non-compensatory. A security, provenance, tamper, or correctness failure cannot be outweighed by style or plausibility.
+5. **Blind verification.** Verifiers commit a ReferenceReport before candidates are exposed, receive anonymized labels, reveal once, and submit signed reports. Invalid reveal means inadmissible; no rewritten retry.
+6. **Exact-state promotion.** A single-use permit binds task, baseline, candidate tree digest, evaluation bundle, policy, and destination HEAD.
+7. **Proof after shipping.** Promotion evidence is encoded as in-toto-style statements in DSSE envelopes and can be checked offline.
 
-Humans can resolve genuine ambiguities and trade-offs — but they can never override an
-integrity gate (a failed test, a tampered file, a signature mismatch). Those require
-starting over, not an exception.
+## Trust model
 
-## Architecture
-
-Five trust zones with a strict credential matrix:
+MADGRIX separates five trust zones:
 
 ```
-┌──────────────┐   ┌──────────────┐   ┌──────────────┐   ┌──────────────┐   ┌──────────────┐
-│ Control plane │ → │ Contender    │ → │ Evaluation   │ → │ Verdict      │ → │ Promotion    │
-│ TaskAuthority │   │ microVMs     │   │ domain       │   │ plane        │   │ service      │
-│ (Durable      │   │ (one fork    │   │ (hidden      │   │ (gates →      │   │ (sole        │
-│  Object)      │   │  per agent)  │   │  oracles,    │   │  dominance →  │   │  canonical   │
-└──────────────┘   └──────────────┘   │  blind       │   │  blind vote) │   │  writer)     │
-                                      │  verifiers)  │   └──────────────┘   └──────────────┘
-                                      └──────────────┘
+Control plane
+    │
+    ├── Contender repositories / agent work
+    │
+    ├── Independent evaluation domain
+    │
+    ├── Verdict plane
+    │
+    └── Promotion service ──► canonical repository
 ```
 
-Contenders hold short-lived write tokens for *their own fork only*. Verifiers get no
-repo access at all. Only the promotion service can write canonical state, and it is
-unreachable from contender sandboxes. Full detail with diagrams:
-`docs/ARCHITECTURE.md`.
+Runtime identities are also separated:
 
-## Quickstart (fresh machine)
+- `AGENT_SERVICE_TOKEN` — WorkClaim/context/contender operations.
+- `EVALUATION_SERVICE_TOKEN` — read-only evaluator credentials and evidence submission.
+- `CONTROL_SERVICE_TOKEN` — task freeze, verifier protocol, verdict, and promotion.
+- Artifacts repo tokens are short-lived and scoped to one repository and one access level.
 
-Requirements: **Node 24** (tested on v24.20.0), **npm 10**. Everything runs locally —
-no credentials, no network, no deploys.
+Only the promotion path receives canonical write authority.
+
+## Competition-critical implementation
+
+The production path now includes:
+
+- Real Artifacts binding through `ArtifactsPort`.
+- WorkClaim registration before agent execution.
+- Cloudflare Artifacts fork attempt plus a documented **baseline-copy fallback** for the current beta fork-endpoint failure observed during live Artifacts validation.
+- Official `cf.artifacts.repo.pushed` envelope normalization.
+- Queue → per-task Durable Object event routing and content-derived deduplication.
+- Real Verdict Seam route; no `501` placeholder.
+- Authority-owned candidate anonymization.
+- Signed blind-verifier report validation.
+- Exact-state permits.
+- Trusted Cloudflare Container with Git for canonical promotion.
+- Bit-for-bit promotion of the **reviewed candidate commit SHA**.
+- HEAD-race protection through the permit plus Git fast-forward compare-and-swap.
+- Durable `PromotionWorkflow` retry wrapper.
+- External real-agent runner.
+- Independent real-candidate evaluator.
+- Full live-infrastructure orchestrator: `npm run live:e2e`.
+- Offline promotion-bundle verifier.
+
+### What has actually been validated
+
+On GitHub Actions for the competition branch:
+
+```
+npm run typecheck        PASS
+npm run build            PASS
+npm test                 110 tests / 27 suites / 0 failures
+npm run slice            SLICE OK
+npm run headmove         HEAD-MOVE OK
+npm run bench            26/26 adversarial trials; zero_tolerance_ok=true
+```
+
+The Cloudflare build includes the Worker and trusted promotion-container image.
+
+Separately, real Cloudflare Artifacts validation has already demonstrated repository creation, Git push/clone, scoped read/write tokens, and token revocation. The beta repository `fork()` endpoint returned a Cloudflare server error during that validation, which is why MADGRIX carries the explicit baseline-copy fallback.
+
+### What is **not** claimed yet
+
+The new production path has **not yet been deployed and run end-to-end against the user's Cloudflare account** from this development environment. The remaining proof step is:
+
+```
+real deployed Worker
+→ real task
+→ 3 real agents
+→ 3 real Artifact repos
+→ real pushed events
+→ Queue
+→ TaskAuthority
+→ independent evaluation
+→ blind verifier reports
+→ Verdict Seam
+→ exact candidate promotion
+→ promotion.bundle
+→ VERIFIED
+```
+
+`npm run live:e2e` is written to execute exactly that path and fails if real Artifact push events do not arrive.
+
+The ordinary benchmark stratum remains synthetic harness validation, **not evidence** of real-world accuracy uplift. The real SWE-bench/SpecBench procedure is pre-registered in `docs/BENCHMARK_RUNBOOK.md`.
+
+Production Sigstore signing is also future hardening; the current competition verifier uses Ed25519 with the same DSSE envelope structure.
+
+## Local verification
+
+Requirements: Node 24, npm, Git, Docker for the Cloudflare container build.
 
 ```bash
 npm install
-npm run typecheck                     # must pass
-npm test                              # 105 tests, 26 suites
-npm run slice                         # the full loop: task → claims → forks → evaluation
-                                      # → blind verifiers → verdict → permit → promotion
-                                      # → signed bundle → offline verification
-                                      # ends with SLICE OK
-npm run headmove                       # destination-head-move loop: permit expiry →
-                                      # re-evaluation → re-promotion (HEAD-MOVE OK)
-npm run verify -- .slice-output/promotion.bundle   # offline check: 8-line transcript + VERIFIED
-npm run bench                         # benchmark harness (synthetic / harness-validation only)
+npm run typecheck
+npm run build
+npm test
+npm run slice
+npm run headmove
+npm run verify -- .slice-output/promotion.bundle
+npm run bench
 ```
 
-Notes:
+Expected test summary at the current competition-critical branch:
 
-- `npm run slice` writes `.slice-output/promotion.bundle` (gitignored). No credentials,
-  no network, no deploys. Node 24 type-stripping runs the `.ts` sources directly.
-- `node --test test/` (directory form) fails on this Node build
-  (`Cannot find module '…/test'`), so the `test` script uses the equivalent glob
-  `node --test "test/**/*.test.ts"`, which runs the identical test set.
-- The slice's *outcomes* are deterministic (verdict ACCEPT, winner contender-1,
-  quarantine, replay consumed, bundle VERIFIED) but its *IDs* are fresh each run: task
-  hashes, nonces, tokens, and permit values differ run to run. Quote assertions, not hex.
-  See `docs/DEMO_SCRIPT.md`.
+```
+tests 110
+suites 27
+pass 110
+fail 0
+```
 
-## The vertical slice
+## Real competition run
 
-`src/harness/slice.ts` (`runSlice()`) is the proof the whole protocol works together —
-one realistic task ("`isTokenExpired` returns true iff `exp <= now`"), three contenders
-(one correct, one subtly wrong at the boundary, one that tampers with test material),
-blind verifiers (one reveals with the wrong nonce → inadmissible, no retry):
+The live path intentionally does not use `FakeArtifacts`.
 
-1. **Freeze task** — intent → task record → task authority (task_hash pins
-   intent, baseline, policy).
-2. **Work claims** — 3 registrations; contract conflict on `JWTClaims` classifies
-   RED (proceed-with-awareness, counted in blast radius).
-3. **Forks** — idempotent fork per contender, 3600s write-scoped tokens.
-4. **Contender work** — pushes via the fake git-protocol stand-in.
-5. **Queue ingestion** — at-least-once delivery, dedupe (`ACK_DUP`), out-of-order
-   rejection.
-6. **Evaluation** — admission gates, hidden oracle, manifest-hash tamper →
-   mechanical quarantine (token revoked, downstream effects canceled).
-7. **Blind verifiers** — commit → anonymized judging → reveal → report; invalid
-   reveal is inadmissible with no retry (frozen rule); report signatures verified
-   against keys registered at task freeze.
-8. **Verdict seam** — non-compensatory eligibility gates, objective dominance
-   (correctness → regressions → security → blast radius → minimality), then blind
-   2-of-3 vote → `ACCEPT` with contender-1 the unique dominant candidate.
-9. **Permit + promotion** — single-use exact-state permit; replay is a no-op
-   `ALREADY_CONSUMED` ACK; evaluation-bundle hash re-checked at write time;
-   canonical head moves exactly once.
-10. **Attestation** — in-toto link → test result → verification result →
-    authority predicate, all DSSE-signed into one bundle.
-11. **Offline verify** — `node src/cli/verify.ts` prints the exact 8-line
-    transcript and exits 0 (`VERIFIED`) or 1 (`NOT VERIFIED`).
+High-level prerequisites:
 
-Any unexpected outcome fails the slice with a non-zero exit and a clear message.
+1. Deploy the Worker with the `ARTIFACTS`, `TASK_AUTHORITY`, promotion-container, Workflow, Queue, and three secret bindings declared in `cloudflare.config.ts`.
+2. Configure Artifact push events from the competition namespace into `madgrix-events`.
+3. Have a baseline Artifact repository and exact baseline commit.
+4. Provide a real coding-agent command and independent evaluation commands.
 
-## Honest limitations
+Then run:
 
-- **In-memory Artifacts stand-in.** `FakeArtifacts` implements the `ArtifactsPort`
-  interface (repos, scoped tokens, content-addressed commits, queue events) in memory.
-  Nothing touches real git, Cloudflare, or the network. The platform layer
-  (`src/do/TaskAuthority.ts`, `src/worker/index.ts`) is written against the port, so
-  production swaps in real Artifacts without changing protocol logic.
-- **Remote binding untested from this sandbox.** The port is written against the real
-  Artifacts API, but no live Cloudflare end-to-end run has happened from here yet —
-  that needs a direct-egress machine or deploy permission. See
-  `docs/PRODUCTION_DEPLOYMENT.md`.
-- **Deterministic verifier stand-ins.** The slice's "contenders" and "verifiers" are
-  deterministic harness code, not LLMs. The ordering guarantees (commit before seeing
-  candidates, no retry after an invalid reveal, signature verification) are real; the
-  judgments are scripted.
-- **Ed25519 slice signer vs production Sigstore.** The slice signs with Ed25519; the
-  DSSE envelope shape is identical to production's Sigstore path.
+```bash
+npm run live:e2e
+```
 
-## The paper trail
+The orchestrator requires environment variables documented at the top of `scripts/live-e2e.ts`. It freezes verifier keys before candidate creation, launches three agents concurrently, waits for real push-event delivery, evaluates immutable candidate SHAs independently, runs the Verdict Seam, promotes the exact reviewed commit, emits a promotion bundle, and invokes the offline verifier.
 
-This repo is submission evidence, not just code. The full chain of reasoning is
-checked in:
-
-- `research/RESEARCH.md` — the deep-research report: paper catalog, 25-item Git
-  pain-point ranking, competitive landscape, demo arc, risks.
-- `specs/` — six engineering specifications. **#1 Promotion Protocol, #3 Evaluation
-  Threat Model, #5 Cloudflare Runtime Model are FROZEN-v1** (content hashes in
-  `specs/FROZEN.json`; amendment-only — see `specs/amendments/`). #2 Intent/Conflict
-  Graph, #4 Attestation Protocol, #6 Benchmark Protocol harden in parallel.
-- `docs/DEVELOPMENT_LOG.md` — the build history: what was decided, when, and why.
-- `docs/ENTRY_BLUEPRINT.md` — the earliest sketch (superseded; preserved for the record).
+Provider-specific coding agents are deliberately not hardcoded. `MADGRIX_AGENT_COMMAND` may invoke Codex, Claude Code, Aider, an AOS/Agent-Fleet runner, or another coding-agent command.
 
 ## API surface
 
-Worker (`src/worker/index.ts`):
+| Method | Route | Identity | Purpose |
+|---|---|---|---|
+| POST | `/tasks` | CONTROL | Freeze task + verifier/operator keys |
+| GET | `/tasks/:id/context` | AGENT/CONTROL | Frozen task, claims, contender summaries |
+| POST | `/tasks/:id/claim` | AGENT/CONTROL | Register WorkClaim + conflict findings |
+| POST | `/tasks/:id/contenders` | AGENT/CONTROL | Create isolated contender repo + scoped write token |
+| POST | `/tasks/:id/evaluator-credentials` | EVALUATION | Mint short-lived read-only candidate credential |
+| POST | `/tasks/:id/evidence` | EVALUATION | Submit content-addressed evaluation bundle |
+| POST | `/tasks/:id/verifiers/commit` | CONTROL | Record blind-verifier commitment |
+| POST | `/tasks/:id/verifiers/labels` | CONTROL | Assign anonymized candidate labels after commitments |
+| POST | `/tasks/:id/verifiers/reveal` | CONTROL | Validate one-time reveal |
+| POST | `/tasks/:id/verifiers/report` | CONTROL | Submit signed verifier report |
+| POST | `/tasks/:id/verdict` | CONTROL | Execute Verdict Seam and issue permit on ACCEPT |
+| POST | `/tasks/:id/promote` | CONTROL | Exact-state canonical promotion |
+| GET | `/tasks/:id/ledger` | current route | Task ledger |
 
-| Method | Route | What it does |
-|---|---|---|
-| POST | `/tasks` | Register intent → `task_id`, `task_hash` |
-| POST | `/tasks/:id/claim` | Register work claim → conflict classification |
-| POST | `/tasks/:id/contenders` | Fork baseline per agent → fork repo + short-lived write token |
-| POST | `/tasks/:id/evidence` | Submit evaluation bundle (evaluation-domain callers only) |
-| POST | `/tasks/:id/verdict` | Run the verdict seam across contenders |
-| POST | `/tasks/:id/promote` | Present a permit → exact-state, single-consume promotion |
-| GET | `/tasks/:id/ledger` | Verifiable history for the task |
-| GET | `/tasks/:id/attestation/:pid/verify` | Offline attestation verification data |
+The task authority also exposes internal RPC transitions for queue ingestion, permit issuance, verdict execution, and post-write promotion finalization.
 
-Durable Object (`src/do/TaskAuthority.ts`) exposes `POST /init`, `/event`,
-`/claim`, `/contender`, `/evidence` and `GET /state`. `/claim` rejects bodies
-that carry a `work_id` (authority-issued only) and returns the conflict list;
-`/evidence` runs the real evaluation submission against the state machine
-(422 on task mismatch).
+## Exact-state promotion
 
-## Benchmark harness
+Promotion preserves the reviewed candidate Git identity.
 
-`npm run bench` runs `src/lib/benchmark.ts` — a **synthetic, harness-validation**
-implementation of `specs/BENCHMARK_PROTOCOL.md`, not the real benchmark:
+The trusted container:
 
-- Ordinary stratum: 20 tasks × 3 contenders (6×3 with `--quick`), seeded PRNG,
-  arms B/C/D over identical fixed candidate sets, Selection Regret + paired
-  bootstrap CIs. The ≥25% D-vs-C precommit is **reported, not exit-gated** —
-  manufacturing it as evidence would be dishonest.
-- Adversarial stratum: 26 trials (13 attack classes × 2) against the **real**
-  protocol modules — zero-tolerance checks (no false/stale/duplicate/quarantined
-  promotions, 100% fail-closed).
-- Conflict stratum: 30 labeled claim pairs through the real classifier,
-  precision/recall/FPR with 95% CIs, as-measured.
+1. fetches the permit-bound destination HEAD,
+2. fetches the exact winner candidate SHA,
+3. recomputes `tree-digest/v1`,
+4. rejects a tree mismatch,
+5. rejects a foreign destination-head move,
+6. verifies the candidate descends from the permit-bound destination,
+7. fast-forward pushes the **candidate SHA itself** to canonical `main`,
+8. lets the Durable Object consume the permit only after the canonical write is known to exist.
 
-Nothing here is evidence for the competition claim; the report says so on every
-page. The full benchmark on real datasets (SWE-bench etc.) is future work —
-`docs/BENCHMARK_RUNBOOK.md` is the pre-registered procedure for running it.
+A retry after a lost response sees the exact candidate already canonical and reconciles as `ALREADY_WRITTEN`; it does not create a second change.
 
-## Design notes
+`tree-digest/v1` is specified in `specs/amendments/tree-digest-v1.md`.
 
-- **Fail-closed.** Missing evidence abstains or rejects; nothing is accepted on narration.
-- **Blind verifiers.** Commit before seeing candidates; a wrong reveal is
-  inadmissible, with no retry and no rewritten opinions; reports are signature-checked.
-- **Evaluation plane isolation.** Contenders hold write tokens on their forks only —
-  never on the baseline, the evaluation material, policy, or the ledger.
-- **Idempotent promotion.** The same permit presented twice returns
-  `ALREADY_CONSUMED` (no-op ACK): no duplicate promotions, no duplicate effects,
-  canonical head unchanged. A moved destination head expires the permit.
-- **Mechanical quarantine only.** Agent accusation is never a trigger; revocation
-  cancels side effects, freezes evidence, and taints downstream. Quarantined state
-  can never be promoted.
-
-## Docs
-
-- `docs/DEMO_SCRIPT.md` — 7-minute narrated demo: exact commands, expected output,
-  tamper-rejection showcase.
-- `docs/ARCHITECTURE.md` — system architecture, with a mermaid diagram and a rendered
-  SVG (`docs/architecture.svg`).
-- `docs/SECURITY.md` — threat model: the 13-attack battery, trust zones, credential
-  matrix, honest sandbox constraint, non-claims.
-- `docs/PRODUCTION_DEPLOYMENT.md` — what runs where, deploy commands, honest
-  validated/blocked status.
-- `docs/NAME_SHORTLIST.md` — the naming record: why "SEAM" was rejected, the
-  shortlist, and the decision (Madgrix).
-- `docs/SUBMISSION_CHECKLIST.md` — competition requirements mapped to repo locations.
-- `docs/DEVELOPMENT_LOG.md` — the full build history.
-
-## Layout
+## Repository layout
 
 ```
 src/
-  lib/            protocol layer (state machines, pure where possible)
-    task-state.ts     task + authority lifecycle
-    claims.ts         work-claim registration + conflict classification
-    evaluation.ts     evaluation bundles + admission gates
-    verifiers.ts      commit→judge→reveal protocol + deterministic verifiers
-    verdict-seam.ts   eligibility gates → dominance ranking → blind 2-of-3 vote
-    permit.ts         exact-state single-consume permits
-    attestation.ts    in-toto chain + DSSE envelopes + promotion bundle
-    artifacts-port.ts platform interface
-    fake-artifacts.ts in-memory platform substrate (NOT production)
-    benchmark.ts      synthetic/harness-validation benchmark (NOT evidence)
-  do/             TaskAuthority Durable Object (platform layer)
-  worker/         Worker fetch router (platform layer)
-  harness/        the vertical slice (src/harness/slice.ts) + head-move loop
-  cli/            offline bundle verifier (src/cli/verify.ts)
-test/             unit tests + slice integration test
-docs/             submission docs
-specs/            FROZEN-v1 protocol specs (amendment-only) + amendments
-research/         deep-research report
+  lib/                    protocol + deterministic policy
+  do/TaskAuthority.ts     authoritative per-task state machine
+  do/PromotionContainer.ts trusted Git promotion container
+  worker/index.ts         Cloudflare Worker + Queue + Workflow
+  harness/                deterministic local protocol proofs
+  cli/verify.ts           offline promotion-bundle verifier
+
+container/
+  Dockerfile
+  promote.sh
+  copy-baseline.sh
+
+scripts/
+  run-contenders.mjs      concurrent real-agent runner
+  evaluate-candidate.ts   independent evaluation-domain runner
+  live-e2e.ts             complete real Cloudflare competition path
+
+test/                     unit/integration/adversarial tests
+specs/                    engineering contracts + amendments
+research/                 research report
+docs/                     architecture, deployment, security, demo, benchmark
 ```
 
-Conventions: TypeScript strict, erasable syntax only, `.ts` import extensions,
-`import type` for type-only imports.
+## Evidence discipline
+
+MADGRIX deliberately distinguishes:
+
+- **Implemented + CI-validated**
+- **Live Artifacts primitive validated**
+- **Live deployed MADGRIX E2E pending**
+- **Synthetic benchmark harness**
+- **Future production hardening**
+
+Do not turn one category into another in demos, docs, or benchmark claims.
 
 ## License
 
