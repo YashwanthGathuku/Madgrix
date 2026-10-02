@@ -46,7 +46,7 @@ export default defineConfig({
 		// this queue (at-least-once, unordered) and are ingested by the
 		// Worker's `queue()` export → per-task DO (event_key dedupe) → effects.
 		// DEPLOY NOTE: the `madgrix-events` queue must exist in the account
-		// before deploy (e.g. `cf queues create seam-events`); a dead-letter
+		// before deploy (e.g. `cf queues create madgrix-events`); a dead-letter
 		// queue is recommended for poison messages (see docs/PRODUCTION_DEPLOYMENT.md).
 		triggers: [triggers.queue({ name: "madgrix-events", maxBatchSize: 10, maxBatchTimeout: 30 })],
 	},
