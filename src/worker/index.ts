@@ -765,10 +765,8 @@ export async function handleVerifierReport(env: Env, taskId: string, request: Re
 }
 
 /**
- * POST /tasks/:id/verdict — SKELETON. The verdict seam (spec 1 §9:
- * non-compensatory AND gates, objective dominance, blind 2-of-3 verifier
- * vote) is protocol-layer logic owned by the sibling. The platform exposes
- * the route shape; computation is not implemented here.
+ * POST /tasks/:id/verdict — execute the frozen Verdict Seam against
+ * authority-held evidence and issue an exact-state permit only on ACCEPT.
  */
 export async function handleVerdict(env: Env, taskId: string, request: Request): Promise<Response> {
 	if (!(await requireControlPlane(request, env))) return json({ error: "control_plane_auth_required" }, 401);
@@ -802,12 +800,10 @@ export async function handleVerdict(env: Env, taskId: string, request: Request):
 }
 
 /**
- * POST /tasks/:id/promote — promotion preconditions, PLATFORM SKELETON.
- * The promotion service is the ONLY canonical writer (spec 3 §2). This
- * skeleton performs every platform-owned precondition check against the
- * task authority + Artifacts, and stops before the canonical write:
- * the write itself executes in the merge sandbox with a merge-scoped token
- * (spec 5 §7), and permit consumption is a protocol-layer DO transition.
+ * POST /tasks/:id/promote — exact-state canonical promotion.
+ * The Worker validates the permit/evidence, mints short-lived Git
+ * capabilities, delegates the single canonical write to the trusted
+ * promotion container, then atomically finalizes/consumes the permit.
  */
 export async function handlePromote(
 	env: Env,
@@ -905,7 +901,12 @@ export async function handlePromote(
 			detail?: string;
 		};
 		if (!promoRes.ok) {
-			const status = promotion.outcome === "EXPIRED_HEAD_MOVED" || promotion.outcome === "TREE_MISMATCH" ? 409 : 502;
+			const status =
+				promotion.outcome === "EXPIRED_HEAD_MOVED" ||
+				promotion.outcome === "TREE_MISMATCH" ||
+				promotion.outcome === "BASELINE_MISMATCH"
+					? 409
+					: 502;
 			return json({ ...promotion, permit_id }, status);
 		}
 		if (
@@ -1119,8 +1120,11 @@ export async function fetch(request: Request, env: Env): Promise<Response> {
 /* ------------------------------------------------------------------ */
 
 /**
- * Queue consumer: each message is `{ task_id, event: QueuePushEvent }`.
- * Forwards to the task's Durable Object (POST /event) for `event_key`
+ * Queue consumer accepts Cloudflare's official `cf.artifacts.repo.pushed`
+ * envelope (plus the deterministic internal test envelope). Contender repo
+ * names encode the opaque task id, so pushes route to the correct per-task
+ * authority without a mutable global registry. Forwards to the task's
+ * Durable Object (POST /event) for `event_key`
  * dedupe + authoritative transition, then executes returned effects.
  * Returns normally to ACK; throws only on genuine failure so the message
  * is redelivered (spec 5 §10: MUST NOT drop the event).
