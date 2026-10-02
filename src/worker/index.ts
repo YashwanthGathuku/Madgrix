@@ -51,6 +51,7 @@ import type {
 import { forkIdempotent } from "../lib/artifacts-port.ts";
 import type { SimulatedGit } from "../lib/artifacts-port.ts";
 import { joinHashParts, randomHex, sha256Hex } from "../lib/canonical.ts";
+import { contenderRepoName, normalizeArtifactQueueBody } from "../lib/artifact-events.ts";
 import type {
 	AuthorityState,
 	ContenderRecord,
@@ -505,7 +506,7 @@ export async function handleCreateContender(
 
 	const contender_id = (await sha256Hex(joinHashParts("contender", taskId, agent_id))).slice(0, 32);
 	const forkOpId = await sha256Hex(joinHashParts("fork", taskId, contender_id));
-	const forkName = forkOpId.slice(0, 32);
+	const forkName = contenderRepoName(taskId, forkOpId);
 
 	const port = productionPort(env);
 	const { repo, created, initialTokenPlaintext, viaImportFallback } = await forkIdempotent(
@@ -1022,10 +1023,12 @@ export async function fetch(request: Request, env: Env): Promise<Response> {
 export async function queue(batch: QueueBatchLike, env: Env): Promise<void> {
 	const port = productionPort(env);
 	for (const msg of batch.messages) {
-		const { task_id, event } = msg.body as { task_id: string; event: QueuePushEvent };
-		if (typeof task_id !== "string" || !event || typeof event.repo !== "string") {
-			throw new Error("queue: malformed message body; redelivering will not help — drop manually");
-		}
+		const routed = normalizeArtifactQueueBody(msg.body);
+		// Event subscriptions may share a queue with unrelated Artifacts
+		// lifecycle events or pushes to baseline/canonical repositories.
+		// Those are intentionally acknowledged without mutating task state.
+		if (routed === null) continue;
+		const { task_id, event } = routed;
 		const res = await doRpc(taskStub(env, task_id), "/event", { body: { event } });
 		if (!res.ok) {
 			throw new Error(`queue: DO /event failed for task ${task_id}: HTTP ${res.status}`);
