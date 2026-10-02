@@ -54,7 +54,7 @@ blind verifiers. Narrate the beats as the 12 stages scroll:
 | [8] Verdict seam | **The decision.** "Fixed rules: correctness first, then regressions, security, blast radius, minimality — then a blind 2-of-3 vote." | `ACCEPT`, winner contender-1 |
 | [9] Permit + promotion | **Money scene 2.** "The permit binds the exact code, baseline, and destination. Present it twice — the second is a no-op." | `PROMOTED`, then replay → `ALREADY_CONSUMED` |
 | [10] Attestation | "Every step is chained into signed in-toto statements — one bundle, DSSE-signed." | `.slice-output/promotion.bundle` written |
-| [11] Offline verify | "And the proof, checked with no network and no trusted server." | 8-line transcript + `VERIFIED`, then `SLICE OK` |
+| [11] Offline verify | "And the proof, checked with no network against the pinned authority key." | 10-line transcript + `VERIFIED`, then `SLICE OK` |
 
 **Do not read hashes aloud.** The candidate SHAs above and the baseline prefix
 `cb8e6dc15090` are the only values stable across runs; everything else (task hash,
@@ -63,11 +63,12 @@ nonces, commitments, token IDs, permit values) is fresh per run.
 ## 5:30–6:15 — The proof, slowly
 
 ```bash
-npm run verify -- .slice-output/promotion.bundle
+npm run verify -- --trust-key .slice-output/authority.pub .slice-output/promotion.bundle
 ```
 
 **Say:** "This is the moment that matters. A third party — an auditor, a customer,
-anyone — checks the promotion with nothing but the bundle." Read the eight lines:
+anyone — checks the promotion with nothing but the bundle and the authority's public
+key, pinned out of band. A key inside the bundle proves nothing." Read the ten lines:
 
 ```
 subject digest........ OK
@@ -76,8 +77,10 @@ chain integrity....... OK
 hidden evaluation..... PASSED
 policy digest......... OK
 destination parent.... OK
+authority key......... PINNED
 signature............. VALID
-promotion authority... CONSUMED ONCE
+permit id............. RECOMPUTED FROM BOUND FIELDS
+ledger chain.......... OK
 
 VERIFIED
 ```
@@ -92,7 +95,7 @@ const b=JSON.parse(fs.readFileSync(p,'utf8'));
 const s=b.statements[0].signatures[0];
 s.sig = s.sig.slice(0,10) + (s.sig[10]==='A'?'B':'A') + s.sig.slice(11);
 fs.writeFileSync(p, JSON.stringify(b));"
-npm run verify -- /tmp/tampered.bundle
+npm run verify -- --trust-key .slice-output/authority.pub /tmp/tampered.bundle
 ```
 
 **Say:** "One flipped character in one signature." **Expected:** `chain integrity.......

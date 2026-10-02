@@ -18,7 +18,10 @@
  *   against live claims); `/contender` → `registerContender` (create-only:
  *   an existing record is returned unchanged, never overwritten);
  *   `/evidence` → `submitEvaluation` (rejects bundles for a different
- *   task). Verdict, permit, and quarantine logic lives in task-state.ts.
+ *   task); `/promotion/finalize` → `attemptPromotion` +
+ *   `recordPromotionBundle` (signs the ship record with
+ *   AUTHORITY_SIGNING_KEY in the same transaction). Verdict, permit, and
+ *   quarantine logic lives in task-state.ts.
  *
  * Structural typing note: this class does NOT extend a real DurableObject
  * (no base class importable here; see workers.d.ts). The runtime only needs
@@ -33,6 +36,7 @@ import {
 	createAuthority,
 	ingestQueueEvent,
 	issuePermit,
+	recordPromotionBundle,
 	registerClaim,
 	registerContender,
 	registerOperatorKeys,
@@ -58,6 +62,7 @@ import type {
 } from "../lib/types.ts";
 import { joinHashParts, randomHex, sha256Hex } from "../lib/canonical.ts";
 import { SELECTOR_POLICY_VERSION } from "../lib/types.ts";
+import { loadAuthoritySigner, type AuthoritySigner } from "../lib/authority-key.ts";
 
 /** Frozen spec 1 §10: permit = SHA256(task_hash || baseline || winning_tree
  *  || eval_bundle || policy || expected_destination_head), with "||"
@@ -422,21 +427,63 @@ export class TaskAuthority {
 			});
 		}
 
-		/* -- POST /promotion/finalize — consume only after canonical write --- */
+		/* -- POST /promotion/finalize — consume + sign the ship record ------ */
+		// Spec 1 §11: after the canonical write, mark the permit consumed,
+		// append to the ledger and record the ship record (the authority-
+		// signed promotion bundle) in ONE storage transaction.
 		if (request.method === "POST" && path === "/promotion/finalize") {
 			const parsed = await readJsonBody(request);
 			if (!parsed.ok) return parsed.response;
-			const body = parsed.body as { permit_id?: string; verified_parent?: string; tree_sha256?: string };
-			if (!body.permit_id || !body.verified_parent || !body.tree_sha256) return json({ error: "invalid_promotion_finalize" }, 400);
+			const body = parsed.body as {
+				permit_id?: string;
+				verified_parent?: string;
+				tree_sha256?: string;
+				promoted_sha?: string;
+			};
+			if (!body.permit_id || !body.verified_parent || !body.tree_sha256 || !body.promoted_sha) {
+				return json({ error: "invalid_promotion_finalize" }, 400);
+			}
+			// Without the signing key no ship record can be recorded, so nothing
+			// is consumed; the caller retries once the secret is configured.
+			let signer: AuthoritySigner;
+			try {
+				signer = await loadAuthoritySigner(this.doEnv["AUTHORITY_SIGNING_KEY"]);
+			} catch (err) {
+				return json({ error: "authority_signing_key_unavailable", detail: (err as Error).message }, 503);
+			}
 			const ctx = await productionCtx();
 			return this.doState.storage.transaction(async () => {
 				const state = await this.loadState();
 				if (state === null) return json({ error: "not_initialized" }, 404);
 				const r = await attemptPromotion(state, body.permit_id!, body.verified_parent!, body.tree_sha256!, ctx);
-				if (r.state !== state) await this.doState.storage.put(STATE_KEY, r.state);
-				const status = r.outcome === "PROMOTED" || r.outcome === "ALREADY_CONSUMED" ? 200 : 409;
-				return json({ outcome: r.outcome, effects: r.effects }, status);
+				if (r.outcome !== "PROMOTED" && r.outcome !== "ALREADY_CONSUMED") {
+					if (r.state !== state) await this.doState.storage.put(STATE_KEY, r.state);
+					return json({ outcome: r.outcome, effects: r.effects }, 409);
+				}
+				// A finalize retry returns the bundle signed the first time.
+				const stored = r.state.promotion_bundles?.[body.permit_id!];
+				if (stored) return json({ outcome: r.outcome, effects: r.effects, bundle: stored });
+				try {
+					const recorded = await recordPromotionBundle(r.state, body.permit_id!, body.promoted_sha!, signer, ctx);
+					await this.doState.storage.put(STATE_KEY, recorded.state);
+					return json({ outcome: r.outcome, effects: r.effects, bundle: recorded.bundle });
+				} catch (err) {
+					// Nothing was stored: the permit stays unconsumed.
+					return json({ error: "promotion_bundle_failed", detail: (err as Error).message }, 500);
+				}
 			});
+		}
+
+		/* ---------------- GET /bundle — authority-signed ship record ------- */
+		if (request.method === "GET" && path === "/bundle") {
+			const state = await this.loadState();
+			if (state === null) return json({ error: "not_initialized" }, 404);
+			const bundles = state.promotion_bundles ?? {};
+			const permitId = url.searchParams.get("permit_id");
+			// Default: the task's most recent promotion.
+			const bundle = permitId === null ? Object.values(bundles).at(-1) : bundles[permitId];
+			if (!bundle) return json({ error: "bundle_not_found", permit_id: permitId }, 404);
+			return json(bundle);
 		}
 
 		/* ---------------- GET /state — debug/introspection ---------------- */

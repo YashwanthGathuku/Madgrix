@@ -38,7 +38,10 @@
  * spec 4 §4 (revisit when the public product name is chosen).
  */
 
-import { canonicalJson } from "./canonical.ts";
+import { canonicalJson, sha256Hex } from "./canonical.ts";
+import { verifyLedgerChain } from "./ledger.ts";
+import { buildPermitId } from "./permit.ts";
+import type { LedgerEntry } from "./types.ts";
 
 /* ------------------------------------------------------------------ */
 /* in-toto statement                                                   */
@@ -73,6 +76,12 @@ export interface AgentPromotionAuthorityPredicate {
 	verification: { result: "PASSED" | "FAILED"; policy_sha256: string };
 	destination: { repo: string; expected_parent: string };
 	authority: { nonce: string; single_use: true; permit_id: string; issued_at: string };
+	/**
+	 * Head of the task authority's hash-chained ledger when the bundle was
+	 * signed (authority-signing-v1). Signing it here binds the ledger the
+	 * bundle carries; the verifier recomputes the chain to this head.
+	 */
+	ledger?: { head_sha256: string };
 }
 
 /* ------------------------------------------------------------------ */
@@ -165,6 +174,8 @@ export async function buildPromotionAuthority(input: {
 	nonce: string;
 	permitId: string;
 	issuedAt: string;
+	/** Ledger head at signing (authority-signing-v1). */
+	ledgerHeadSha256?: string;
 }): Promise<InTotoStatement> {
 	const predicate: AgentPromotionAuthorityPredicate = {
 		intent: { digest: input.taskHash },
@@ -183,6 +194,7 @@ export async function buildPromotionAuthority(input: {
 			permit_id: input.permitId,
 			issued_at: input.issuedAt,
 		},
+		...(input.ledgerHeadSha256 === undefined ? {} : { ledger: { head_sha256: input.ledgerHeadSha256 } }),
 	};
 	return statement(AGENT_PROMOTION_AUTHORITY_V1, input.treeSha256, predicate);
 }
@@ -232,8 +244,9 @@ export async function verifyEnvelope(
 /* Promotion bundle verification (spec 4 §7 transcript).               */
 /* ------------------------------------------------------------------ */
 
+/** Promotion bundle, authority-signing-v1 (specs/amendments/authority-signing-v1.md). */
 export interface PromotionBundle {
-	version: 1;
+	version: 2;
 	statements: DsseEnvelope[];
 	ship: {
 		repo: string;
@@ -242,13 +255,15 @@ export interface PromotionBundle {
 		parent: string;
 		permit_id: string;
 	};
-	/** Ledger hashes; the permit_id must appear exactly once (consumed once). */
-	ledger_hashes: string[];
 	/**
-	 * SPKI DER (hex) of the promotion-authority Ed25519 public key that
-	 * signed the envelopes. Lets an offline verifier build a verify-only
-	 * signer from the bundle alone — no key-distribution side channel.
-	 * (Slice: the Ed25519 slice signer; production: Sigstore per spec 4 §6.)
+	 * The task authority's hash-chained ledger when the bundle was signed.
+	 * `head_sha256` is also signed into the authority statement.
+	 */
+	ledger: { head_sha256: string; entries: LedgerEntry[] };
+	/**
+	 * SPKI DER (hex) of the authority key that signed the envelopes. A
+	 * label, never a trust anchor: the verifier checks it equals the key it
+	 * has pinned and verifies every signature with the pinned key.
 	 */
 	authority_pubkey_der_hex: string;
 }
@@ -264,14 +279,17 @@ function subjectDigest(s: InTotoStatement | null): string | null {
 }
 
 /**
- * `$ verify promotion.bundle` — reproduces the spec 4 §7 transcript
- * lines IN ORDER. Any line failing → verified=false with the failing
- * line(s) named. Fully offline: the bundle carries everything needed.
+ * `$ verify promotion.bundle` — the spec 4 §7 transcript as amended by
+ * authority-signing-v1, IN ORDER. Any line failing → verified=false with
+ * the failing line(s) named. Offline: the bundle carries everything except
+ * the trust anchor. The caller pins the authority key: `signer` verifies
+ * with it and `opts.trustedKeyDerHex` is its SPKI DER (hex). Statements
+ * that do not verify under that key are not evaluated at all.
  */
 export async function verifyBundle(
 	bundle: PromotionBundle,
 	signer: Signer,
-	opts: { policyHash: string },
+	opts: { policyHash: string; trustedKeyDerHex: string },
 ): Promise<{ lines: VerifyLine[]; verified: boolean }> {
 	const lines: VerifyLine[] = [];
 	const fail = (label: string, detail: string): void => {
@@ -369,26 +387,65 @@ export async function verifyBundle(
 		);
 	}
 
-	// 7. signature — every envelope verifies (offline).
+	// 7. authority key — the key the bundle names is the key the verifier
+	// pinned. The embedded key is a label, never a trust anchor.
+	if (
+		typeof bundle.authority_pubkey_der_hex === "string" &&
+		bundle.authority_pubkey_der_hex.toLowerCase() === opts.trustedKeyDerHex.toLowerCase()
+	) {
+		lines.push({ label: "authority key", status: "PINNED" });
+	} else {
+		fail("authority key", "the bundle's authority key is not the pinned authority key");
+	}
+
+	// 8. signature — every envelope verifies under the pinned key (offline).
 	if (signaturesOk) {
 		lines.push({ label: "signature", status: "VALID" });
 	} else {
 		fail("signature", signatureDetail ?? "a DSSE signature did not verify");
 	}
 
-	// 8. promotion authority — permit_id present exactly once across
-	// bundle + ledger_hashes (single-use). For the slice: the ship record
-	// references the permit and ledger_hashes contains it exactly once.
-	const permitId = ap?.authority.permit_id ?? null;
-	const occurrences =
-		permitId === null ? 0 : bundle.ledger_hashes.filter((h) => h === permitId).length;
-	if (permitId !== null && bundle.ship.permit_id === permitId && occurrences === 1) {
-		lines.push({ label: "promotion authority", status: "CONSUMED ONCE" });
+	// 9. permit id — recomputes from the fields it binds (spec 1 §10,
+	// spec 4 §4) and is the permit the ship record names. Whether a permit
+	// was consumed once cannot be established offline; line 10 checks what
+	// the authority's signed ledger records.
+	const recomputedPermitId =
+		ap === null
+			? null
+			: await buildPermitId(
+					{
+						task_hash: ap.intent?.digest,
+						baseline_commit: ap.baseline?.git_commit,
+						winning_tree_sha256: ap.candidate?.tree_sha256,
+						evaluation_bundle_hash: ap.evaluation?.bundle_sha256,
+						selector_policy_hash: ap.verification?.policy_sha256,
+						expected_destination_head: ap.destination?.expected_parent,
+					},
+					sha256Hex,
+				);
+	if (ap !== null && recomputedPermitId === ap.authority?.permit_id && bundle.ship.permit_id === ap.authority.permit_id) {
+		lines.push({ label: "permit id", status: "RECOMPUTED FROM BOUND FIELDS" });
 	} else {
-		fail(
-			"promotion authority",
-			`permit_id ${permitId}: ship references ${bundle.ship.permit_id}, present ${occurrences}x in ledger_hashes (must be exactly once)`,
+		fail("permit id", "permit_id does not recompute from its bound fields, or the ship record names another permit");
+	}
+
+	// 10. ledger chain — the entries hash-chain to the head signed into the
+	// authority statement, and that signed ledger records this promotion
+	// exactly once.
+	const ledgerChain = await verifyLedgerChain(bundle.ledger?.entries, sha256Hex);
+	if (!ledgerChain.ok) {
+		fail("ledger chain", ledgerChain.detail);
+	} else if (ledgerChain.head !== bundle.ledger.head_sha256 || ledgerChain.head !== ap?.ledger?.head_sha256) {
+		fail("ledger chain", "the ledger does not end at the head signed into the authority statement");
+	} else {
+		const promotionPayloadHash = await sha256Hex(
+			canonicalJson({ permit_id: bundle.ship.permit_id, tree_sha256: bundle.ship.tree_sha256 }),
 		);
+		const recorded = bundle.ledger.entries.filter(
+			(e) => e.kind === "promotion_succeeded" && e.payload_hash === promotionPayloadHash,
+		).length;
+		if (recorded === 1) lines.push({ label: "ledger chain", status: "OK" });
+		else fail("ledger chain", `the signed ledger records this promotion ${recorded} times (must be exactly once)`);
 	}
 
 	return { lines, verified: lines.every((l) => l.status !== "FAIL") };

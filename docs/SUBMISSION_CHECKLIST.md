@@ -31,8 +31,8 @@ user decision or remaining work.
   `ALREADY_CONSUMED`, bundle `VERIFIED`).
 - `npm run headmove` → exit 0, ends with **`HEAD-MOVE OK`** (destination head move →
   permit `EXPIRED_HEAD_MOVED` → re-evaluation → re-promotion, exactly one write).
-- `npm run verify -- .slice-output/promotion.bundle` → 8-line transcript +
-  `VERIFIED`, exit 0.
+- `npm run verify -- --trust-key .slice-output/authority.pub .slice-output/promotion.bundle`
+  → 10-line transcript + `VERIFIED`, exit 0. Without a pinned key → exit 2.
 - Tamper check: one flipped signature byte → `NOT VERIFIED`, exit 1.
 - `npm run bench` → exit 0, `"zero_tolerance_ok": true` (13 attacks × 2 trials
   against the real protocol modules).

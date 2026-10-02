@@ -20,7 +20,7 @@ flowchart TB
     SEAM --> PERMIT["5. Promotion service — exact-state single-use permit<br/>binds task · baseline · winning tree · evaluation bundle · policy · destination head"]
     PERMIT --> PROMOTE["Canonical write — the sole writer<br/>replay → ALREADY_CONSUMED · destination HEAD moved → permit EXPIRED"]
     PROMOTE --> ATTEST["Attestation chain — in-toto statements, DSSE envelope<br/>→ promotion.bundle"]
-    ATTEST --> OFFLINE(["Offline verify — 8-line transcript → VERIFIED<br/>no network · no trusted server"])
+    ATTEST --> OFFLINE(["Offline verify — 10-line transcript → VERIFIED<br/>no network · pinned authority key"])
 ```
 
 ## The five trust zones
@@ -76,11 +76,15 @@ component that can write canonical state, and it lives inside the control plane.
    moved after the verdict, the permit is EXPIRED and the task must be re-evaluated.
 10. **Attest.** Each step emits an in-toto statement (link, test result, verification
     result, plus the custom `AgentPromotionAuthority/v1` predicate), chained and
-    signed in DSSE envelopes into `promotion.bundle`.
-11. **Verify offline.** Anyone can check the bundle with `npm run verify -- <bundle>`:
-    eight transcript lines (`subject digest`, `candidate digest`, `chain integrity`,
-    `hidden evaluation`, `policy digest`, `destination parent`, `signature`,
-    `promotion authority`) and `VERIFIED` — no network, no trusted server.
+    signed in DSSE envelopes into `promotion.bundle`. The TaskAuthority signs them
+    at promotion with `AUTHORITY_SIGNING_KEY`, together with the head of its
+    hash-chained ledger (`specs/amendments/authority-signing-v1.md`).
+11. **Verify offline.** Anyone holding the pinned authority public key can check the
+    bundle with `npm run verify -- --trust-key <key> <bundle>` (default key:
+    `keys/authority.pub`): ten transcript lines (`subject digest`, `candidate digest`,
+    `chain integrity`, `hidden evaluation`, `policy digest`, `destination parent`,
+    `authority key`, `signature`, `permit id`, `ledger chain`) and `VERIFIED` — no
+    network; the key embedded in the bundle is never trusted.
 
 ## The honest sandbox constraint
 
@@ -114,7 +118,7 @@ what white-box protects is evaluation *authority and persistence*).
 | TaskAuthority DO | `src/do/TaskAuthority.ts` | Durable Object wrapper around the state machine |
 | Worker router | `src/worker/index.ts` | HTTP routes for tasks, claims, contenders, evidence, verdict, promote, ledger |
 | Vertical slice | `src/harness/slice.ts` | The 12-stage end-to-end proof |
-| Offline verifier | `src/cli/verify.ts` | Verify-only Ed25519 signer; prints the 8-line transcript |
+| Offline verifier | `src/cli/verify.ts` | Verify-only Ed25519 signer over the pinned authority key; prints the 10-line transcript |
 | Benchmark harness | `src/lib/benchmark.ts` | Synthetic / harness-validation only — not evidence |
 
 In the current prototype the platform layer (`src/do/`, `src/worker/`) runs against

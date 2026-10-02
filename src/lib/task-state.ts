@@ -23,6 +23,16 @@ import {
 	sha256Hex as defaultSha256Hex,
 } from "./canonical.ts";
 import { checkPromotion, buildPermitId, createPermit } from "./permit.ts";
+import { LEDGER_GENESIS_PREV_HASH, ledgerEntryHash, sealLedger } from "./ledger.ts";
+import {
+	buildLinkStatement,
+	buildPromotionAuthority,
+	buildTestResultStatement,
+	buildVerificationResultStatement,
+	signEnvelope,
+	type PromotionBundle,
+	type Signer,
+} from "./attestation.ts";
 import { classifyPair, validateClaim, type ClaimInput } from "./claims.ts";
 import { verifyReveal } from "./verifiers.ts";
 import {
@@ -84,23 +94,34 @@ export type Effect =
 	| { kind: "notify"; to: string[]; message: string }
 	| { kind: "canonical_write"; repo: string; tree_sha256: string; parent: string };
 
-/** Append a content-hashed ledger entry (async — hashing is async). */
+/**
+ * Append a content-hashed ledger entry linked to the previous one
+ * (async — hashing is async). Seals any not-yet-hashed entries first.
+ */
 export async function appendLedger(
 	state: AuthorityState,
 	kind: string,
 	payload: unknown,
 	ctx: Ctx,
 ): Promise<AuthorityState> {
-	const payload_hash = await ctx.sha256Hex(canonicalJson(payload));
-	const entry: LedgerEntry = { seq: state.ledger.length, ts: ctx.now(), kind, payload_hash };
-	return { ...state, ledger: [...state.ledger, entry] };
+	const ledger = await sealLedger(state.ledger, ctx.sha256Hex);
+	const fields = {
+		seq: ledger.length,
+		ts: ctx.now(),
+		kind,
+		payload_hash: await ctx.sha256Hex(canonicalJson(payload)),
+		prev_hash: ledger.length === 0 ? LEDGER_GENESIS_PREV_HASH : ledger[ledger.length - 1].entry_hash,
+	};
+	const entry: LedgerEntry = { ...fields, entry_hash: await ledgerEntryHash(fields, ctx.sha256Hex) };
+	return { ...state, ledger: [...ledger, entry] };
 }
 
 /**
  * Create the authority for a frozen task. The genesis ledger entry
  * documents task creation; it carries an empty payload hash because
  * hashing is async and this constructor is sync — every subsequent
- * entry is content-hashed via appendLedger.
+ * entry is content-hashed via appendLedger, which also seals (hashes)
+ * the genesis entry on the first append.
  */
 export function createAuthority(task: TaskRecord): AuthorityState {
 	return {
@@ -120,7 +141,16 @@ export function createAuthority(task: TaskRecord): AuthorityState {
 		candidate_labels: {},
 		seen_event_keys: [],
 		escalations: [],
-		ledger: [{ seq: 0, ts: task.frozen_at, kind: "authority_created", payload_hash: "" }],
+		ledger: [
+			{
+				seq: 0,
+				ts: task.frozen_at,
+				kind: "authority_created",
+				payload_hash: "",
+				prev_hash: LEDGER_GENESIS_PREV_HASH,
+				entry_hash: "",
+			},
+		],
 	};
 }
 
@@ -986,6 +1016,96 @@ export async function attemptPromotion(
 				parent: permit.expected_destination_head,
 			},
 		],
+	};
+}
+
+/**
+ * Record the ship record for a consumed permit (spec 1 §11; amendment
+ * authority-signing-v1). The four attestation statements are built from
+ * this authority's own state: the permit (every value it binds), the
+ * stored evaluation bundle, the winner's verdict, the contender's fork and
+ * the promoted commit the promotion service reported. The authority
+ * statement also carries the current ledger head, so the signature covers
+ * the ledger the bundle ships with. The bundle is stored under the permit
+ * id; it adds no ledger entry of its own, so its head stays the ledger's
+ * head at promotion. Throws if the permit is not consumed or its evidence
+ * is missing.
+ */
+export async function recordPromotionBundle(
+	state: AuthorityState,
+	permit_id: string,
+	promoted_sha: string,
+	signer: Signer & { publicKeyDerHex: string },
+	ctx: Ctx,
+): Promise<{ state: AuthorityState; bundle: PromotionBundle }> {
+	const permit = state.permits[permit_id];
+	if (!permit?.consumed) throw new Error(`promotion bundle: permit ${permit_id} is not consumed`);
+	const evaluation = state.evaluations[permit.winner_candidate_sha];
+	if (!evaluation || evaluation.bundle_hash !== permit.evaluation_bundle_hash) {
+		throw new Error(`promotion bundle: permit ${permit_id}'s evaluation bundle is not stored`);
+	}
+	const contender = state.contenders[permit.contender_id];
+	if (!contender) throw new Error(`promotion bundle: contender ${permit.contender_id} is unknown`);
+	const verification = state.verdicts.some(
+		(v) => v.state === "ACCEPT" && v.winner_sha === permit.winner_candidate_sha,
+	)
+		? "PASSED"
+		: "FAILED";
+	const ledger = await sealLedger(state.ledger, ctx.sha256Hex);
+	const head = ledger[ledger.length - 1].entry_hash;
+	const tree = permit.winning_tree_sha256;
+	const candidateCommit = permit.winner_candidate_sha;
+	const statements = [
+		await buildLinkStatement({ baselineCommit: permit.baseline_commit, candidateCommit, treeSha256: tree }),
+		await buildTestResultStatement({
+			treeSha256: tree,
+			candidateCommit,
+			// The authority holds the content-addressed evaluation record, not
+			// the evaluator's command lines.
+			testConfigDigest: evaluation.bundle_hash,
+			result: evaluation.hidden_oracle.passed && evaluation.regressions.passed ? "PASS" : "FAIL",
+		}),
+		await buildVerificationResultStatement({
+			treeSha256: tree,
+			candidateCommit,
+			policySha256: permit.selector_policy_hash,
+			result: verification,
+		}),
+		await buildPromotionAuthority({
+			taskHash: permit.task_hash,
+			baselineCommit: permit.baseline_commit,
+			candidateRepo: contender.fork_repo,
+			candidateCommit,
+			treeSha256: tree,
+			evaluationBundleHash: permit.evaluation_bundle_hash,
+			verificationResult: verification,
+			policySha256: permit.selector_policy_hash,
+			destinationRepo: permit.destination_repo,
+			expectedParent: permit.expected_destination_head,
+			nonce: permit.nonce,
+			permitId: permit.permit_id,
+			issuedAt: permit.issued_at,
+			ledgerHeadSha256: head,
+		}),
+	];
+	const envelopes = [];
+	for (const statement of statements) envelopes.push(await signEnvelope(statement, signer));
+	const bundle: PromotionBundle = {
+		version: 2,
+		statements: envelopes,
+		ship: {
+			repo: permit.destination_repo,
+			commit: promoted_sha,
+			tree_sha256: tree,
+			parent: permit.expected_destination_head,
+			permit_id,
+		},
+		ledger: { head_sha256: head, entries: ledger },
+		authority_pubkey_der_hex: signer.publicKeyDerHex,
+	};
+	return {
+		state: { ...state, ledger, promotion_bundles: { ...(state.promotion_bundles ?? {}), [permit_id]: bundle } },
+		bundle,
 	};
 }
 

@@ -23,13 +23,20 @@
 import { after, before, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
-import { createHash, randomBytes } from "node:crypto";
+import { createHash, generateKeyPairSync, randomBytes } from "node:crypto";
 import { chmod, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+
+import { loadAuthoritySigner, type AuthoritySigner } from "../src/lib/authority-key.ts";
+import { sha256Hex } from "../src/lib/canonical.ts";
+import { buildPermitId } from "../src/lib/permit.ts";
+import { appendLedger, createAuthority, recordPromotionBundle, type Ctx } from "../src/lib/task-state.ts";
+import { SELECTOR_POLICY_VERSION } from "../src/lib/types.ts";
+import { SELECTOR_POLICY_INPUT } from "../src/do/TaskAuthority.ts";
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -87,6 +94,9 @@ const fx = {} as {
 	seed: string;
 	baselineSha: string;
 	mock: Mock;
+	/** The mock Worker's AUTHORITY_SIGNING_KEY signer, and its public key file. */
+	authority: AuthoritySigner;
+	trustKeyPath: string;
 };
 
 function git(cwd: string, ...args: string[]): string {
@@ -243,12 +253,78 @@ const ROUTE_ZONES: Record<string, Zone[]> = {
 	"POST verifiers/report": ["control"],
 	"POST verdict": ["control"],
 	"POST promote": ["control"],
+	"GET bundle": ["control"],
 	"GET context": ["agent", "control"],
 	"POST claim": ["agent"],
 	"POST contenders": ["agent"],
 	"POST evaluator-credentials": ["evaluation"],
 	"POST evidence": ["evaluation"],
 };
+
+interface MockPromotion {
+	permit: Record<string, any>;
+	evaluation: Record<string, any>;
+	contenderId: string;
+}
+
+/** A permit whose id recomputes from its bound fields, as the TaskAuthority issues it. */
+async function issueMockPermit(taskId: string, taskHashValue: string, chosen: any): Promise<MockPromotion> {
+	const bound = {
+		task_hash: taskHashValue,
+		baseline_commit: fx.baselineSha,
+		winning_tree_sha256: chosen.tree_sha256,
+		evaluation_bundle_hash: chosen.bundle.bundle_hash,
+		selector_policy_hash: await sha256Hex(SELECTOR_POLICY_INPUT),
+		expected_destination_head: fx.baselineSha,
+	};
+	const permit = {
+		...bound,
+		permit_id: await buildPermitId(bound, sha256Hex),
+		winner_candidate_sha: chosen.candidate_sha,
+		contender_id: chosen.contender_id,
+		destination_repo: "madgrix/env-isolation",
+		nonce: randomBytes(32).toString("hex"),
+		issued_at: new Date().toISOString(),
+		consumed: false,
+		consumed_at: null,
+	};
+	return { permit, evaluation: chosen.bundle, contenderId: chosen.contender_id };
+}
+
+/** The ship record, signed by the code the TaskAuthority runs at /promotion/finalize. */
+async function mockSignedBundle(taskId: string, p: MockPromotion, promotedSha: string) {
+	const ctx: Ctx = {
+		now: () => new Date().toISOString(),
+		randomHex: (n: number) => randomBytes(n).toString("hex"),
+		sha256Hex,
+		selectorPolicyHash: p.permit.selector_policy_hash,
+		policyVersion: SELECTOR_POLICY_VERSION,
+	};
+	let state = createAuthority({
+		task_id: taskId,
+		task_hash: p.permit.task_hash,
+		intent: "keep every credential inside its own zone",
+		baseline_repo: "madgrix/env-isolation",
+		baseline_commit: p.permit.baseline_commit,
+		behavior_contract: "",
+		policy_version: SELECTOR_POLICY_VERSION,
+		frozen_at: ctx.now(),
+	});
+	state = {
+		...state,
+		permits: { [p.permit.permit_id]: { ...p.permit, consumed: true, consumed_at: ctx.now() } as never },
+		evaluations: { [p.permit.winner_candidate_sha]: p.evaluation as never },
+		contenders: { [p.contenderId]: { contender_id: p.contenderId, fork_repo: `fork-${p.contenderId}` } as never },
+		verdicts: [{ state: "ACCEPT", winner_sha: p.permit.winner_candidate_sha } as never],
+	};
+	state = await appendLedger(
+		state,
+		"promotion_succeeded",
+		{ permit_id: p.permit.permit_id, tree_sha256: p.permit.winning_tree_sha256 },
+		ctx,
+	);
+	return (await recordPromotionBundle(state, p.permit.permit_id, promotedSha, fx.authority, ctx)).bundle;
+}
 
 async function startMock(): Promise<Mock> {
 	const contenders = new Map<string, Contender>();
@@ -259,6 +335,7 @@ async function startMock(): Promise<Mock> {
 	const agentSecrets = new Map<string, string>();
 	let seq = 0;
 	let winner = "";
+	let promotion: MockPromotion | null = null;
 
 	const createContender = (taskId: string, agentId: string): Contender => {
 		const id = `contender-${++seq}`;
@@ -345,19 +422,17 @@ async function startMock(): Promise<Mock> {
 						latest_commit: head(c),
 					});
 				}
-				case "POST verdict":
-					winner = body.candidates?.[0]?.candidate_sha ?? "";
-					return send(200, {
-						verdict: { state: "ACCEPT", winner_sha: winner },
-						permit: {
-							permit_id: `permit-${randomBytes(8).toString("hex")}`,
-							nonce: randomBytes(32).toString("hex"),
-							issued_at: new Date().toISOString(),
-							expected_destination_head: fx.baselineSha,
-						},
-					});
+				case "POST verdict": {
+					const chosen = body.candidates?.[0];
+					winner = chosen?.candidate_sha ?? "";
+					promotion = await issueMockPermit(taskId, taskHash(taskId), chosen);
+					return send(200, { verdict: { state: "ACCEPT", winner_sha: winner }, permit: promotion.permit });
+				}
 				case "POST promote":
 					return send(200, { outcome: "PROMOTED", promoted_sha: winner });
+				case "GET bundle":
+					if (!promotion) return send(404, { error: "bundle_not_found" });
+					return send(200, await mockSignedBundle(taskId, promotion, winner));
 				default:
 					// evidence and verifier commit/labels/reveal/report
 					return send(200, { ok: true });
@@ -398,6 +473,10 @@ describe("process environment boundaries of the live-run scripts", () => {
 		git(fx.seed, "add", "-A");
 		git(fx.seed, "commit", "--quiet", "-m", "baseline");
 		fx.baselineSha = git(fx.seed, "rev-parse", "HEAD");
+		const authorityKey = generateKeyPairSync("ed25519");
+		fx.authority = await loadAuthoritySigner(authorityKey.privateKey.export({ type: "pkcs8", format: "pem" }).toString());
+		fx.trustKeyPath = path.join(fx.root, "authority.pub");
+		await writeFile(fx.trustKeyPath, authorityKey.publicKey.export({ type: "spki", format: "pem" }).toString());
 		fx.mock = await startMock();
 	});
 
@@ -589,11 +668,15 @@ describe("process environment boundaries of the live-run scripts", () => {
 				MADGRIX_MODEL_NAME: "test-model",
 				MADGRIX_EVENT_TIMEOUT_MS: "10000",
 				MADGRIX_BUNDLE_PATH: path.join(dumpDir, "promotion.bundle"),
+				MADGRIX_TRUST_KEY: fx.trustKeyPath,
 				...hidden,
 			}),
 		);
 		assert.equal(live.code, 0, `live-e2e failed:\n${live.stderr}`);
 		assert.match(live.stdout, /MADGRIX_LIVE_E2E_OK/);
+		// live-e2e verified the Worker's bundle against the pinned key, not the embedded one.
+		assert.match(live.stdout, /^authority key\.+ PINNED$/m);
+		assert.match(live.stdout, /^VERIFIED$/m);
 
 		const runner = await readDumps(dumpDir, /^node-run-contenders\.mjs\.\d+\.env$/);
 		const evaluators = await readDumps(dumpDir, /^node-evaluate-candidate\.ts\.\d+\.env$/);

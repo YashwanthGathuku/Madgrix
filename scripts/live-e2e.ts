@@ -32,6 +32,9 @@
  *   GIT_AUTHOR_EMAIL               passed through to contender runner
  *   MADGRIX_REGRESSION_COMMAND / SEMANTIC / STATIC / SECURITY commands
  *   MADGRIX_HARNESS_VERSION        passed through to the evaluator
+ *   MADGRIX_TRUST_KEY              authority public key file pinned when
+ *                                  verifying the bundle (default
+ *                                  keys/authority.pub)
  *
  * This process holds all three service tokens; no child inherits its
  * environment. The contender runner receives only the AGENT token, each
@@ -50,21 +53,10 @@ import os from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
 
-import { canonicalJson, sha256Hex } from "../src/lib/canonical.ts";
+import { sha256Hex } from "../src/lib/canonical.ts";
 import { classifyPair } from "../src/lib/claims.ts";
-import {
-	buildLinkStatement,
-	buildPromotionAuthority,
-	buildTestResultStatement,
-	buildVerificationResultStatement,
-	signEnvelope,
-	verifyBundle,
-	type PromotionBundle,
-} from "../src/lib/attestation.ts";
-import { createEd25519Signer } from "../src/lib/signer-node.ts";
 import { createCommitment } from "../src/lib/verifiers.ts";
 import { verifierReportPayload } from "../src/lib/verifier-keys.ts";
-import { SELECTOR_POLICY_INPUT } from "../src/do/TaskAuthority.ts";
 import { SELECTOR_POLICY_VERSION, type ReferenceReport } from "../src/lib/types.ts";
 import { minimalEnv, parseAgentEnvAllowlist, pickEnv } from "./lib/child-env.mjs";
 
@@ -413,7 +405,6 @@ try {
 	const winnerIndex = candidates.findIndex((c) => c.candidate_sha === verdictResponse.verdict.winner_sha);
 	if (winnerIndex < 0) throw new Error("verdict winner is not in the contender set");
 	const winner = candidates[winnerIndex];
-	const winnerEval = evalResults[winnerIndex];
 
 	console.error("[madgrix-live] 8/9 promote the exact reviewed commit to canonical Artifacts state");
 	const promotion = await requestJson(`${baseUrl}/tasks/${encodeURIComponent(taskId)}/promote`, {
@@ -424,74 +415,23 @@ try {
 		throw new Error(`exact-state promotion failed: ${JSON.stringify(promotion)}`);
 	}
 
-	console.error("[madgrix-live] 9/9 build signed evidence bundle and verify it offline");
-	const policyHash = await sha256Hex(SELECTOR_POLICY_INPUT);
-	const testConfigDigest = await sha256Hex(
-		canonicalJson({
-			hidden: hiddenCommand,
-			regression: env.MADGRIX_REGRESSION_COMMAND ?? hiddenCommand,
-			semantic: env.MADGRIX_SEMANTIC_COMMAND ?? null,
-			static: env.MADGRIX_STATIC_COMMAND ?? null,
-			security: env.MADGRIX_SECURITY_COMMAND ?? null,
-		}),
+	console.error("[madgrix-live] 9/9 fetch the authority-signed bundle and verify it offline");
+	// The TaskAuthority signed the ship record at /promotion/finalize from its
+	// own state (amendment authority-signing-v1); nothing is built locally.
+	const bundle = await requestJson(
+		`${baseUrl}/tasks/${encodeURIComponent(taskId)}/bundle?permit_id=${encodeURIComponent(permit.permit_id)}`,
+		{ token: controlToken },
 	);
-	const link = await buildLinkStatement({
-		baselineCommit: baselineCommit as string,
-		candidateCommit: winner.candidate_sha,
-		treeSha256: winnerEval.bundle.tree_sha256,
-	});
-	const testResult = await buildTestResultStatement({
-		treeSha256: winnerEval.bundle.tree_sha256,
-		candidateCommit: winner.candidate_sha,
-		testConfigDigest,
-		result:
-			winnerEval.bundle.hidden_oracle.passed && winnerEval.bundle.regressions.passed ? "PASS" : "FAIL",
-	});
-	const verificationResult = await buildVerificationResultStatement({
-		treeSha256: winnerEval.bundle.tree_sha256,
-		candidateCommit: winner.candidate_sha,
-		policySha256: policyHash,
-		result: "PASSED",
-	});
-	const authority = await buildPromotionAuthority({
-		taskHash,
-		baselineCommit: baselineCommit as string,
-		candidateRepo: winner.fork_repo,
-		candidateCommit: winner.candidate_sha,
-		treeSha256: winnerEval.bundle.tree_sha256,
-		evaluationBundleHash: winnerEval.bundle.bundle_hash,
-		verificationResult: "PASSED",
-		policySha256: policyHash,
-		destinationRepo: destinationRepo as string,
-		expectedParent: permit.expected_destination_head,
-		nonce: permit.nonce,
-		permitId: permit.permit_id,
-		issuedAt: permit.issued_at,
-	});
-	const authoritySigner = createEd25519Signer();
-	const statements = [];
-	for (const statement of [link, testResult, verificationResult, authority]) {
-		statements.push(await signEnvelope(statement, authoritySigner));
+	if (bundle?.ship?.permit_id !== permit.permit_id || bundle?.ship?.commit !== promotion.promoted_sha) {
+		throw new Error("the Worker's promotion bundle does not describe this promotion");
 	}
-	const bundle: PromotionBundle = {
-		version: 1,
-		statements,
-		ship: {
-			repo: destinationRepo as string,
-			commit: winner.candidate_sha,
-			tree_sha256: winnerEval.bundle.tree_sha256,
-			parent: permit.expected_destination_head,
-			permit_id: permit.permit_id,
-		},
-		ledger_hashes: [permit.permit_id],
-		authority_pubkey_der_hex: authoritySigner.publicKeyDerHex,
-	};
-	const verified = await verifyBundle(bundle, authoritySigner, { policyHash });
-	if (!verified.verified) throw new Error(`new promotion bundle failed self-verification: ${JSON.stringify(verified.lines)}`);
 	await mkdir(path.dirname(bundlePath), { recursive: true });
 	await writeFile(bundlePath, JSON.stringify(bundle, null, 2) + "\n", "utf8");
-	// Offline verification needs no credential.
-	await run("node", ["src/cli/verify.ts", bundlePath], { env: minimalEnv() });
+	// Offline verification needs no credential. Trust comes from the pinned
+	// authority key (MADGRIX_TRUST_KEY, else keys/authority.pub), never from
+	// the key embedded in the bundle.
+	const trustKeyArgs = env.MADGRIX_TRUST_KEY ? ["--trust-key", path.resolve(env.MADGRIX_TRUST_KEY)] : [];
+	await run("node", ["src/cli/verify.ts", ...trustKeyArgs, bundlePath], { env: minimalEnv() });
 
 	console.log(
 		JSON.stringify(

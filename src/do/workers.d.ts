@@ -92,6 +92,8 @@ interface Env {
 	EVALUATION_SERVICE_TOKEN: string;
 	CONTROL_SERVICE_TOKEN: string;
 	AGENT_SERVICE_TOKEN: string;
+	/** Ed25519 PKCS8 (PEM or base64) the TaskAuthority signs promotion bundles with. */
+	AUTHORITY_SIGNING_KEY?: string;
 	PROMOTION_CONTAINER: DoNamespace;
 }
 

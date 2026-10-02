@@ -40,6 +40,9 @@ export default defineConfig({
 			EVALUATION_SERVICE_TOKEN: bindings.secret(),
 			CONTROL_SERVICE_TOKEN: bindings.secret(),
 			AGENT_SERVICE_TOKEN: bindings.secret(),
+			// Ed25519 PKCS8 private key the TaskAuthority signs promotion bundles
+			// with; its public key is pinned in keys/authority.pub (keys/README.md).
+			AUTHORITY_SIGNING_KEY: bindings.secret(),
 			PROMOTION_CONTAINER: bindings.durableObject({ worker: "madgrix", exportName: "PromotionContainer" }),
 		},
 		// Queue consumer (spec 5 §2–§3): Artifact lifecycle events arrive via

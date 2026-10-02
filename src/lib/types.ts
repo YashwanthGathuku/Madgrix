@@ -318,6 +318,13 @@ export interface LedgerEntry {
 	ts: string;
 	kind: string;
 	payload_hash: string;
+	/** entry_hash of the previous entry; 64 zeros for the genesis entry. */
+	prev_hash: string;
+	/**
+	 * SHA-256 over canonical JSON of the five fields above (src/lib/ledger.ts).
+	 * "" until sealed: the genesis entry until the first append.
+	 */
+	entry_hash: string;
 }
 
 export interface AuthorityState {
@@ -367,6 +374,12 @@ export interface AuthorityState {
 	seen_event_keys: string[];
 	escalations: { reason: string; at: string; resolved: boolean }[];
 	ledger: LedgerEntry[];
+	/**
+	 * Authority-signed promotion bundles (ship records), keyed by the
+	 * consumed permit_id (spec 1 §11; amendment authority-signing-v1).
+	 * Absent until the task's first promotion.
+	 */
+	promotion_bundles?: Record<string, import("./attestation.ts").PromotionBundle>;
 }
 
 /** Queue push event (spec 5 §3). NOTE: event_key is derived from content,

@@ -973,11 +973,14 @@ export async function handlePromote(
 		// Consume the permit only AFTER the canonical write is known to exist.
 		// If this RPC is lost after the Git push, retry reconciliation returns
 		// ALREADY_WRITTEN and this same finalization safely runs again.
+		// The authority consumes the permit and signs the ship record (the
+		// promotion bundle) in the same transaction (spec 1 §11).
 		const finalized = await doRpc(taskStub(env, taskId), "/promotion/finalize", {
 			body: {
 				permit_id,
 				verified_parent: permit.expected_destination_head,
 				tree_sha256: permit.winning_tree_sha256,
+				promoted_sha: promotion.promoted_sha,
 			},
 		});
 		if (!finalized.ok) {
@@ -1001,6 +1004,19 @@ export async function handlePromote(
 			destinationRepo.revokeToken(destinationToken.id),
 		]);
 	}
+}
+
+/**
+ * GET /tasks/:id/bundle[?permit_id=] — the promotion bundle the task
+ * authority signed at finalize (default: the task's latest promotion).
+ * Verify it offline with `src/cli/verify.ts` against the pinned authority key.
+ */
+export async function handlePromotionBundle(env: Env, taskId: string, request: Request): Promise<Response> {
+	if (!(await requireControlPlane(request, env))) return json({ error: "control_plane_auth_required" }, 401);
+	const permitId = new URL(request.url).searchParams.get("permit_id");
+	const query = permitId === null ? "" : `?permit_id=${encodeURIComponent(permitId)}`;
+	const res = await doRpc(taskStub(env, taskId), `/bundle${query}`, { method: "GET" });
+	return json(res.body, res.status);
 }
 
 /** GET /tasks/:id/ledger — the task authority's append-only ledger. */
@@ -1154,6 +1170,9 @@ export async function fetch(request: Request, env: Env): Promise<Response> {
 		}
 		if (request.method === "GET" && action === "ledger" && parts.length === 3) {
 			return handleLedger(env, taskId);
+		}
+		if (request.method === "GET" && action === "bundle" && parts.length === 3) {
+			return handlePromotionBundle(env, taskId, request);
 		}
 		if (
 			request.method === "GET" &&

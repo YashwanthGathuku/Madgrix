@@ -46,13 +46,14 @@ Bindings/secrets required at deploy time (all declared in `cloudflare.config.ts`
 |---|---|---|---|
 | `ARTIFACTS` | Artifacts binding, namespace `default` | platform-managed | Local dev on a direct-egress machine uses `dev: { remote: true }` |
 | `TASK_AUTHORITY` | Durable Object binding → class `TaskAuthority` in this same Worker | declared via `exports.durableObject({ storage: "sqlite" })` + `bindings.durableObject({ worker: "seam", exportName: "TaskAuthority" })` | sqlite storage for transactional state |
+| `AUTHORITY_SIGNING_KEY` | Worker secret (Ed25519 PKCS8, PEM or base64) | generated outside the repo (`keys/README.md`) | The TaskAuthority signs every promotion bundle with it at `/promotion/finalize`; without it finalize answers 503 and consumes nothing. Its public half is committed as `keys/authority.pub` and pinned by `src/cli/verify.ts` |
 | Queue trigger `seam-events` | Queue consumer | `triggers.queue(...)` in config; queue must pre-exist | `maxBatchSize: 10`, `maxBatchTimeout: 30`; add a dead-letter queue for poison messages (the `queue()` consumer throws on malformed bodies, which redelivers until the retry limit) |
 
-No API keys, tokens, or signing keys are required by the platform slice
-itself. Plaintext contender tokens are minted at runtime via the Artifacts
-binding and returned once in the `/contenders` response body — never logged,
-never persisted. Sigstore/DSSE signing keys belong to the protocol layer
-(spec 4), not this slice.
+Besides the three service tokens, the only key the Worker needs is
+`AUTHORITY_SIGNING_KEY` (`specs/amendments/authority-signing-v1.md`). Plaintext
+contender tokens are minted at runtime via the Artifacts binding and returned
+once in the `/contenders` response body — never logged, never persisted.
+Sigstore signing remains future hardening (spec 4 §6).
 
 ## (c) Honest status table
 
