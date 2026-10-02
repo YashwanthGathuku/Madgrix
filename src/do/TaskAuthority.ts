@@ -26,12 +26,19 @@
  */
 
 import {
+	assignCandidateLabels,
+	attemptPromotion,
+	commitVerifier,
 	createAuthority,
 	ingestQueueEvent,
+	issuePermit,
 	registerClaim,
 	registerOperatorKeys,
 	registerVerifierKeys,
+	revealVerifier,
+	runVerdictSeam,
 	submitEvaluation,
+	submitVerifierReport,
 	type Ctx,
 	type Effect,
 	type NewClaimInput,
@@ -42,7 +49,10 @@ import type {
 	ContenderRecord,
 	EvaluationBundle,
 	QueuePushEvent,
+	ReferenceReport,
 	TaskRecord,
+	VerdictReport,
+	VerifierCommitment,
 } from "../lib/types.ts";
 import { joinHashParts, randomHex, sha256Hex } from "../lib/canonical.ts";
 import { SELECTOR_POLICY_VERSION } from "../lib/types.ts";
@@ -276,6 +286,144 @@ export class TaskAuthority {
 				} catch (err) {
 					return json({ error: "evidence_rejected", detail: (err as Error).message }, 422);
 				}
+			});
+		}
+
+
+		/* -- POST /candidate-labels — authority-owned anonymization map ----- */
+		if (request.method === "POST" && path === "/candidate-labels") {
+			const parsed = await readJsonBody(request);
+			if (!parsed.ok) return parsed.response;
+			const candidate_shas = (parsed.body as { candidate_shas?: unknown }).candidate_shas;
+			if (!Array.isArray(candidate_shas) || !candidate_shas.every((x) => typeof x === "string")) {
+				return json({ error: "invalid_candidate_shas" }, 400);
+			}
+			const ctx = await productionCtx();
+			return this.doState.storage.transaction(async () => {
+				const state = await this.loadState();
+				if (state === null) return json({ error: "not_initialized" }, 404);
+				try {
+					const r = await assignCandidateLabels(state, candidate_shas as string[], ctx);
+					await this.doState.storage.put(STATE_KEY, r.state);
+					// The mapping is control-plane data. The Worker exposes labels to
+					// verifier orchestration, never contender identities.
+					return json({ labels: Object.keys(r.labels) });
+				} catch (err) {
+					return json({ error: "candidate_label_assignment_failed", detail: (err as Error).message }, 422);
+				}
+			});
+		}
+
+		/* -- POST /verifier/commit — blind verifier commitment -------------- */
+		if (request.method === "POST" && path === "/verifier/commit") {
+			const parsed = await readJsonBody(request);
+			if (!parsed.ok) return parsed.response;
+			const commitment = (parsed.body as { commitment?: VerifierCommitment }).commitment;
+			if (!commitment || typeof commitment.verifier_id !== "string") return json({ error: "invalid_commitment" }, 400);
+			const ctx = await productionCtx();
+			return this.doState.storage.transaction(async () => {
+				const state = await this.loadState();
+				if (state === null) return json({ error: "not_initialized" }, 404);
+				try {
+					const next = await commitVerifier(state, commitment, ctx);
+					await this.doState.storage.put(STATE_KEY, next);
+					return json({ committed: true, verifier_id: commitment.verifier_id });
+				} catch (err) {
+					return json({ error: "commitment_rejected", detail: (err as Error).message }, 422);
+				}
+			});
+		}
+
+		/* -- POST /verifier/reveal — commit/reveal validation ---------------- */
+		if (request.method === "POST" && path === "/verifier/reveal") {
+			const parsed = await readJsonBody(request);
+			if (!parsed.ok) return parsed.response;
+			const body = parsed.body as { verifier_id?: string; report?: ReferenceReport; nonce?: string };
+			if (!body.verifier_id || !body.report || typeof body.nonce !== "string") return json({ error: "invalid_reveal" }, 400);
+			const ctx = await productionCtx();
+			return this.doState.storage.transaction(async () => {
+				const state = await this.loadState();
+				if (state === null) return json({ error: "not_initialized" }, 404);
+				const r = await revealVerifier(state, body.verifier_id!, body.report!, body.nonce!, ctx);
+				if (r.state !== state) await this.doState.storage.put(STATE_KEY, r.state);
+				return json({ admissible: r.admissible, reason: r.reason }, r.admissible ? 200 : 422);
+			});
+		}
+
+		/* -- POST /verifier/report — signed verifier report ------------------ */
+		if (request.method === "POST" && path === "/verifier/report") {
+			const parsed = await readJsonBody(request);
+			if (!parsed.ok) return parsed.response;
+			const report = (parsed.body as { report?: VerdictReport }).report;
+			if (!report || typeof report.verifier_id !== "string") return json({ error: "invalid_verifier_report" }, 400);
+			const ctx = await productionCtx();
+			return this.doState.storage.transaction(async () => {
+				const state = await this.loadState();
+				if (state === null) return json({ error: "not_initialized" }, 404);
+				try {
+					const next = await submitVerifierReport(state, report, ctx);
+					await this.doState.storage.put(STATE_KEY, next);
+					return json({ recorded: true, verifier_id: report.verifier_id });
+				} catch (err) {
+					return json({ error: "verifier_report_rejected", detail: (err as Error).message }, 422);
+				}
+			});
+		}
+
+		/* -- POST /verdict — execute the real non-compensatory seam --------- */
+		if (request.method === "POST" && path === "/verdict") {
+			const parsed = await readJsonBody(request);
+			if (!parsed.ok) return parsed.response;
+			const candidates = (parsed.body as { candidates?: unknown }).candidates;
+			if (!Array.isArray(candidates)) return json({ error: "invalid_candidates" }, 400);
+			const ctx = await productionCtx();
+			return this.doState.storage.transaction(async () => {
+				const state = await this.loadState();
+				if (state === null) return json({ error: "not_initialized" }, 404);
+				try {
+					const r = await runVerdictSeam(state, candidates as Parameters<typeof runVerdictSeam>[1], ctx);
+					await this.doState.storage.put(STATE_KEY, r.state);
+					return json({ verdict: r.record });
+				} catch (err) {
+					return json({ error: "verdict_failed", detail: (err as Error).message }, 422);
+				}
+			});
+		}
+
+		/* -- POST /permit — exact-state single-use promotion authority ------- */
+		if (request.method === "POST" && path === "/permit") {
+			const parsed = await readJsonBody(request);
+			if (!parsed.ok) return parsed.response;
+			const body = parsed.body as { winner_sha?: string; destination_repo?: string; destination_head?: string };
+			if (!body.winner_sha || !body.destination_repo || !body.destination_head) return json({ error: "invalid_permit_request" }, 400);
+			const ctx = await productionCtx();
+			return this.doState.storage.transaction(async () => {
+				const state = await this.loadState();
+				if (state === null) return json({ error: "not_initialized" }, 404);
+				try {
+					const r = await issuePermit(state, body.winner_sha!, body.destination_repo!, body.destination_head!, ctx);
+					await this.doState.storage.put(STATE_KEY, r.state);
+					return json({ permit: r.permit });
+				} catch (err) {
+					return json({ error: "permit_rejected", detail: (err as Error).message }, 422);
+				}
+			});
+		}
+
+		/* -- POST /promotion/finalize — consume only after canonical write --- */
+		if (request.method === "POST" && path === "/promotion/finalize") {
+			const parsed = await readJsonBody(request);
+			if (!parsed.ok) return parsed.response;
+			const body = parsed.body as { permit_id?: string; verified_parent?: string; tree_sha256?: string };
+			if (!body.permit_id || !body.verified_parent || !body.tree_sha256) return json({ error: "invalid_promotion_finalize" }, 400);
+			const ctx = await productionCtx();
+			return this.doState.storage.transaction(async () => {
+				const state = await this.loadState();
+				if (state === null) return json({ error: "not_initialized" }, 404);
+				const r = await attemptPromotion(state, body.permit_id!, body.verified_parent!, body.tree_sha256!, ctx);
+				if (r.state !== state) await this.doState.storage.put(STATE_KEY, r.state);
+				const status = r.outcome === "PROMOTED" || r.outcome === "ALREADY_CONSUMED" ? 200 : 409;
+				return json({ outcome: r.outcome, effects: r.effects }, status);
 			});
 		}
 
