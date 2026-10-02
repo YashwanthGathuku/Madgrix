@@ -20,6 +20,11 @@ export default defineConfig({
 		exports: {
 			TaskAuthority: exports.durableObject({ storage: "sqlite" }),
 			PromotionContainer: exports.durableObject({ storage: "sqlite", container: promotionContainer }),
+			PromotionWorkflow: exports.workflow({
+				name: "madgrix-promotion",
+				limits: { steps: 8 },
+				defaultRetention: { successRetention: "3 days", errorRetention: "7 days" },
+			}),
 		},
 		env: {
 			// Local dev note: workerd cannot reach the remote Artifacts service
