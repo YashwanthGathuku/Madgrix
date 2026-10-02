@@ -1,15 +1,16 @@
 /**
- * Worker entry point for the seam platform layer (internal codename: seam —
- * NOT a public brand).
+ * Worker entry point for MADGRIX.
  *
  * # What this file is
  *
- * FAITHFUL SKELETON. It MUST typecheck (strict, erasable syntax only) but
- * it will NOT run end-to-end on this machine: workerd cannot reach the
- * remote Artifacts binding through this sandbox's TLS egress proxy, and the
- * Durable Object / Queue / Workflow runtime is not exercised here
- * (see ../SETUP_STATUS.md). The full vertical slice runs locally via a Node
- * harness driving the same pure logic (task-state.ts) and FakeArtifacts.
+ * Production Cloudflare control-plane wiring for the competition path:
+ * Artifacts, Queue ingestion, per-task Durable Object authority, independent
+ * trust-zone identities, Verdict Seam execution, durable promotion Workflow,
+ * and exact-state canonical Git promotion through the trusted container.
+ *
+ * The local deterministic slice still uses FakeArtifacts for repeatable tests;
+ * scripts/live-e2e.ts is the real-infrastructure path and intentionally fails
+ * unless real Artifacts push events reach Queue → TaskAuthority.
  *
  * # Architecture (spec 5)
  *
