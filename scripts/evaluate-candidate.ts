@@ -66,7 +66,9 @@ function capture(cmd: string, args: string[], cwd: string): Promise<Buffer> {
 		child.stdout.on("data", (b: Buffer) => out.push(b));
 		child.stderr.on("data", (b: Buffer) => err.push(b));
 		child.on("error", reject);
-		child.on("exit", (code) => {
+		// "close", not "exit": stdout may still hold unread output at "exit",
+		// which would truncate the changed-file list and the tree digest.
+		child.on("close", (code) => {
 			if (code === 0) resolve(Buffer.concat(out));
 			else reject(new Error(`${cmd} exited ${code}: ${Buffer.concat(err).toString("utf8").trim()}`));
 		});
@@ -89,7 +91,7 @@ function exitCode(command: string, cwd: string): Promise<{ passed: boolean; deta
 		child.stdout.on("data", (b) => (out += b));
 		child.stderr.on("data", (b) => (err += b));
 		child.on("error", reject);
-		child.on("exit", (code) =>
+		child.on("close", (code) =>
 			resolve({
 				passed: code === 0,
 				detail: [out.trim(), err.trim()].filter(Boolean).join("\n").slice(0, 4000),

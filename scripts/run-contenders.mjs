@@ -69,7 +69,8 @@ function capture(cmd, args, opts = {}) {
 		child.stdout.on("data", (b) => (out += b));
 		child.stderr.on("data", (b) => (err += b));
 		child.on("error", reject);
-		child.on("exit", (code) => {
+		// "close", not "exit": stdout may still hold unread output at "exit".
+		child.on("close", (code) => {
 			if (code === 0) resolve(out.trim());
 			else reject(new Error(`${cmd} exited ${code}: ${err.trim()}`));
 		});
