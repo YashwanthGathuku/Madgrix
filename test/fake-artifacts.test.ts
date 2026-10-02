@@ -14,6 +14,7 @@ import {
 	ArtifactStateError,
 	forkIdempotent,
 } from "../src/lib/artifacts-port.ts";
+import type { ArtifactsPort } from "../src/lib/artifacts-port.ts";
 import { FakeArtifacts } from "../src/lib/fake-artifacts.ts";
 
 const TREE_A = { "README.md": "hello baseline", "src/main.ts": "export {};" };
@@ -146,6 +147,73 @@ describe("FakeArtifacts", () => {
 			(await fake.get("baseline")).fork("fork-op-1"),
 			(err: unknown) =>
 				err instanceof ArtifactStateError && err.code === "ALREADY_EXISTS",
+		);
+	});
+
+	it("forkIdempotent falls back to import when the fork endpoint is broken (live beta bug, 2026-10-01)", async () => {
+		const fake = new FakeArtifacts();
+		await makeRepo(fake, "baseline");
+		// Simulate the broken Artifacts beta fork endpoint: every fork
+		// attempt fails with 400 [10101] "Invalid repo name" (validated live
+		// via the cf CLI on 2026-10-01 against multiple repos).
+		const brokenFork = (): ArtifactsPort =>
+			new Proxy(fake, {
+				get(target, prop, receiver) {
+					if (prop === "get") {
+						return async (name: string) => {
+							const repo = await target.get(name);
+							return new Proxy(repo, {
+								get(rTarget, rProp, rReceiver) {
+									if (rProp === "fork") {
+										return async () => {
+											throw new Error(
+												"[10101] Invalid repo name: must match /^[a-zA-Z0-9][a-zA-Z0-9._-]*$/",
+											);
+										};
+									}
+									const v = Reflect.get(rTarget, rProp, rReceiver);
+									return typeof v === "function" ? v.bind(rTarget) : v;
+								},
+							});
+						};
+					}
+					const v = Reflect.get(target, prop, receiver);
+					return typeof v === "function" ? v.bind(target) : v;
+				},
+			}) as unknown as ArtifactsPort;
+		const result = await forkIdempotent(brokenFork(), "baseline", "fork-fallback-1");
+		assert.equal(result.created, true);
+		assert.equal(result.viaImportFallback, true);
+		assert.equal(result.repo.name, "fork-fallback-1");
+		assert.equal(typeof result.initialTokenPlaintext, "string");
+
+		// Genuine fork errors must NOT be misrouted into the fallback.
+		const authFail = (): ArtifactsPort =>
+			new Proxy(fake, {
+				get(target, prop, receiver) {
+					if (prop === "get") {
+						return async (name: string) => {
+							const repo = await target.get(name);
+							return new Proxy(repo, {
+								get(rTarget, rProp, rReceiver) {
+									if (rProp === "fork") {
+										return async () => {
+											throw new ArtifactAuthError("TOKEN_REVOKED", "nope");
+										};
+									}
+									const v = Reflect.get(rTarget, rProp, rReceiver);
+									return typeof v === "function" ? v.bind(rTarget) : v;
+								},
+							});
+						};
+					}
+					const v = Reflect.get(target, prop, receiver);
+					return typeof v === "function" ? v.bind(target) : v;
+				},
+			}) as unknown as ArtifactsPort;
+		await assert.rejects(
+			forkIdempotent(authFail(), "baseline", "fork-fallback-2"),
+			(err: unknown) => err instanceof ArtifactAuthError,
 		);
 	});
 

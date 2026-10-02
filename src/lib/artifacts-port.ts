@@ -164,6 +164,13 @@ export interface ArtifactsRepo {
 	 * Fork this repo to a new repo.
 	 * Maps to: `ArtifactsRepo.fork(name, opts?)` on the real binding.
 	 * Real binding throws ALREADY_EXISTS if the target exists.
+	 *
+	 * LIVE-VALIDATED CAVEAT (2026-10-01): the Artifacts beta fork endpoint
+	 * is broken server-side — every fork attempt returns 400 [10101]
+	 * "Invalid repo name" regardless of caller input (confirmed via the cf
+	 * CLI against multiple repos). Callers that need contender isolation
+	 * MUST use `forkIdempotent`, which falls back to create-empty +
+	 * push-baseline-via-git when it detects this exact failure.
 	 */
 	fork(
 		name: string,
@@ -332,22 +339,53 @@ export async function forkIdempotent(
 	port: ArtifactsPort,
 	sourceRepoName: string,
 	forkName: string,
-): Promise<{ repo: ArtifactsRepo; created: boolean; initialTokenPlaintext: string | null }> {
+): Promise<{ repo: ArtifactsRepo; created: boolean; initialTokenPlaintext: string | null; viaImportFallback: boolean }> {
 	let cursor: string | undefined;
 	do {
 		const page = await port.list(cursor === undefined ? undefined : { cursor });
 		if (page.repos.some((r) => r.name === forkName)) {
-			return { repo: await port.get(forkName), created: false, initialTokenPlaintext: null };
+			return { repo: await port.get(forkName), created: false, initialTokenPlaintext: null, viaImportFallback: false };
 		}
 		cursor = page.cursor;
 	} while (cursor !== undefined);
 	const source = await port.get(sourceRepoName);
-	const created = await source.fork(forkName, {
-		description: "seam contender fork (internal codename; not a public brand)",
-	});
-	return {
-		repo: await port.get(forkName),
-		created: true,
-		initialTokenPlaintext: created.tokenPlaintext,
-	};
+	try {
+		const created = await source.fork(forkName, {
+			description: "madgrix contender fork",
+		});
+		return {
+			repo: await port.get(forkName),
+			created: true,
+			initialTokenPlaintext: created.tokenPlaintext,
+			viaImportFallback: false,
+		};
+	} catch (err) {
+		if (!isBetaForkEndpointBug(err)) throw err;
+		// Import fallback (live-validated 2026-10-01): the Artifacts beta
+		// fork endpoint is broken server-side. Create an empty repo with the
+		// fork's name; the CALLER must then push the baseline into it via
+		// git using a write-scoped token — that reproduces fork semantics
+		// (same name, same baseline content) without the broken endpoint.
+		const created = await port.create(forkName, {
+			description: "madgrix contender repo (import fallback: fork endpoint broken 2026-10-01; baseline pushed via git)",
+		});
+		return {
+			repo: await port.get(forkName),
+			created: true,
+			initialTokenPlaintext: created.tokenPlaintext,
+			viaImportFallback: true,
+		};
+	}
+}
+
+/**
+ * The Artifacts beta fork endpoint is broken as of 2026-10-01: every fork
+ * attempt returns 400 [10101] "Invalid repo name" (validated live via the cf
+ * CLI against multiple repos, including the pre-existing starter-repo).
+ * Match narrowly so genuine fork errors (auth, limits, already-exists)
+ * still propagate instead of being misrouted into the fallback.
+ */
+function isBetaForkEndpointBug(err: unknown): boolean {
+	const msg = err instanceof Error ? err.message : String(err);
+	return msg.includes("10101") || msg.includes("Invalid repo name");
 }
