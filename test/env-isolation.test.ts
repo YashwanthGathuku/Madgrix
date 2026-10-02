@@ -137,9 +137,21 @@ function operatorEnv(extra: Record<string, string> = {}): Record<string, string>
 	};
 }
 
-/** Agent command: dump the environment, then make the change the runner commits. */
+/** printf format of the agent's tool-status log (specs/amendments/tool-status-v1.md). */
+const TOOL_LOG_FORMAT =
+	'{"format":"madgrix-tool-status/v1","task_id":"%s","contender_id":"%s","agent_id":"%s","baseline_commit":"%s",' +
+	'"model":"test-model","harness":"env-isolation-agent/1"}\\n{"seq":1,"action":"write_file","tool_status":"OK"}\\n';
+
+/** The claim scope every contender run here registers. */
+const CLAIM_PATHS = "CANDIDATE.txt";
+
+/** Agent command: dump the environment, make the change the runner commits, and log that one action. */
 function agentCommand(dumpDir: string): string {
-	return `env > ${shq(dumpDir)}/agent-"$MADGRIX_AGENT_ID".env && echo "candidate from $MADGRIX_AGENT_ID" > CANDIDATE.txt`;
+	return (
+		`env > ${shq(dumpDir)}/agent-"$MADGRIX_AGENT_ID".env && echo "candidate from $MADGRIX_AGENT_ID" > CANDIDATE.txt && ` +
+		`mkdir -p .madgrix && printf ${shq(TOOL_LOG_FORMAT)} "$MADGRIX_TASK_ID" "$MADGRIX_CONTENDER_ID" ` +
+		`"$MADGRIX_AGENT_ID" "$MADGRIX_BASELINE_SHA" > .madgrix/tool-status.jsonl`
+	);
 }
 
 /** One `env` dump per evaluation command and per run ($$ = that shell's pid). */
@@ -418,8 +430,10 @@ async function startMock(): Promise<Mock> {
 						remote: c.bare,
 						baseline_commit: fx.baselineSha,
 						task_hash: taskHash(taskId),
-						claim: { scope: { paths: ["**"] } },
+						claim: { agent: c.agentId, scope: { paths: CLAIM_PATHS.split(","), symbols: [] } },
 						latest_commit: head(c),
+						agent_id: c.agentId,
+						fork_lineage: { parent_repo: "madgrix/env-isolation", parent_commit: fx.baselineSha },
 					});
 				}
 				case "POST verdict": {
@@ -496,6 +510,7 @@ describe("process environment boundaries of the live-run scripts", () => {
 				MADGRIX_TASK_ID: taskId,
 				MADGRIX_AGENT_IDS: "agent-a,agent-b",
 				MADGRIX_AGENT_COMMAND: agentCommand(dumpDir),
+				MADGRIX_CLAIM_PATHS: CLAIM_PATHS,
 				MADGRIX_RESULT_PATH: resultPath,
 			}),
 		);
@@ -530,6 +545,7 @@ describe("process environment boundaries of the live-run scripts", () => {
 				MADGRIX_TASK_ID: `task_${"b".repeat(24)}`,
 				MADGRIX_AGENT_IDS: "agent-a,agent-b",
 				MADGRIX_AGENT_COMMAND: agentCommand(dumpDir),
+				MADGRIX_CLAIM_PATHS: CLAIM_PATHS,
 				MADGRIX_AGENT_ENV_ALLOWLIST: ` ${MODEL_KEY.name} ,UNSET_BY_OPERATOR`,
 			}),
 		);
@@ -561,6 +577,7 @@ describe("process environment boundaries of the live-run scripts", () => {
 					MADGRIX_BASE_URL: fx.mock.url,
 					MADGRIX_TASK_ID: `task_${"c".repeat(24)}`,
 					MADGRIX_AGENT_COMMAND: agentCommand(dumpDir),
+					MADGRIX_CLAIM_PATHS: CLAIM_PATHS,
 					MADGRIX_AGENT_ENV_ALLOWLIST: `${MODEL_KEY.name},${entry}`,
 				}),
 			);
@@ -580,7 +597,7 @@ describe("process environment boundaries of the live-run scripts", () => {
 				MADGRIX_INTENT: "refuse a dangerous allowlist",
 				MADGRIX_BEHAVIOR_CONTRACT: "no zone credential reaches the agent",
 				MADGRIX_AGENT_COMMAND: agentCommand(dumpDir),
-				MADGRIX_MODEL_NAME: "test-model",
+				MADGRIX_CLAIM_PATHS: CLAIM_PATHS,
 				MADGRIX_HIDDEN_TEST_COMMAND: "true",
 				MADGRIX_BUNDLE_PATH: path.join(dumpDir, "never.bundle"),
 				MADGRIX_AGENT_ENV_ALLOWLIST: "MADGRIX_EVALUATION_SERVICE_TOKEN",
@@ -612,7 +629,6 @@ describe("process environment boundaries of the live-run scripts", () => {
 				MADGRIX_TASK_ID: taskId,
 				MADGRIX_CONTENDER_ID: contender.id,
 				MADGRIX_CANDIDATE_SHA: candidateSha,
-				MADGRIX_MODEL_NAME: "test-model",
 				MADGRIX_RESULT_PATH: resultPath,
 				MADGRIX_AGENT_ENV_ALLOWLIST: MODEL_KEY.name,
 				...evaluationCommands(dumpDir),
@@ -664,8 +680,8 @@ describe("process environment boundaries of the live-run scripts", () => {
 				MADGRIX_BEHAVIOR_CONTRACT: "no child receives another zone's credential",
 				MADGRIX_AGENT_IDS: "agent-a,agent-b",
 				MADGRIX_AGENT_COMMAND: agentCommand(dumpDir),
+				MADGRIX_CLAIM_PATHS: CLAIM_PATHS,
 				MADGRIX_AGENT_ENV_ALLOWLIST: MODEL_KEY.name,
-				MADGRIX_MODEL_NAME: "test-model",
 				MADGRIX_EVENT_TIMEOUT_MS: "10000",
 				MADGRIX_BUNDLE_PATH: path.join(dumpDir, "promotion.bundle"),
 				MADGRIX_TRUST_KEY: fx.trustKeyPath,
@@ -694,6 +710,7 @@ describe("process environment boundaries of the live-run scripts", () => {
 				"MADGRIX_AGENT_COMMAND",
 				"MADGRIX_AGENT_IDS",
 				"MADGRIX_AGENT_ENV_ALLOWLIST",
+				"MADGRIX_CLAIM_PATHS",
 				"MADGRIX_RESULT_PATH",
 				MODEL_KEY.name,
 			]);
@@ -707,7 +724,6 @@ describe("process environment boundaries of the live-run scripts", () => {
 				"MADGRIX_CONTENDER_ID",
 				"MADGRIX_CANDIDATE_SHA",
 				"MADGRIX_EVALUATION_SERVICE_TOKEN",
-				"MADGRIX_MODEL_NAME",
 				"MADGRIX_RESULT_PATH",
 				...Object.values(EVAL_COMMAND_VARS),
 			]);

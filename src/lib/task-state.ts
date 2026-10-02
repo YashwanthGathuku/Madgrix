@@ -497,7 +497,7 @@ export async function registerContender(
  */
 const EVIDENCE_SUBMITTER_ZONES: ReadonlySet<TrustZone> = new Set(["evaluation_domain"]);
 
-export type SubmitEvaluationOutcome = "RECORDED" | "ACK_DUP";
+export type SubmitEvaluationOutcome = "RECORDED" | "ACK_DUP" | "REPLACEMENT_REJECTED";
 
 /**
  * Store an evaluation bundle. The caller identity is checked against the
@@ -508,12 +508,22 @@ export type SubmitEvaluationOutcome = "RECORDED" | "ACK_DUP";
  * check itself is enforced here, so a misrouted or forged caller identity
  * fails closed even if the edge is naive.
  *
+ * Binding (specs/amendments/evidence-integrity-v1.md): the bundle must name
+ * a known contender, and its candidate_sha must be that contender's
+ * latest_commit — the newest push the authority observed. Anything else
+ * throws: evidence for a commit the contender has moved past, or never
+ * pushed, is not evidence about its candidate.
+ *
  * Idempotency: re-submitting the identical bundle (same candidate_sha +
  * bundle_hash, e.g. an evaluation-domain retry) is an ACK_DUP — no state
  * change, no ledger entry. Submitting a DIFFERENT bundle for the same
- * candidate_sha is a re-evaluation: it overwrites (RECORDED). A permit
- * issued against the superseded bundle no longer verifies at promotion
- * (spec 1 §11 check 4 → EVAL_BUNDLE_MISMATCH).
+ * candidate_sha before verifiers' candidate labels exist for it is a
+ * re-evaluation: it overwrites (RECORDED). A permit issued against the
+ * superseded bundle no longer verifies at promotion (spec 1 §11 check 4 →
+ * EVAL_BUNDLE_MISMATCH). Once a label is bound to that SHA, its evidence
+ * is final: a different bundle is REPLACEMENT_REJECTED — the stored bundle
+ * stands and the attempt is recorded as an `evidence_replacement_rejected`
+ * ledger entry, which the caller persists.
  *
  * Rejects bundles for a different task.
  */
@@ -539,10 +549,37 @@ export async function submitEvaluation(
 	}
 	if (bundle.task_hash !== state.task.task_hash)
 		throw new Error("evaluation rejected: task_hash mismatch");
+	const contender = Object.hasOwn(state.contenders, bundle.contender_id)
+		? state.contenders[bundle.contender_id]
+		: undefined;
+	if (contender === undefined)
+		throw new Error(`evaluation rejected: unknown contender ${JSON.stringify(bundle.contender_id)}`);
+	if (contender.latest_commit !== bundle.candidate_sha)
+		throw new Error(
+			`evaluation rejected: candidate ${bundle.candidate_sha} is not the latest observed commit of ` +
+				`${bundle.contender_id} (${contender.latest_commit ?? "no push observed"})`,
+		);
 	const existing = state.evaluations[bundle.candidate_sha];
 	if (existing && existing.bundle_hash === bundle.bundle_hash) {
 		// Idempotent retry of the same evaluation: converge, don't duplicate.
 		return { state, outcome: "ACK_DUP" };
+	}
+	if (existing && Object.values(state.candidate_labels).includes(bundle.candidate_sha)) {
+		// Verifiers can see this candidate under its label: its evidence is
+		// final. Record the attempt; never swap the bundle.
+		const rejected = await appendLedger(
+			state,
+			"evidence_replacement_rejected",
+			{
+				candidate_sha: bundle.candidate_sha,
+				contender_id: bundle.contender_id,
+				recorded_bundle_hash: existing.bundle_hash,
+				rejected_bundle_hash: bundle.bundle_hash,
+				submitted_by_zone: zone,
+			},
+			ctx,
+		);
+		return { state: rejected, outcome: "REPLACEMENT_REJECTED" };
 	}
 	const s2: AuthorityState = {
 		...state,

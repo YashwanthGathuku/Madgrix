@@ -743,6 +743,10 @@ export async function handleEvaluatorCredentials(env: Env, taskId: string, reque
 		baseline_commit: state.task.baseline_commit,
 		claim: claim ? publicClaim(claim) : null,
 		latest_commit: contender.latest_commit,
+		// What the agent's tool-status log must agree with for
+		// provenance_complete (specs/amendments/tool-status-v1.md).
+		agent_id: contender.agent_id,
+		fork_lineage: contender.fork_lineage,
 	});
 }
 

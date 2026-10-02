@@ -39,6 +39,16 @@ describe("validateClaim", () => {
 		assert.match((r as { ok: false; error: string }).error, /unbounded/i);
 	});
 
+	it('rejects a "**" scope path — it matches every path, so it bounds nothing (spec 2 §7)', () => {
+		for (const paths of [["**"], ["src/**", "**"]]) {
+			const c = makeClaim({ work_id: "W-1", scope: { paths, symbols: [] } });
+			const { work_id: _w, status: _s, version: _v, ...input } = c;
+			const r = validateClaim(input);
+			assert.equal(r.ok, false, `scope ${JSON.stringify(paths)}`);
+			assert.match((r as { ok: false; error: string }).error, /unbounded/i);
+		}
+	});
+
 	it("accepts a well-formed claim", () => {
 		const c = makeClaim({ work_id: "W-1" });
 		const { work_id: _w, status: _s, version: _v, ...input } = c;

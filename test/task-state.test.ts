@@ -85,6 +85,13 @@ function stateWithContender(ctx: Ctx): AuthorityState {
 	return { ...s, contenders: { "contender-1": makeContender() } };
 }
 
+/** As stateWithContender, with the contender's push of `sha` already observed
+ *  (evidence must name the contender's latest observed commit). */
+function stateWithObservedCandidate(ctx: Ctx, sha = "csha1"): AuthorityState {
+	const s = stateWithContender(ctx);
+	return { ...s, contenders: { "contender-1": { ...makeContender(), latest_commit: sha } } };
+}
+
 async function makeBundle(overrides: Partial<EvaluationBundle> = {}): Promise<EvaluationBundle> {
 	const base = {
 		candidate_sha: "csha1",
@@ -114,7 +121,7 @@ async function makeBundle(overrides: Partial<EvaluationBundle> = {}): Promise<Ev
 
 /** Drive a fresh authority to an ACCEPT verdict for one candidate. */
 async function authorityWithAccept(ctx: Ctx, bundle: EvaluationBundle) {
-	let state = stateWithContender(ctx);
+	let state = stateWithObservedCandidate(ctx, bundle.candidate_sha);
 	const evalCaller: CallerIdentity = { zone: "evaluation_domain" };
 	state = (await submitEvaluation(state, bundle, evalCaller, ctx)).state;
 	const { state: s2, record } = await runVerdictSeam(
@@ -426,7 +433,7 @@ describe("quarantine", () => {
 	it("quarantine revokes token, cancels workflow, notifies, taints evidence", async () => {
 		const ctx = makeCtx();
 		const bundle = await makeBundle();
-		let state = stateWithContender(ctx);
+		let state = stateWithObservedCandidate(ctx);
 		state = (await submitEvaluation(state, bundle, { zone: "evaluation_domain" }, ctx)).state;
 		const { state: qstate, effects } = await quarantineContender(
 			state,
@@ -452,7 +459,7 @@ describe("quarantine", () => {
 	it("RELEASED requires a passing re-check of the firing trigger + signed determination; REVOKED terminates", async () => {
 		const ctx = makeCtx();
 		const bundle = await makeBundle();
-		let state = stateWithContender(ctx);
+		let state = stateWithObservedCandidate(ctx);
 		state = (await submitEvaluation(state, bundle, { zone: "evaluation_domain" }, ctx)).state;
 		const operator = await makeOperator();
 		state = await operator.register(state, ctx);
@@ -543,7 +550,7 @@ describe("quarantine", () => {
 		// finding is SHA256(canonical_json(presented_config)) != locked digest.
 		const ctx = makeCtx();
 		const bundle = await makeBundle();
-		let state = stateWithContender(ctx);
+		let state = stateWithObservedCandidate(ctx);
 		state = (await submitEvaluation(state, bundle, { zone: "evaluation_domain" }, ctx)).state;
 		const locked = { evaluator_version: "eval-domain/0.3.1", hidden_seed: "9f2c", policy: "strict" };
 		const lockedHash = await ctx.sha256Hex(canonicalJson(locked));

@@ -715,6 +715,19 @@ async function miniAuthority(contenderId = "cont-a", forkRepo = "fork-a"): Promi
 	return { ...s0, contenders: { [contenderId]: contender } };
 }
 
+/** The authority observes `sha` pushed to the contender's fork: evidence is
+ *  admissible only for a contender's latest observed commit. */
+async function observePush(state: AuthorityState, contenderId: string, sha: string, ctx: Ctx): Promise<AuthorityState> {
+	const contender = state.contenders[contenderId];
+	const r = await ingestQueueEvent(
+		state,
+		{ namespace: "bench", repo: contender.fork_repo, ref: "refs/heads/main", before: contender.latest_commit ?? "base0", after: sha },
+		ctx,
+	);
+	expect(r.outcome === "APPLIED_NEW", `push of ${sha} to ${contenderId} must be observed`);
+	return r.state;
+}
+
 function miniClaim(taskHash: string): WorkClaim {
 	return {
 		work_id: "W-synth",
@@ -768,6 +781,7 @@ async function buildPromotionScenario(ctx: Ctx, seed: number): Promise<{
 		regressionsPassed: true,
 		regressionFailed: [],
 	});
+	state = await observePush(state, "cont-a", shaX, ctx);
 	state = (await submitEvaluation(state, bundle, { zone: "evaluation_domain" }, ctx)).state;
 	const { state: s2, record } = await runVerdictSeam(
 		state,
@@ -938,6 +952,7 @@ async function runAdversarialStratum(seed: number): Promise<AdversarialStratum> 
 			regressionsPassed: true,
 			regressionFailed: [],
 		});
+		state = await observePush(state, "cont-a", sha, ctx);
 		state = (await submitEvaluation(state, bundle, { zone: "evaluation_domain" }, ctx)).state;
 		const lockedHash = await sha256Hex(canonicalJson({ evaluator_version: "x" }));
 		const r = await quarantineContender(state, "cont-a", "evaluator_config_modification", lockedHash, ctx);

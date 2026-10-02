@@ -16,9 +16,11 @@
  *   MADGRIX_BASELINE_COMMIT
  *   MADGRIX_INTENT
  *   MADGRIX_BEHAVIOR_CONTRACT
- *   MADGRIX_AGENT_COMMAND
- *   MADGRIX_MODEL_NAME
+ *   MADGRIX_AGENT_COMMAND          must write the agent's tool-status log
+ *                                  (specs/amendments/tool-status-v1.md)
  *   MADGRIX_HIDDEN_TEST_COMMAND
+ *   MADGRIX_CLAIM_PATHS            the claim's scope.paths, passed to the
+ *                                  contender runner (or MADGRIX_CLAIM_TEMPLATE)
  *
  * Optional:
  *   MADGRIX_DESTINATION_REPO       default baseline repo
@@ -31,7 +33,8 @@
  *   MADGRIX_KEEP_WORKSPACES / MADGRIX_WORK_ROOT / GIT_AUTHOR_NAME /
  *   GIT_AUTHOR_EMAIL               passed through to contender runner
  *   MADGRIX_REGRESSION_COMMAND / SEMANTIC / STATIC / SECURITY commands
- *   MADGRIX_HARNESS_VERSION        passed through to the evaluator
+ *   MADGRIX_HIDDEN_TESTS_DIR / MADGRIX_TEST_GLOBS / MADGRIX_HARNESS_VERSION
+ *                                  passed through to the evaluator
  *   MADGRIX_TRUST_KEY              authority public key file pinned when
  *                                  verifying the bundle (default
  *                                  keys/authority.pub)
@@ -71,7 +74,6 @@ const destinationRepo = env.MADGRIX_DESTINATION_REPO ?? baselineRepo;
 const intent = env.MADGRIX_INTENT;
 const behaviorContract = env.MADGRIX_BEHAVIOR_CONTRACT;
 const agentCommand = env.MADGRIX_AGENT_COMMAND;
-const modelName = env.MADGRIX_MODEL_NAME;
 const hiddenCommand = env.MADGRIX_HIDDEN_TEST_COMMAND;
 const eventTimeoutMs = Number(env.MADGRIX_EVENT_TIMEOUT_MS ?? "60000");
 const bundlePath = path.resolve(env.MADGRIX_BUNDLE_PATH ?? ".madgrix-live/promotion.bundle");
@@ -86,10 +88,12 @@ const required: Record<string, unknown> = {
 	MADGRIX_INTENT: intent,
 	MADGRIX_BEHAVIOR_CONTRACT: behaviorContract,
 	MADGRIX_AGENT_COMMAND: agentCommand,
-	MADGRIX_MODEL_NAME: modelName,
 	MADGRIX_HIDDEN_TEST_COMMAND: hiddenCommand,
 };
 const missing = Object.entries(required).filter(([, v]) => typeof v !== "string" || v.length === 0);
+if (!env.MADGRIX_CLAIM_PATHS && !env.MADGRIX_CLAIM_TEMPLATE) {
+	missing.push(["MADGRIX_CLAIM_PATHS (or MADGRIX_CLAIM_TEMPLATE)", undefined]);
+}
 if (missing.length) {
 	console.error("Missing required environment:", missing.map(([k]) => k).join(", "));
 	process.exit(2);
@@ -255,6 +259,7 @@ try {
 			MADGRIX_AGENT_COMMAND: agentCommand,
 			MADGRIX_AGENT_IDS: env.MADGRIX_AGENT_IDS,
 			MADGRIX_AGENT_ENV_ALLOWLIST: env.MADGRIX_AGENT_ENV_ALLOWLIST,
+			MADGRIX_CLAIM_PATHS: env.MADGRIX_CLAIM_PATHS,
 			MADGRIX_CLAIM_TEMPLATE: env.MADGRIX_CLAIM_TEMPLATE,
 			MADGRIX_KEEP_WORKSPACES: env.MADGRIX_KEEP_WORKSPACES,
 			MADGRIX_WORK_ROOT: env.MADGRIX_WORK_ROOT,
@@ -307,12 +312,13 @@ try {
 					MADGRIX_CONTENDER_ID: candidate.contender_id,
 					MADGRIX_CANDIDATE_SHA: candidate.candidate_sha,
 					MADGRIX_EVALUATION_SERVICE_TOKEN: evaluationToken,
-					MADGRIX_MODEL_NAME: modelName,
 					MADGRIX_HIDDEN_TEST_COMMAND: hiddenCommand,
 					MADGRIX_REGRESSION_COMMAND: env.MADGRIX_REGRESSION_COMMAND,
 					MADGRIX_SEMANTIC_COMMAND: env.MADGRIX_SEMANTIC_COMMAND,
 					MADGRIX_STATIC_COMMAND: env.MADGRIX_STATIC_COMMAND,
 					MADGRIX_SECURITY_COMMAND: env.MADGRIX_SECURITY_COMMAND,
+					MADGRIX_HIDDEN_TESTS_DIR: env.MADGRIX_HIDDEN_TESTS_DIR,
+					MADGRIX_TEST_GLOBS: env.MADGRIX_TEST_GLOBS,
 					MADGRIX_HARNESS_VERSION: env.MADGRIX_HARNESS_VERSION,
 					MADGRIX_RESULT_PATH: resultPath,
 				}),

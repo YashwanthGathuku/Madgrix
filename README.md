@@ -133,9 +133,9 @@ npm run bench
 Expected test summary at the current competition-critical branch:
 
 ```
-tests 130
-suites 32
-pass 130
+tests 159
+suites 41
+pass 159
 fail 0
 ```
 
@@ -148,7 +148,7 @@ High-level prerequisites:
 1. Deploy the Worker with the `ARTIFACTS`, `TASK_AUTHORITY`, promotion-container, Workflow, Queue, and four secret bindings (three service tokens and `AUTHORITY_SIGNING_KEY`) declared in `cloudflare.config.ts`, and commit the matching `keys/authority.pub` (`keys/README.md`).
 2. Configure Artifact push events from the competition namespace into `madgrix-events`.
 3. Have a baseline Artifact repository and exact baseline commit.
-4. Provide a real coding-agent command and independent evaluation commands.
+4. Provide a real coding-agent command that writes its tool-status log (`specs/amendments/tool-status-v1.md`), the claim scope (`MADGRIX_CLAIM_PATHS`; `"**"` is refused), and independent evaluation commands.
 
 Then run:
 
@@ -169,7 +169,7 @@ Provider-specific coding agents are deliberately not hardcoded. `MADGRIX_AGENT_C
 | POST | `/tasks/:id/claim` | AGENT/CONTROL (+ agent secret after the agent's first claim) | Register WorkClaim + conflict findings; the first claim returns the agent secret once |
 | POST | `/tasks/:id/contenders` | AGENT/CONTROL + `X-Madgrix-Agent-Secret` | Create the calling agent's contender repo + scoped write token (once per contender) |
 | POST | `/tasks/:id/evaluator-credentials` | EVALUATION | Mint short-lived read-only candidate credential |
-| POST | `/tasks/:id/evidence` | EVALUATION | Submit content-addressed evaluation bundle |
+| POST | `/tasks/:id/evidence` | EVALUATION | Submit content-addressed evaluation bundle for the contender's latest observed commit; a replacement bundle is refused (409) once the candidate is labeled |
 | POST | `/tasks/:id/verifiers/commit` | CONTROL | Record blind-verifier commitment |
 | POST | `/tasks/:id/verifiers/labels` | CONTROL | Assign anonymized candidate labels after commitments |
 | POST | `/tasks/:id/verifiers/reveal` | CONTROL | Validate one-time reveal |

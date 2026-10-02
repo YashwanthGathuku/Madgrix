@@ -76,6 +76,26 @@ async function makeBundle(input: {
 
 const EVAL_CALLER = { zone: "evaluation_domain" } as const;
 
+/** contender-1, bound to `workId`, with its push of `cand` observed by the authority. */
+function observedContender(state: AuthorityState, workId: string, cand: string): AuthorityState {
+	return {
+		...state,
+		contenders: {
+			"contender-1": {
+				contender_id: "contender-1",
+				agent_id: "contender-1",
+				fork_repo: "fork-contender-1",
+				fork_lineage: { parent_repo: "acme/api", parent_commit: "base123" },
+				token_id: "tok-1",
+				token_ids: ["tok-1"],
+				status: "forked",
+				claim_work_id: workId,
+				latest_commit: cand,
+			},
+		},
+	};
+}
+
 /** Authority driven to an ACCEPT verdict for one candidate; returns state + ids. */
 async function authorityWithPermit(ctx: Ctx, task_hash: string, cand: string, tree: string, head: string) {
 	let state: AuthorityState = createAuthority({
@@ -104,7 +124,7 @@ async function authorityWithPermit(ctx: Ctx, task_hash: string, cand: string, tr
 		},
 		ctx,
 	);
-	state = claimRes.state;
+	state = observedContender(claimRes.state, claimRes.claim.work_id, cand);
 	const bundle = await makeBundle({ candidate_sha: cand, tree_sha256: tree, contender_id: "contender-1", task_hash });
 	state = (await submitEvaluation(state, bundle, EVAL_CALLER, ctx)).state;
 	const v = await runVerdictSeam(

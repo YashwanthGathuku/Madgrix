@@ -18,8 +18,10 @@
  *   against live claims); `/contender` → `registerContender` (create-only:
  *   an existing record is returned unchanged, never overwritten);
  *   `/evidence` → `submitEvaluation` (rejects bundles for a different
- *   task); `/promotion/finalize` → `attemptPromotion` +
- *   `recordPromotionBundle` (signs the ship record with
+ *   task or for a SHA that is not the contender's latest observed commit;
+ *   answers 409 and ledgers `evidence_replacement_rejected` when a labeled
+ *   candidate's evidence would be replaced); `/promotion/finalize` →
+ *   `attemptPromotion` + `recordPromotionBundle` (signs the ship record with
  *   AUTHORITY_SIGNING_KEY in the same transaction). Verdict, permit, and
  *   quarantine logic lives in task-state.ts.
  *
@@ -299,6 +301,17 @@ export class TaskAuthority {
 					if (outcome === "ACK_DUP")
 						return json({ recorded: true, candidate_sha: body.bundle!.candidate_sha, outcome: "ACK_DUP" });
 					await this.doState.storage.put(STATE_KEY, next);
+					if (outcome === "REPLACEMENT_REJECTED") {
+						// Persisted: the ledger records the attempt; the labeled evidence stands.
+						return json(
+							{
+								error: "evidence_replacement_rejected",
+								candidate_sha: body.bundle!.candidate_sha,
+								recorded_bundle_hash: next.evaluations[body.bundle!.candidate_sha].bundle_hash,
+							},
+							409,
+						);
+					}
 					return json({ recorded: true, candidate_sha: body.bundle!.candidate_sha });
 				} catch (err) {
 					return json({ error: "evidence_rejected", detail: (err as Error).message }, 422);

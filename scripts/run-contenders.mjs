@@ -6,6 +6,15 @@
  *   MADGRIX_BASE_URL=https://<worker>
  *   MADGRIX_TASK_ID=task_<24hex>
  *   MADGRIX_AGENT_COMMAND='<command run inside each cloned repo>'
+ *   MADGRIX_CLAIM_PATHS=src/auth/**,src/jwt.ts   the WorkClaim's scope.paths:
+ *     repo-relative globs ("**" is refused: an unbounded claim is not
+ *     admissible, spec 2 §7). Or MADGRIX_CLAIM_TEMPLATE, a JSON claim body
+ *     whose own scope.paths is used instead.
+ *
+ * The agent command writes its tool-status log to .madgrix/tool-status.jsonl
+ * in the workspace (specs/amendments/tool-status-v1.md); it is committed with
+ * the agent's other changes. Without it the candidate fails valid_tool_states
+ * and provenance_complete.
  *
  * Optional:
  *   MADGRIX_AGENT_IDS=agent-a,agent-b,agent-c   (default)
@@ -56,6 +65,31 @@ try {
 	agentEnvAllowlist = parseAgentEnvAllowlist(process.env.MADGRIX_AGENT_ENV_ALLOWLIST);
 } catch (err) {
 	console.error(err.message);
+	process.exit(2);
+}
+let claimTemplate = null;
+if (process.env.MADGRIX_CLAIM_TEMPLATE) {
+	try {
+		claimTemplate = JSON.parse(process.env.MADGRIX_CLAIM_TEMPLATE);
+	} catch {
+		console.error("MADGRIX_CLAIM_TEMPLATE must be valid JSON");
+		process.exit(2);
+	}
+}
+const claimPaths = (process.env.MADGRIX_CLAIM_PATHS ?? "")
+	.split(",")
+	.map((s) => s.trim())
+	.filter(Boolean);
+const scopePaths = claimTemplate ? claimTemplate.scope?.paths : claimPaths;
+if (!Array.isArray(scopePaths) || scopePaths.length === 0) {
+	console.error(
+		"A WorkClaim needs a bounded scope: set MADGRIX_CLAIM_PATHS (comma-separated repo-relative globs) " +
+			"or scope.paths in MADGRIX_CLAIM_TEMPLATE (spec 2 §2).",
+	);
+	process.exit(2);
+}
+if (scopePaths.includes("**")) {
+	console.error('Claim scope "**" matches every path; unbounded claims are not admissible (spec 2 §7). Name the paths the task may change.');
 	process.exit(2);
 }
 
@@ -122,17 +156,9 @@ if (!task || typeof task.task_hash !== "string" || typeof task.baseline_commit !
 	throw new Error("MADGRIX task context is incomplete");
 }
 
-let claimTemplate = null;
-if (process.env.MADGRIX_CLAIM_TEMPLATE) {
-	try {
-		claimTemplate = JSON.parse(process.env.MADGRIX_CLAIM_TEMPLATE);
-	} catch {
-		throw new Error("MADGRIX_CLAIM_TEMPLATE must be valid JSON");
-	}
-}
 const defaultClaim = {
 	intent: { behavior: [task.intent] },
-	scope: { paths: ["**"], symbols: [] },
+	scope: { paths: claimPaths, symbols: [] },
 	contracts: { reads: [], modifies: [] },
 	interfaces: [],
 	schema_changes: [],

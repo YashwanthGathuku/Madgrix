@@ -13,7 +13,6 @@
  *   MADGRIX_CONTENDER_ID
  *   MADGRIX_CANDIDATE_SHA
  *   MADGRIX_EVALUATION_SERVICE_TOKEN
- *   MADGRIX_MODEL_NAME
  *
  * Evaluation commands:
  *   MADGRIX_HIDDEN_TEST_COMMAND      required
@@ -21,6 +20,25 @@
  *   MADGRIX_SEMANTIC_COMMAND         optional (pass when absent)
  *   MADGRIX_STATIC_COMMAND           optional (pass when absent)
  *   MADGRIX_SECURITY_COMMAND         optional (pass when absent)
+ *
+ * Optional:
+ *   MADGRIX_HIDDEN_TESTS_DIR   directory on this host whose files are copied
+ *                              into the run directory
+ *   MADGRIX_TEST_GLOBS         comma-separated globs added to the default test
+ *                              globs (src/lib/eval-gates.ts)
+ *   MADGRIX_HARNESS_VERSION    this evaluator's version, for the result
+ *
+ * Run directory (specs/amendments/evidence-integrity-v1.md): every command
+ * runs in a fresh directory outside the candidate checkout that holds the
+ * BASELINE's runner configuration and test material, the candidate's other
+ * files, and the hidden tests. A candidate change to runner configuration,
+ * to a path matched by a test glob, or to a path outside its claim scope
+ * fails no_eval_tampering.
+ *
+ * Tool-status log (specs/amendments/tool-status-v1.md): valid_tool_states
+ * and provenance_complete come from the agent's .madgrix/tool-status.jsonl
+ * in the candidate tree. The model id is the log's; no environment variable
+ * supplies it.
  *
  * White-box caveat: candidate code and test processes share this disposable
  * evaluator host. This protects evaluator credentials/authority and destroys
@@ -33,13 +51,23 @@
  */
 
 import { createHash } from "node:crypto";
-import { mkdtemp, rm } from "node:fs/promises";
+import { cp, lstat, mkdir, mkdtemp, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
 
 import { canonicalJson, sha256Hex } from "../src/lib/canonical.ts";
-import { globMatchesPath } from "../src/lib/claims.ts";
+import {
+	DEFAULT_TEST_GLOBS,
+	TOOL_STATUS_LOG_MAX_BYTES,
+	TOOL_STATUS_LOG_PATH,
+	changedPaths,
+	checkToolStatusLog,
+	composeRunTree,
+	evaluatorGates,
+	type RunFile,
+	type TreeEntry,
+} from "../src/lib/eval-gates.ts";
 import { minimalEnv } from "./lib/child-env.mjs";
 
 const baseUrl = process.env.MADGRIX_BASE_URL?.replace(/\/$/, "");
@@ -47,19 +75,30 @@ const taskId = process.env.MADGRIX_TASK_ID;
 const contenderId = process.env.MADGRIX_CONTENDER_ID;
 const candidateSha = process.env.MADGRIX_CANDIDATE_SHA;
 const serviceToken = process.env.MADGRIX_EVALUATION_SERVICE_TOKEN;
-const modelName = process.env.MADGRIX_MODEL_NAME;
 const hiddenCommand = process.env.MADGRIX_HIDDEN_TEST_COMMAND;
 const regressionCommand = process.env.MADGRIX_REGRESSION_COMMAND ?? hiddenCommand;
 const semanticCommand = process.env.MADGRIX_SEMANTIC_COMMAND;
 const staticCommand = process.env.MADGRIX_STATIC_COMMAND;
 const securityCommand = process.env.MADGRIX_SECURITY_COMMAND;
 const harnessVersion = process.env.MADGRIX_HARNESS_VERSION ?? "madgrix-evaluator/0.1.0";
+const hiddenTestsDir = process.env.MADGRIX_HIDDEN_TESTS_DIR ? path.resolve(process.env.MADGRIX_HIDDEN_TESTS_DIR) : undefined;
+const testGlobs = [
+	...DEFAULT_TEST_GLOBS,
+	...(process.env.MADGRIX_TEST_GLOBS ?? "")
+		.split(",")
+		.map((s) => s.trim())
+		.filter(Boolean),
+];
 
-if (!baseUrl || !taskId || !contenderId || !candidateSha || !serviceToken || !modelName || !hiddenCommand) {
+if (!baseUrl || !taskId || !contenderId || !candidateSha || !serviceToken || !hiddenCommand) {
 	console.error(
 		"Missing required MADGRIX_* variables. Need BASE_URL, TASK_ID, CONTENDER_ID, " +
-			"CANDIDATE_SHA, EVALUATION_SERVICE_TOKEN, MODEL_NAME, HIDDEN_TEST_COMMAND.",
+			"CANDIDATE_SHA, EVALUATION_SERVICE_TOKEN, HIDDEN_TEST_COMMAND.",
 	);
+	process.exit(2);
+}
+if (hiddenTestsDir !== undefined && !(await stat(hiddenTestsDir).then((s) => s.isDirectory(), () => false))) {
+	console.error(`MADGRIX_HIDDEN_TESTS_DIR is not a directory: ${hiddenTestsDir}`);
 	process.exit(2);
 }
 
@@ -145,24 +184,85 @@ async function treeDigestV1(repoDir: string, sha: string): Promise<string> {
 	return createHash("sha256").update(Buffer.concat(records)).digest("hex");
 }
 
-async function changedFiles(repoDir: string, baseline: string, candidate: string): Promise<string[]> {
-	const raw = await capture("git", ["diff", "--name-only", "-z", baseline, candidate], repoDir);
+/** Every blob and submodule entry of `sha`'s tree (`git ls-tree -r`). */
+async function lsTree(repoDir: string, sha: string): Promise<TreeEntry[]> {
+	const raw = (await capture("git", ["ls-tree", "-r", "-z", "--full-tree", sha], repoDir)).toString("utf8");
 	return raw
-		.toString("utf8")
 		.split("\0")
-		.filter(Boolean);
+		.filter(Boolean)
+		.map((record) => {
+			const tab = record.indexOf("\t");
+			const [mode, type, oid] = record.slice(0, tab).split(" ");
+			return { mode, type, oid, path: record.slice(tab + 1) };
+		});
 }
 
-async function isAncestor(repoDir: string, baseline: string, candidate: string): Promise<boolean> {
+function gitSucceeds(args: string[], repoDir: string): Promise<boolean> {
 	return new Promise((resolve) => {
-		const child = spawn("git", ["merge-base", "--is-ancestor", baseline, candidate], {
-			cwd: repoDir,
-			env: minimalEnv(),
-			stdio: "ignore",
-		});
+		const child = spawn("git", args, { cwd: repoDir, env: minimalEnv(), stdio: "ignore" });
 		child.on("error", () => resolve(false));
 		child.on("exit", (code) => resolve(code === 0));
 	});
+}
+
+/** The candidate's tool-status log, or why there is none to read. */
+async function readToolStatusLog(repoDir: string, tree: TreeEntry[]): Promise<{ text: string } | { absent: string }> {
+	const entry = tree.find((e) => e.path === TOOL_STATUS_LOG_PATH);
+	if (!entry) return { absent: `no tool-status log at ${TOOL_STATUS_LOG_PATH}` };
+	if (entry.type !== "blob" || entry.mode === "120000") {
+		return { absent: `${TOOL_STATUS_LOG_PATH} is not a regular file` };
+	}
+	const size = Number((await capture("git", ["cat-file", "-s", entry.oid], repoDir)).toString("utf8").trim());
+	if (!(size <= TOOL_STATUS_LOG_MAX_BYTES)) {
+		return { absent: `${TOOL_STATUS_LOG_PATH} exceeds ${TOOL_STATUS_LOG_MAX_BYTES} bytes` };
+	}
+	return { text: (await capture("git", ["cat-file", "blob", entry.oid], repoDir)).toString("utf8") };
+}
+
+/** Refuse to create anything under `rel` whose existing parent inside `root` is a symlink. */
+async function refuseSymlinkParents(root: string, rel: string): Promise<void> {
+	let dir = root;
+	for (const part of rel.split("/").slice(0, -1)) {
+		dir = path.join(dir, part);
+		const st = await lstat(dir).catch(() => null);
+		if (st?.isSymbolicLink()) throw new Error(`run directory: ${rel} would be written through a symlink`);
+	}
+}
+
+/**
+ * Write the run directory: the composed tree's regular files, then the
+ * hidden tests, then the tree's symlinks, so no file is written through a
+ * symlink the candidate supplied.
+ */
+async function materialize(repoDir: string, runDir: string, files: RunFile[]): Promise<void> {
+	for (const file of files) {
+		if (file.mode === "120000") continue;
+		const target = path.join(runDir, file.path);
+		await mkdir(path.dirname(target), { recursive: true });
+		await writeFile(target, await capture("git", ["cat-file", "blob", file.oid], repoDir), {
+			flag: "wx",
+			mode: file.mode === "100755" ? 0o755 : 0o644,
+		});
+	}
+	if (hiddenTestsDir !== undefined) {
+		await cp(hiddenTestsDir, runDir, { recursive: true, force: true, dereference: true });
+	}
+	for (const file of files) {
+		if (file.mode !== "120000") continue;
+		await refuseSymlinkParents(runDir, file.path);
+		const target = path.join(runDir, file.path);
+		await mkdir(path.dirname(target), { recursive: true });
+		await symlink((await capture("git", ["cat-file", "blob", file.oid], repoDir)).toString("utf8"), target);
+	}
+}
+
+/** Relative paths of the files under the hidden-tests directory. */
+async function hiddenTestPaths(): Promise<string[]> {
+	if (hiddenTestsDir === undefined) return [];
+	const entries = await readdir(hiddenTestsDir, { recursive: true, withFileTypes: true });
+	return entries
+		.filter((e) => !e.isDirectory())
+		.map((e) => path.relative(hiddenTestsDir, path.join(e.parentPath, e.name)).split(path.sep).join("/"));
 }
 
 function suiteResult(command: string, result: { passed: boolean; detail: string }) {
@@ -177,14 +277,19 @@ const creds = await postJson(
 	`${baseUrl}/tasks/${encodeURIComponent(taskId)}/evaluator-credentials`,
 	{ contender_id: contenderId },
 );
-if (creds.latest_commit && creds.latest_commit !== candidateSha) {
+// The authority admits evidence only for the contender's latest observed
+// commit (specs/amendments/evidence-integrity-v1.md): fail before evaluating.
+if (creds.latest_commit !== candidateSha) {
 	throw new Error(
-		`candidate SHA is stale: authority observed ${creds.latest_commit}, evaluator was given ${candidateSha}`,
+		`candidate SHA is not the contender's latest observed commit: authority observed ` +
+			`${creds.latest_commit ?? "no push"}, evaluator was given ${candidateSha}`,
 	);
 }
 if (!creds.claim) throw new Error("candidate has no bound WorkClaim; scope gate must fail closed");
 
 const dir = await mkdtemp(path.join(os.tmpdir(), "madgrix-eval-"));
+// Outside the candidate checkout: the commands run here, never in `dir`.
+const runDir = await mkdtemp(path.join(os.tmpdir(), "madgrix-run-"));
 try {
 	const authHeader = `Authorization: Bearer ${creds.token}`;
 	await new Promise<void>((resolve, reject) => {
@@ -196,39 +301,61 @@ try {
 		child.on("error", reject);
 		child.on("exit", (code) => (code === 0 ? resolve() : reject(new Error(`git clone failed: ${code}`))));
 	});
-	await capture("git", ["checkout", "--detach", candidateSha], dir);
+	if (!(await gitSucceeds(["cat-file", "-e", `${candidateSha}^{commit}`], dir))) {
+		throw new Error(`candidate commit ${candidateSha} is not in the contender repository`);
+	}
 
-	const exactBaseline = await isAncestor(dir, creds.baseline_commit, candidateSha);
-	const files = await changedFiles(dir, creds.baseline_commit, candidateSha);
-	const scopeCompliance = files.every((file) =>
-		(creds.claim.scope?.paths ?? []).some((glob: string) => globMatchesPath(glob, file)),
-	);
-	const testTamper = files.some((file) => /(^|\/)(__tests__|tests?|spec)(\/|$)/i.test(file));
+	const baselineCommit: string = creds.baseline_commit;
+	const baselineAvailable = await gitSucceeds(["cat-file", "-e", `${baselineCommit}^{commit}`], dir);
+	const descendsFromBaseline =
+		baselineAvailable && (await gitSucceeds(["merge-base", "--is-ancestor", baselineCommit, candidateSha], dir));
+	// Everything read from the clone is read before any candidate code runs.
+	const tree_sha256 = await treeDigestV1(dir, candidateSha);
+	const candidateTree = await lsTree(dir, candidateSha);
+	const baselineTree = baselineAvailable ? await lsTree(dir, baselineCommit) : [];
+	const changed = changedPaths(baselineTree, candidateTree);
+	const toolStatus = checkToolStatusLog(await readToolStatusLog(dir, candidateTree), {
+		task_id: taskId,
+		contender_id: contenderId,
+		agent_id: typeof creds.agent_id === "string" ? creds.agent_id : null,
+		baseline_commit: baselineCommit,
+	});
+	const gates = evaluatorGates({
+		baselineAvailable,
+		descendsFromBaseline,
+		baselineCommit,
+		changed,
+		scope: Array.isArray(creds.claim.scope?.paths) ? creds.claim.scope.paths : null,
+		testGlobs,
+		toolStatus,
+		forkLineage: creds.fork_lineage,
+	});
 
+	// Without the baseline there is no runner configuration or test material
+	// to run the candidate against: nothing runs and every suite fails.
+	const notRun = { passed: false, detail: `not run: baseline commit ${baselineCommit} is unavailable` };
+	const run = (command: string) => (baselineAvailable ? exitCode(command, runDir) : Promise.resolve(notRun));
+	const optional = (command: string | undefined) =>
+		command ? run(command) : Promise.resolve({ passed: true, detail: "" });
+	if (baselineAvailable) {
+		const files = composeRunTree(baselineTree, candidateTree, testGlobs, await hiddenTestPaths());
+		await materialize(dir, runDir, files);
+	}
 	const [hidden, regressions, semantic, staticCheck, security] = await Promise.all([
-		exitCode(hiddenCommand, dir),
-		exitCode(regressionCommand!, dir),
-		semanticCommand ? exitCode(semanticCommand, dir) : Promise.resolve({ passed: true, detail: "" }),
-		staticCommand ? exitCode(staticCommand, dir) : Promise.resolve({ passed: true, detail: "" }),
-		securityCommand ? exitCode(securityCommand, dir) : Promise.resolve({ passed: true, detail: "" }),
+		run(hiddenCommand),
+		run(regressionCommand!),
+		optional(semanticCommand),
+		optional(staticCommand),
+		optional(securityCommand),
 	]);
 
-	const tree_sha256 = await treeDigestV1(dir, candidateSha);
 	const evaluated_at = new Date().toISOString();
 	const withoutHash = {
 		candidate_sha: candidateSha,
 		tree_sha256,
 		contender_id: contenderId,
 		task_hash: creds.task_hash,
-		admission: {
-			exact_baseline: exactBaseline,
-			scope_compliance: scopeCompliance,
-			// This receipt is mechanical: the evaluator fetched the exact immutable
-			// candidate through an authenticated read-only repo credential.
-			valid_tool_states: true,
-			no_eval_tampering: !testTamper,
-			provenance_complete: Boolean(modelName && harnessVersion),
-		},
+		admission: gates.admission,
 		hidden_oracle: suiteResult(hiddenCommand, hidden),
 		regressions: suiteResult(regressionCommand!, regressions),
 		static_analysis: {
@@ -237,11 +364,8 @@ try {
 		},
 		semantic_checks: suiteResult(semanticCommand ?? "not-configured", semantic),
 		security_policy: {
-			passed: security.passed && !testTamper,
-			findings: [
-				...(security.passed ? [] : [security.detail || "security command failed"]),
-				...(testTamper ? ["candidate modified test/spec material relative to the frozen baseline"] : []),
-			],
+			passed: security.passed && gates.findings.length === 0,
+			findings: [...(security.passed ? [] : [security.detail || "security command failed"]), ...gates.findings],
 		},
 		evaluated_at,
 		tainted: false,
@@ -256,15 +380,21 @@ try {
 		candidate_sha: candidateSha,
 		tree_sha256,
 		bundle_hash,
-		changed_files: files,
+		changed_files: changed,
 		bundle,
-		provenance: { model: modelName, harness_version: harnessVersion },
+		tool_status: { actions: toolStatus.actions, errors: toolStatus.errors },
+		provenance: {
+			agent_id: toolStatus.session?.agent_id ?? null,
+			model: toolStatus.session?.model ?? null,
+			harness: toolStatus.session?.harness ?? null,
+			evaluator_harness_version: harnessVersion,
+		},
 	};
 	if (process.env.MADGRIX_RESULT_PATH) {
-		const { writeFile } = await import("node:fs/promises");
 		await writeFile(process.env.MADGRIX_RESULT_PATH, JSON.stringify(result, null, 2) + "\n", "utf8");
 	}
 	console.log(JSON.stringify(result, null, 2));
 } finally {
 	await rm(dir, { recursive: true, force: true });
+	await rm(runDir, { recursive: true, force: true });
 }

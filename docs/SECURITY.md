@@ -140,6 +140,42 @@ What this boundary does **not** do:
   other local processes while that `git` process runs. This section does not change
   that.
 
+## Evidence integrity and the evaluation run directory
+
+The amendments are `specs/amendments/evidence-integrity-v1.md` and
+`specs/amendments/tool-status-v1.md`.
+
+- **Evidence names the observed commit.** The task authority records an evaluation
+  bundle only when its `candidate_sha` is the contender's `latest_commit`, the newest
+  push it observed (422 otherwise). Once a candidate label is bound to a SHA, a
+  different bundle for that SHA is refused with 409, the stored bundle stands, and the
+  ledger records `evidence_replacement_rejected`.
+- **The commands run the baseline's configuration.** `evaluate-candidate.ts` runs
+  every evaluation command in a fresh directory outside the candidate checkout. That
+  directory holds the baseline's runner configuration (`package.json`, lockfiles,
+  `conftest.py`, jest/vitest/mocha configs, `pytest.ini`, `pyproject.toml`,
+  `tox.ini`, `setup.cfg`, `Makefile`, …) and test material (test globs including
+  `__mocks__/`), the candidate's other files, and the hidden tests from
+  `MADGRIX_HIDDEN_TESTS_DIR`. A candidate change to runner configuration, to a path a
+  test glob matches, or to a path outside its claim fails `no_eval_tampering`.
+- **Claims are bounded.** A claim scope of `"**"` is refused at `/claim` and by the
+  contender runner, and fails `scope_compliance` at evaluation.
+- **Tool receipts come from the agent.** `valid_tool_states` and `provenance_complete`
+  are read from the agent's `.madgrix/tool-status.jsonl`, bound to the task,
+  contender, agent and baseline. The model id comes from that log, never from the
+  evaluator's environment.
+
+`test/evaluator-isolation.test.ts` runs the evaluator against a mock Worker and bare
+Git repositories. A candidate whose only change sets `package.json` `"test"` to
+`"exit 0"` fails `no_eval_tampering`, and the hidden suite still runs the baseline's
+test script against the candidate's code (and fails). Before this change both
+assertions failed: the evaluator ran the candidate's `"exit 0"`.
+
+What this does **not** do: the run directory is not a sandbox. Candidate code runs
+next to the baseline and hidden tests and can read or rewrite them while the suite
+runs (white-box caveat below). The tool log is the agent's own statement. The
+evaluator checks its form and binding, not that the listed actions happened.
+
 ## The honest sandbox constraint
 
 One sandbox is not an adversarial boundary: processes inside it share the filesystem

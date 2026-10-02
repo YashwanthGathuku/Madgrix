@@ -20,8 +20,10 @@ import {
 	attemptPromotion,
 	createAuthority,
 	defaultCtx,
+	ingestQueueEvent,
 	issuePermit,
 	registerClaim,
+	registerContender,
 	runVerdictSeam,
 	submitEvaluation,
 	type Ctx,
@@ -111,6 +113,33 @@ export async function runHeadMoveScenario(ctx: Ctx): Promise<{ state: AuthorityS
 
 	const CAND = "cand-x";
 	const TREE_X = "tree-x";
+
+	// contender-1's fork, and the push of CAND observed through the queue:
+	// evidence is admissible only for a contender's latest observed commit.
+	state = (
+		await registerContender(
+			state,
+			{
+				contender_id: "contender-1",
+				agent_id: "contender-1",
+				fork_repo: "fork-contender-1",
+				fork_lineage: { parent_repo: "acme/api", parent_commit: "base123" },
+				token_id: "tok-1",
+				token_ids: ["tok-1"],
+				status: "forked",
+				claim_work_id: claimRes.claim.work_id,
+				latest_commit: null,
+			},
+			ctx,
+		)
+	).state;
+	const pushed = await ingestQueueEvent(
+		state,
+		{ namespace: "headmove", repo: "fork-contender-1", ref: "refs/heads/main", before: "base123", after: CAND },
+		ctx,
+	);
+	check(pushed.outcome === "APPLIED_NEW", "the contender's push must be observed");
+	state = pushed.state;
 
 	// --- promote once at HEAD H0 -------------------------------------
 	const bundle1 = await makeBundle({

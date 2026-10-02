@@ -130,8 +130,24 @@ describe("head-move: rebase-vs-reverify end to end", () => {
 			},
 			ctx,
 		);
-		state = claimRes.state;
 		const CAND = "cand-e";
+		// contender-1's push of CAND, as the authority observed it.
+		state = {
+			...claimRes.state,
+			contenders: {
+				"contender-1": {
+					contender_id: "contender-1",
+					agent_id: "contender-1",
+					fork_repo: "fork-contender-1",
+					fork_lineage: { parent_repo: "acme/api", parent_commit: "base123" },
+					token_id: "tok-1",
+					token_ids: ["tok-1"],
+					status: "forked",
+					claim_work_id: claimRes.claim.work_id,
+					latest_commit: CAND,
+				},
+			},
+		};
 		const TREE = "tree-e";
 		const HEAD = "head-0";
 		const b1 = await makeBundle({
