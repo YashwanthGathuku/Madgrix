@@ -14,7 +14,22 @@
  *   - `Env` is the Worker's environment: the Artifacts port abstraction
  *     plus the task-authority Durable Object namespace (structural).
  */
+interface ContainerExecOutput {
+	exitCode: number;
+	stdout: ArrayBuffer;
+	stderr: ArrayBuffer;
+}
+interface ContainerExecProcess {
+	output(): Promise<ContainerExecOutput>;
+}
+interface ContainerHandle {
+	running: boolean;
+	start(options?: { env?: Record<string, string>; entrypoint?: string[]; enableInternet?: boolean }): void;
+	exec(cmd: string[], options?: { env?: Record<string, string> }): Promise<ContainerExecProcess>;
+}
+
 interface DurableObjectState {
+	container?: ContainerHandle;
 	storage: {
 		get<T>(k: string): Promise<T | undefined>;
 		put<T>(k: string, v: T): Promise<void>;
@@ -55,6 +70,7 @@ interface Env {
 	TASK_AUTHORITY: DoNamespace;
 	/** Secret used only at the Worker edge to authenticate evaluation-domain submissions. */
 	EVALUATION_SERVICE_TOKEN: string;
+	PROMOTION_CONTAINER: DoNamespace;
 }
 
 /** Queue consumer batch shape (structural; mirrors MessageBatch). */
