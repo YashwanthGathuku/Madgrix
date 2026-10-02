@@ -95,5 +95,6 @@ interface Env {
 
 /** Queue consumer batch shape (structural; mirrors MessageBatch). */
 interface QueueBatchLike {
-	messages: Array<{ body: { task_id: string; event: import("../lib/types.ts").QueuePushEvent } }>;
+	/** Cloudflare Event Subscription messages arrive as product-defined envelopes. */
+	messages: Array<{ body: unknown }>;
 }
