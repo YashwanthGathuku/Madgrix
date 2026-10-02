@@ -53,6 +53,8 @@ interface DoNamespace {
 interface Env {
 	ARTIFACTS: import("../lib/artifacts-port.ts").ArtifactsPort;
 	TASK_AUTHORITY: DoNamespace;
+	/** Secret used only at the Worker edge to authenticate evaluation-domain submissions. */
+	EVALUATION_SERVICE_TOKEN: string;
 }
 
 /** Queue consumer batch shape (structural; mirrors MessageBatch). */
