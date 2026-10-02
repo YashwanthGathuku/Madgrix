@@ -10,7 +10,7 @@ const promotionContainer = defineContainer({
 
 export default defineConfig({
 	worker: {
-		name: "seam",
+		name: "madgrix",
 		compatibilityDate: "2026-10-01",
 		entrypoint,
 		// The task-authority Durable Object class is exported from the
@@ -33,22 +33,22 @@ export default defineConfig({
 			ARTIFACTS: bindings.artifacts({ namespace: "default", dev: { remote: true } }),
 			// Task authority (spec 5 §4): one Durable Object per task id.
 			// Self-binding: the class is defined by this same Worker.
-			TASK_AUTHORITY: bindings.durableObject({ worker: "seam", exportName: "TaskAuthority" }),
+			TASK_AUTHORITY: bindings.durableObject({ worker: "madgrix", exportName: "TaskAuthority" }),
 			// Evaluation evidence is accepted only when this secret is presented
 			// as a Bearer token at the Worker edge. The caller's JSON body can
 			// never self-assert the evaluation-domain trust zone.
 			EVALUATION_SERVICE_TOKEN: bindings.secret(),
 			CONTROL_SERVICE_TOKEN: bindings.secret(),
 			AGENT_SERVICE_TOKEN: bindings.secret(),
-			PROMOTION_CONTAINER: bindings.durableObject({ worker: "seam", exportName: "PromotionContainer" }),
+			PROMOTION_CONTAINER: bindings.durableObject({ worker: "madgrix", exportName: "PromotionContainer" }),
 		},
 		// Queue consumer (spec 5 §2–§3): Artifact lifecycle events arrive via
 		// this queue (at-least-once, unordered) and are ingested by the
 		// Worker's `queue()` export → per-task DO (event_key dedupe) → effects.
-		// DEPLOY NOTE: the `seam-events` queue must exist in the account
+		// DEPLOY NOTE: the `madgrix-events` queue must exist in the account
 		// before deploy (e.g. `cf queues create seam-events`); a dead-letter
 		// queue is recommended for poison messages (see docs/PRODUCTION_DEPLOYMENT.md).
-		triggers: [triggers.queue({ name: "seam-events", maxBatchSize: 10, maxBatchTimeout: 30 })],
+		triggers: [triggers.queue({ name: "madgrix-events", maxBatchSize: 10, maxBatchTimeout: 30 })],
 	},
 	containers: [promotionContainer],
 });
