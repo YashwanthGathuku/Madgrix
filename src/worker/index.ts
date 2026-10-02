@@ -380,7 +380,10 @@ async function constantTimeTokenEqual(a: string, b: string): Promise<boolean> {
 }
 
 async function requireBearer(request: Request, configured: string | undefined): Promise<boolean> {
-	return requireBearer(request, configured);
+	if (typeof configured !== "string" || configured.length < 16) return false;
+	const auth = request.headers.get("authorization") ?? "";
+	if (!auth.startsWith("Bearer ")) return false;
+	return constantTimeTokenEqual(auth.slice(7), configured);
 }
 
 async function requireControlPlane(request: Request, env: Env): Promise<boolean> {
@@ -388,11 +391,7 @@ async function requireControlPlane(request: Request, env: Env): Promise<boolean>
 }
 
 async function requireEvaluationDomain(request: Request, env: Env): Promise<boolean> {
-	const configured = env.EVALUATION_SERVICE_TOKEN;
-	if (typeof configured !== "string" || configured.length < 16) return false;
-	const auth = request.headers.get("authorization") ?? "";
-	if (!auth.startsWith("Bearer ")) return false;
-	return constantTimeTokenEqual(auth.slice(7), configured);
+	return requireBearer(request, env.EVALUATION_SERVICE_TOKEN);
 }
 
 /* ------------------------------------------------------------------ */
