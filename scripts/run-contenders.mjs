@@ -176,6 +176,7 @@ async function runOne(agentId) {
 			agent_id: agentId,
 			contender_id: contenderId,
 			claim_work_id: workId,
+			conflicts: Array.isArray(claimRes.conflicts) ? claimRes.conflicts : [],
 			fork_repo: forkRepo,
 			candidate_sha: candidateSha,
 			baseline_sha: baseline,
@@ -197,9 +198,14 @@ if (failed.length) {
 	process.exit(1);
 }
 const candidates = settled.map((r) => r.value);
-console.log(JSON.stringify({
+const result = {
 	task_id: taskId,
 	concurrent_agents: candidates.length,
 	elapsed_ms: Date.now() - started,
 	candidates,
-}, null, 2));
+};
+if (process.env.MADGRIX_RESULT_PATH) {
+	const { writeFile } = await import("node:fs/promises");
+	await writeFile(process.env.MADGRIX_RESULT_PATH, JSON.stringify(result, null, 2) + "\n", "utf8");
+}
+console.log(JSON.stringify(result, null, 2));
