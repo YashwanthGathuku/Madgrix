@@ -379,6 +379,14 @@ async function constantTimeTokenEqual(a: string, b: string): Promise<boolean> {
 	return diff === 0;
 }
 
+async function requireBearer(request: Request, configured: string | undefined): Promise<boolean> {
+	return requireBearer(request, configured);
+}
+
+async function requireControlPlane(request: Request, env: Env): Promise<boolean> {
+	return requireBearer(request, env.CONTROL_SERVICE_TOKEN);
+}
+
 async function requireEvaluationDomain(request: Request, env: Env): Promise<boolean> {
 	const configured = env.EVALUATION_SERVICE_TOKEN;
 	if (typeof configured !== "string" || configured.length < 16) return false;
