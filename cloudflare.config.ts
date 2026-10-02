@@ -38,6 +38,8 @@ export default defineConfig({
 			// as a Bearer token at the Worker edge. The caller's JSON body can
 			// never self-assert the evaluation-domain trust zone.
 			EVALUATION_SERVICE_TOKEN: bindings.secret(),
+			CONTROL_SERVICE_TOKEN: bindings.secret(),
+			AGENT_SERVICE_TOKEN: bindings.secret(),
 			PROMOTION_CONTAINER: bindings.durableObject({ worker: "seam", exportName: "PromotionContainer" }),
 		},
 		// Queue consumer (spec 5 §2–§3): Artifact lifecycle events arrive via
