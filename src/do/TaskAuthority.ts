@@ -14,11 +14,11 @@
  * - All state transitions go through the pure functions in
  *   `src/lib/task-state.ts` inside a storage transaction: `/event` →
  *   `ingestQueueEvent`; `/claim` → `registerClaim` (validates the claim,
- *   assigns work_id, classifies conflicts against live claims);
+ *   assigns work_id, binds the agent's secret hash, classifies conflicts
+ *   against live claims); `/contender` → `registerContender` (create-only:
+ *   an existing record is returned unchanged, never overwritten);
  *   `/evidence` → `submitEvaluation` (rejects bundles for a different
- *   task). `/contender` remains a provisional record-ingestion endpoint
- *   (the control plane inserts contender records after forking); verdict,
- *   permit, and quarantine logic lives in task-state.ts.
+ *   task). Verdict, permit, and quarantine logic lives in task-state.ts.
  *
  * Structural typing note: this class does NOT extend a real DurableObject
  * (no base class importable here; see workers.d.ts). The runtime only needs
@@ -26,6 +26,7 @@
  */
 
 import {
+	AgentSecretError,
 	assignCandidateLabels,
 	attemptPromotion,
 	commitVerifier,
@@ -33,6 +34,7 @@ import {
 	ingestQueueEvent,
 	issuePermit,
 	registerClaim,
+	registerContender,
 	registerOperatorKeys,
 	registerVerifierKeys,
 	revealVerifier,
@@ -209,22 +211,25 @@ export class TaskAuthority {
 			// work_id/status/version via registerClaim (task-state.ts).
 			// A body that already carries work_id is rejected — the
 			// authority is the sole assigner of claim identity.
-			const input = (parsed.body as { claim?: Record<string, unknown> }).claim;
-			if (!input || typeof input !== "object" || "work_id" in input) {
+			const { claim: input, agent_secret } = parsed.body as { claim?: Record<string, unknown>; agent_secret?: unknown };
+			if (!input || typeof input !== "object" || "work_id" in input || "agent_secret_sha256" in input) {
 				return json(
 					{
 						error: "invalid_claim",
-						detail: "body.claim must be a claim input (no work_id; the authority assigns it)",
+						detail: "body.claim must be a claim input (no work_id or agent_secret_sha256; the authority assigns them)",
 					},
 					400,
 				);
+			}
+			if (agent_secret !== undefined && typeof agent_secret !== "string") {
+				return json({ error: "invalid_agent_secret" }, 400);
 			}
 			const ctx = await productionCtx();
 			return this.doState.storage.transaction(async () => {
 				const state = await this.loadState();
 				if (state === null) return json({ error: "not_initialized" }, 404);
 				try {
-					const r = await registerClaim(state, input as NewClaimInput, ctx);
+					const r = await registerClaim(state, input as NewClaimInput, ctx, agent_secret);
 					await this.doState.storage.put(STATE_KEY, r.state);
 					return json({
 						recorded: true,
@@ -234,14 +239,18 @@ export class TaskAuthority {
 							risk: rep.risk,
 							explanation: rep.explanation,
 						})),
+						// Plaintext leaves the authority once, on the agent's first
+						// claim; only its SHA-256 was stored.
+						...(r.agent_secret === null ? {} : { agent_secret: r.agent_secret }),
 					});
 				} catch (err) {
+					if (err instanceof AgentSecretError) return json({ error: err.code }, 403);
 					return json({ error: "claim_rejected", detail: (err as Error).message }, 422);
 				}
 			});
 		}
 
-		/* -- POST /contender — PROVISIONAL contender record ingestion ----- */
+		/* -- POST /contender — create-only contender record --------------- */
 		if (request.method === "POST" && path === "/contender") {
 			const parsed = await readJsonBody(request);
 			if (!parsed.ok) return parsed.response;
@@ -249,12 +258,15 @@ export class TaskAuthority {
 			if (!contender || typeof contender.contender_id !== "string") {
 				return json({ error: "invalid_contender" }, 400);
 			}
+			const ctx = await productionCtx();
 			return this.doState.storage.transaction(async () => {
 				const state = await this.loadState();
 				if (state === null) return json({ error: "not_initialized" }, 404);
-				state.contenders[contender.contender_id] = contender;
-				await this.doState.storage.put(STATE_KEY, state);
-				return json({ recorded: true, contender_id: contender.contender_id });
+				// An existing record comes back unchanged (recorded: false);
+				// it is never overwritten.
+				const r = await registerContender(state, contender, ctx);
+				if (r.created) await this.doState.storage.put(STATE_KEY, r.state);
+				return json({ recorded: r.created, contender: r.record });
 			});
 		}
 

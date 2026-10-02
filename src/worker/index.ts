@@ -65,7 +65,7 @@ import type {
 } from "../lib/types.ts";
 import { SELECTOR_POLICY_VERSION } from "../lib/types.ts";
 import type { Effect } from "../lib/task-state.ts";
-import { taskHashFor } from "../lib/task-state.ts";
+import { resolveAgentBySecret, taskHashFor } from "../lib/task-state.ts";
 import { computePermitId, TaskAuthority } from "../do/TaskAuthority.ts";
 import { PromotionContainer } from "../do/PromotionContainer.ts";
 
@@ -468,34 +468,58 @@ export async function handleCreateTask(env: Env, request: Request): Promise<Resp
 	return json({ task_id, task_hash, frozen_at }, 201);
 }
 
-/** POST /tasks/:id/claim — forward a WorkClaim to the task authority. */
+/**
+ * Per-agent secret header. Every agent shares AGENT_SERVICE_TOKEN; this
+ * secret, returned once by an agent's first /claim, says WHICH agent is
+ * calling (specs/amendments/contender-agent-binding.md).
+ */
+const AGENT_SECRET_HEADER = "x-madgrix-agent-secret";
+
+/** A claim as exposed outside the authority: without the secret's hash. */
+function publicClaim(claim: WorkClaim): Omit<WorkClaim, "agent_secret_sha256"> {
+	const { agent_secret_sha256: _hash, ...rest } = claim;
+	return rest;
+}
+
+/**
+ * POST /tasks/:id/claim — forward a WorkClaim to the task authority. An
+ * agent's first claim returns its secret once (`agent_secret`); a later
+ * claim for the same agent must send it in X-Madgrix-Agent-Secret.
+ */
 export async function handleClaim(env: Env, taskId: string, request: Request): Promise<Response> {
 	if (!(await requireAgentOrControl(request, env))) return json({ error: "agent_auth_required" }, 401);
 	const parsed = await readJsonBody(request);
 	if (!parsed.ok) return parsed.response;
-	// The contender supplies the claim INPUT (no work_id/status/version —
-	// the authority assigns those; see TaskAuthority POST /claim and
-	// ClaimInput = Omit<WorkClaim, "work_id"|"status"|"version">). The
-	// authority is the sole validator of the full shape; the edge only
-	// does a light structural check so malformed bodies fail fast.
+	// The contender supplies the claim INPUT (no work_id/status/version/
+	// agent_secret_sha256 — the authority assigns those; see TaskAuthority
+	// POST /claim and ClaimInput in claims.ts). The authority is the sole
+	// validator of the full shape; the edge only does a light structural
+	// check so malformed bodies fail fast.
 	const claim = parsed.body["claim"] as Record<string, unknown> | undefined;
 	if (
 		!claim ||
 		typeof claim !== "object" ||
 		"work_id" in claim ||
+		"agent_secret_sha256" in claim ||
 		typeof claim["agent"] !== "string" ||
 		claim["agent"] === ""
 	) {
 		return json(
 			{
 				error: "invalid_claim",
-				detail: "body.claim must be a claim input (no work_id; the authority assigns it)",
+				detail: "body.claim must be a claim input (no work_id or agent_secret_sha256; the authority assigns them)",
 			},
 			400,
 		);
 	}
-	const res = await doRpc(taskStub(env, taskId), "/claim", { body: { claim } });
+	const agent_secret = request.headers.get(AGENT_SECRET_HEADER) ?? undefined;
+	const res = await doRpc(taskStub(env, taskId), "/claim", { body: { claim, agent_secret } });
 	return json(res.body, res.status);
+}
+
+/** 200 for a contender that already exists: its record stands, no token. */
+function existingContender(record: ContenderRecord): Response {
+	return json({ contender_id: record.contender_id, fork_repo: record.fork_repo, created: false, token_issued: false });
 }
 
 /**
@@ -505,6 +529,11 @@ export async function handleClaim(env: Env, taskId: string, request: Request): P
  * contender gets a ≤1h WRITE token on the fork ONLY; the fork-creation
  * token (default long TTL) is revoked immediately.
  * The plaintext token is returned ONCE in the response body and never logged.
+ *
+ * The agent is the one whose claim matches X-Madgrix-Agent-Secret, never the
+ * request body: a body agent_id or claim_work_id that disagrees is 403. A
+ * contender that already exists is returned with 200 and no token; the
+ * write token is minted once per contender.
  */
 export async function handleCreateContender(
 	env: Env,
@@ -512,12 +541,14 @@ export async function handleCreateContender(
 	request: Request,
 ): Promise<Response> {
 	if (!(await requireAgentOrControl(request, env))) return json({ error: "agent_auth_required" }, 401);
+	const agentSecret = request.headers.get(AGENT_SECRET_HEADER);
+	if (!agentSecret) return json({ error: "agent_secret_required" }, 401);
 	const parsed = await readJsonBody(request);
 	if (!parsed.ok) return parsed.response;
-	const agent_id = parsed.body["agent_id"];
+	const body_agent_id = parsed.body["agent_id"];
 	const claim_work_id = parsed.body["claim_work_id"];
-	if (typeof agent_id !== "string" || agent_id === "") {
-		return json({ error: "agent_id_required" }, 400);
+	if (body_agent_id !== undefined && (typeof body_agent_id !== "string" || body_agent_id === "")) {
+		return json({ error: "invalid_agent_id" }, 400);
 	}
 	if (claim_work_id !== undefined && (typeof claim_work_id !== "string" || claim_work_id === "")) {
 		return json({ error: "invalid_claim_work_id" }, 400);
@@ -526,17 +557,25 @@ export async function handleCreateContender(
 	const stateRes = await doRpc(taskStub(env, taskId), "/state", { method: "GET" });
 	if (!stateRes.ok) return json({ error: "task_not_found", task_id: taskId }, 404);
 	const state = stateRes.body as AuthorityState;
+	const identity = await resolveAgentBySecret(state, agentSecret, { sha256Hex });
+	if (identity === null) return json({ error: "agent_secret_invalid" }, 403);
+	const agent_id = identity.agent;
+	if (body_agent_id !== undefined && body_agent_id !== agent_id) {
+		return json({ error: "agent_id_mismatch" }, 403);
+	}
 	let boundClaimWorkId: string | null = null;
 	if (typeof claim_work_id === "string") {
 		const claim = state.claims.find((x) => x.work_id === claim_work_id);
 		if (!claim) return json({ error: "claim_not_found", claim_work_id }, 404);
-		if (claim.agent !== agent_id) {
-			return json({ error: "claim_agent_mismatch", claim_work_id, claim_agent: claim.agent, agent_id }, 409);
+		if (!identity.work_ids.includes(claim.work_id)) {
+			return json({ error: "claim_agent_mismatch", claim_work_id }, 403);
 		}
 		boundClaimWorkId = claim.work_id;
 	}
 
 	const contender_id = (await sha256Hex(joinHashParts("contender", taskId, agent_id))).slice(0, 32);
+	const existing = state.contenders[contender_id];
+	if (existing) return existingContender(existing);
 	const forkOpId = await sha256Hex(joinHashParts("fork", taskId, contender_id));
 	const forkName = contenderRepoName(taskId, forkOpId);
 
@@ -610,12 +649,24 @@ export async function handleCreateContender(
 		fork_repo: forkName,
 		fork_lineage: { parent_repo: state.task.baseline_repo, parent_commit: state.task.baseline_commit },
 		token_id: credentials.id,
+		token_ids: [credentials.id],
 		status: "forked",
 		claim_work_id: boundClaimWorkId,
 		latest_commit,
 	};
 	const reg = await doRpc(taskStub(env, taskId), "/contender", { body: { contender } });
-	if (!reg.ok) return json({ error: "contender_register_failed", detail: reg.body }, 502);
+	// A token whose id did not make it onto a record could never be revoked
+	// by quarantine: revoke it now.
+	if (!reg.ok) {
+		await repo.revokeToken(credentials.id);
+		return json({ error: "contender_register_failed", detail: reg.body }, 502);
+	}
+	const registered = reg.body as { recorded: boolean; contender: ContenderRecord };
+	if (!registered.recorded) {
+		// A concurrent request registered this contender first; its record stands.
+		await repo.revokeToken(credentials.id);
+		return existingContender(registered.contender);
+	}
 
 	// NOTE: `credentials.plaintext` appears here exactly once — in the
 	// response body. It is never logged, never persisted.
@@ -641,7 +692,7 @@ export async function handleTaskContext(env: Env, taskId: string, request: Reque
 	return json({
 		task: state.task,
 		task_status: state.task_status,
-		claims: state.claims,
+		claims: state.claims.map(publicClaim),
 		contenders: Object.values(state.contenders).map((x) => ({
 			contender_id: x.contender_id,
 			agent_id: x.agent_id,
@@ -679,6 +730,9 @@ export async function handleEvaluatorCredentials(env: Env, taskId: string, reque
 	const port = productionPort(env);
 	const repo = await port.get(contender.fork_repo);
 	const credentials = await issueEvaluatorCredentials(port, contender.fork_repo, 300);
+	const claim = contender.claim_work_id
+		? state.claims.find((x) => x.work_id === contender.claim_work_id)
+		: undefined;
 	return json({
 		contender_id,
 		fork_repo: contender.fork_repo,
@@ -687,9 +741,7 @@ export async function handleEvaluatorCredentials(env: Env, taskId: string, reque
 		expires_at: credentials.expiresAt,
 		task_hash: state.task.task_hash,
 		baseline_commit: state.task.baseline_commit,
-		claim: contender.claim_work_id
-			? state.claims.find((x) => x.work_id === contender.claim_work_id) ?? null
-			: null,
+		claim: claim ? publicClaim(claim) : null,
 		latest_commit: contender.latest_commit,
 	});
 }

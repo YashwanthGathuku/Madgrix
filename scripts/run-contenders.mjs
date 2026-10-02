@@ -101,12 +101,13 @@ async function getJson(url) {
 	return data;
 }
 
-async function postJson(url, body) {
+async function postJson(url, body, extraHeaders = {}) {
 	const res = await fetch(url, {
 		method: "POST",
 		headers: {
 			"content-type": "application/json",
 			authorization: `Bearer ${agentServiceToken}`,
+			...extraHeaders,
 		},
 		body: JSON.stringify(body),
 	});
@@ -153,11 +154,19 @@ async function runOne(agentId) {
 	const claimRes = await postJson(`${baseUrl}/tasks/${encodeURIComponent(taskId)}/claim`, { claim: claimInput });
 	const workId = claimRes.work_id;
 	if (typeof workId !== "string") throw new Error(`claim registration returned no work_id for ${agentId}`);
+	// Proves to /contenders that this runner registered agentId's claim. Held
+	// only in this variable: never logged, written to disk or put in the
+	// agent command's environment.
+	const agentSecret = claimRes.agent_secret;
+	if (typeof agentSecret !== "string" || !/^[0-9a-f]{64}$/.test(agentSecret)) {
+		throw new Error(`claim registration returned no agent secret for ${agentId}`);
+	}
 
-	const contender = await postJson(`${baseUrl}/tasks/${encodeURIComponent(taskId)}/contenders`, {
-		agent_id: agentId,
-		claim_work_id: workId,
-	});
+	const contender = await postJson(
+		`${baseUrl}/tasks/${encodeURIComponent(taskId)}/contenders`,
+		{ agent_id: agentId, claim_work_id: workId },
+		{ "x-madgrix-agent-secret": agentSecret },
+	);
 	const { contender_id: contenderId, remote, token, fork_repo: forkRepo } = contender;
 	if (![contenderId, remote, token, forkRepo].every((x) => typeof x === "string" && x.length > 0)) {
 		throw new Error(`invalid contender response for ${agentId}`);

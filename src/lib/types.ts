@@ -97,6 +97,13 @@ export interface WorkClaim {
 	lease: { claimed_at: string; expires_at: string };
 	status: ClaimStatus;
 	version: number;
+	/**
+	 * SHA-256 (hex) of the per-agent secret that /claim returns once.
+	 * Assigned by the authority, never accepted from the caller, never
+	 * returned by the Worker's public routes. Absent on claims registered
+	 * before agent binding (specs/amendments/contender-agent-binding.md).
+	 */
+	agent_secret_sha256?: string;
 }
 
 export type ConflictRisk = "GREEN" | "AMBER" | "RED" | "BLOCKED";
@@ -131,6 +138,12 @@ export interface ContenderRecord {
 	fork_lineage: { parent_repo: string; parent_commit: string };
 	/** Token id (NOT the plaintext) for auditability. */
 	token_id: string;
+	/**
+	 * Every token id minted for this contender; quarantine revokes all of
+	 * them. Absent on records written before this field existed, which
+	 * carry only `token_id`.
+	 */
+	token_ids?: string[];
 	status: ContenderStatus;
 	claim_work_id: string | null;
 	/** Last observed commit SHA on the contender's branch. */

@@ -14,7 +14,9 @@
  * The operator HOME used here has a login profile that exports a secret, so
  * a login shell (`bash -l`) re-importing the profile also counts as a leak.
  * The mock admits each route only with its own zone's service token, so a
- * script calling the Worker with another zone's token fails the run.
+ * script calling the Worker with another zone's token fails the run, and
+ * admits /contenders only with the agent secret its /claim returned, as the
+ * Worker does (specs/amendments/contender-agent-binding.md).
  *
  * node --test test/env-isolation.test.ts
  */
@@ -172,7 +174,7 @@ function assertCredentials(label: string, dump: Dump, ownZone?: Zone, extraSecre
 	const foreign: Array<[string, string]> = [
 		...Object.entries(OPERATOR_SECRETS).filter(([name]) => !own.includes(name)),
 		[PROFILE_SECRET.name, PROFILE_SECRET.value],
-		...extraSecrets.map((value): [string, string] => ["issued Artifacts token", value]),
+		...extraSecrets.map((value): [string, string] => ["issued Artifacts token or agent secret", value]),
 	];
 	assert.deepEqual(
 		foreign.filter(([, value]) => dump.text.includes(value)).map(([name]) => name),
@@ -223,7 +225,7 @@ interface Contender {
 interface Mock {
 	url: string;
 	requests: Array<{ route: string; zone: Zone | null }>;
-	issuedTokens: string[];
+	issuedCredentials: string[];
 	createContender(taskId: string, agentId: string): Contender;
 	close(): Promise<void>;
 }
@@ -252,7 +254,9 @@ async function startMock(): Promise<Mock> {
 	const contenders = new Map<string, Contender>();
 	const taskHashes = new Map<string, string>();
 	const requests: Mock["requests"] = [];
-	const issuedTokens: string[] = [];
+	const issuedCredentials: string[] = [];
+	/** SHA-256(agent secret) -> agent, as the authority binds it at /claim. */
+	const agentSecrets = new Map<string, string>();
 	let seq = 0;
 	let winner = "";
 
@@ -308,19 +312,30 @@ async function startMock(): Promise<Mock> {
 							.map((c) => ({ contender_id: c.id, agent_id: c.agentId, latest_commit: head(c) })),
 						claims: [],
 					});
-				case "POST claim":
-					return send(200, { work_id: `work-${++seq}`, conflicts: [] });
+				case "POST claim": {
+					const secret = randomBytes(32).toString("hex");
+					agentSecrets.set(createHash("sha256").update(secret).digest("hex"), body.claim?.agent);
+					issuedCredentials.push(secret);
+					return send(200, { work_id: `work-${++seq}`, conflicts: [], agent_secret: secret });
+				}
 				case "POST contenders": {
-					const c = createContender(taskId, body.agent_id);
+					const presented = req.headers["x-madgrix-agent-secret"];
+					const agent =
+						typeof presented === "string"
+							? agentSecrets.get(createHash("sha256").update(presented).digest("hex"))
+							: undefined;
+					if (agent === undefined) return send(401, { error: "agent_secret_required" });
+					if (body.agent_id !== undefined && body.agent_id !== agent) return send(403, { error: "agent_id_mismatch" });
+					const c = createContender(taskId, agent);
 					const token = `fake-fork-write-token-${c.id}`;
-					issuedTokens.push(token);
+					issuedCredentials.push(token);
 					return send(200, { contender_id: c.id, remote: c.bare, token, fork_repo: `fork-${c.id}` });
 				}
 				case "POST evaluator-credentials": {
 					const c = contenders.get(body.contender_id);
 					if (!c) return send(404, { error: "unknown contender" });
 					const token = `fake-fork-read-token-${c.id}-${++seq}`;
-					issuedTokens.push(token);
+					issuedCredentials.push(token);
 					return send(200, {
 						token,
 						remote: c.bare,
@@ -356,7 +371,7 @@ async function startMock(): Promise<Mock> {
 	return {
 		url: `http://127.0.0.1:${port}`,
 		requests,
-		issuedTokens,
+		issuedCredentials,
 		createContender,
 		close: () =>
 			new Promise<void>((resolve) => {
@@ -417,7 +432,7 @@ describe("process environment boundaries of the live-run scripts", () => {
 			);
 			const label = `agent command (${candidate.agent_id})`;
 			const dump = await readDump(path.join(dumpDir, `agent-${candidate.agent_id}.env`));
-			assertCredentials(label, dump, undefined, fx.mock.issuedTokens);
+			assertCredentials(label, dump, undefined, fx.mock.issuedCredentials);
 			assertOnly(label, dump, AGENT_VARS);
 			assert.equal(dump.vars.get("MADGRIX_AGENT_ID"), candidate.agent_id);
 			assert.equal(dump.vars.get("MADGRIX_CONTENDER_ID"), candidate.contender_id);
@@ -443,7 +458,7 @@ describe("process environment boundaries of the live-run scripts", () => {
 		for (const agentId of ["agent-a", "agent-b"]) {
 			const label = `agent command (${agentId})`;
 			const dump = await readDump(path.join(dumpDir, `agent-${agentId}.env`));
-			assertCredentials(label, dump, undefined, fx.mock.issuedTokens);
+			assertCredentials(label, dump, undefined, fx.mock.issuedCredentials);
 			assertOnly(label, dump, [...AGENT_VARS, MODEL_KEY.name]);
 			assert.equal(dump.vars.get(MODEL_KEY.name), MODEL_KEY.value);
 		}
@@ -541,7 +556,7 @@ describe("process environment boundaries of the live-run scripts", () => {
 			"each of the five evaluation commands ran once",
 		);
 		for (const { file, dump } of dumps) {
-			assertCredentials(file, dump, undefined, fx.mock.issuedTokens);
+			assertCredentials(file, dump, undefined, fx.mock.issuedCredentials);
 			assertOnly(file, dump, []);
 		}
 	});
@@ -626,7 +641,7 @@ describe("process environment boundaries of the live-run scripts", () => {
 		const agents = await readDumps(dumpDir, /^agent-.+\.env$/);
 		assert.equal(agents.length, 2, "one agent command per contender");
 		for (const { file, dump } of agents) {
-			assertCredentials(file, dump, undefined, fx.mock.issuedTokens);
+			assertCredentials(file, dump, undefined, fx.mock.issuedCredentials);
 			assertOnly(file, dump, [...AGENT_VARS, MODEL_KEY.name]);
 			for (const command of Object.values(hidden)) {
 				assert.ok(!dump.text.includes(command), `${file}: an evaluation command reached the agent`);
@@ -636,7 +651,7 @@ describe("process environment boundaries of the live-run scripts", () => {
 		const evaluations = await readDumps(dumpDir, /^eval-\w+\.\d+\.env$/);
 		assert.equal(evaluations.length, 10, "five evaluation commands per candidate");
 		for (const { file, dump } of evaluations) {
-			assertCredentials(file, dump, undefined, fx.mock.issuedTokens);
+			assertCredentials(file, dump, undefined, fx.mock.issuedCredentials);
 			assertOnly(file, dump, []);
 		}
 	});

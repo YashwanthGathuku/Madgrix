@@ -20,7 +20,7 @@ import type {
 
 /** Claim fields the contender supplies; work_id/status/version are
  *  assigned by the task authority (see task-state.ts registerClaim). */
-export type ClaimInput = Omit<WorkClaim, "work_id" | "status" | "version">;
+export type ClaimInput = Omit<WorkClaim, "work_id" | "status" | "version" | "agent_secret_sha256">;
 
 export type ClaimValidation =
 	| { ok: true }

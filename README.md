@@ -43,6 +43,7 @@ Control plane
 Runtime identities are also separated:
 
 - `AGENT_SERVICE_TOKEN` — WorkClaim/context/contender operations.
+- Per-agent secret — returned once by an agent's first `/claim`; `/contenders` requires it in `X-Madgrix-Agent-Secret` and derives the agent from it, so a contender's write token is minted once, to the agent whose claim holds the secret.
 - `EVALUATION_SERVICE_TOKEN` — read-only evaluator credentials and evidence submission.
 - `CONTROL_SERVICE_TOKEN` — task freeze, verifier protocol, verdict, and promotion.
 - Artifacts repo tokens are short-lived and scoped to one repository and one access level.
@@ -165,8 +166,8 @@ Provider-specific coding agents are deliberately not hardcoded. `MADGRIX_AGENT_C
 |---|---|---|---|
 | POST | `/tasks` | CONTROL | Freeze task + verifier/operator keys |
 | GET | `/tasks/:id/context` | AGENT/CONTROL | Frozen task, claims, contender summaries |
-| POST | `/tasks/:id/claim` | AGENT/CONTROL | Register WorkClaim + conflict findings |
-| POST | `/tasks/:id/contenders` | AGENT/CONTROL | Create isolated contender repo + scoped write token |
+| POST | `/tasks/:id/claim` | AGENT/CONTROL (+ agent secret after the agent's first claim) | Register WorkClaim + conflict findings; the first claim returns the agent secret once |
+| POST | `/tasks/:id/contenders` | AGENT/CONTROL + `X-Madgrix-Agent-Secret` | Create the calling agent's contender repo + scoped write token (once per contender) |
 | POST | `/tasks/:id/evaluator-credentials` | EVALUATION | Mint short-lived read-only candidate credential |
 | POST | `/tasks/:id/evidence` | EVALUATION | Submit content-addressed evaluation bundle |
 | POST | `/tasks/:id/verifiers/commit` | CONTROL | Record blind-verifier commitment |

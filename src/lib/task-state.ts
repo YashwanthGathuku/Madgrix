@@ -38,6 +38,7 @@ import type {
 	AuthorityState,
 	CallerIdentity,
 	ConflictReport,
+	ContenderRecord,
 	EvaluationBundle,
 	LedgerEntry,
 	PermitRecord,
@@ -306,19 +307,53 @@ export async function ingestQueueEvent(
 /* ------------------------------------------------------------------ */
 
 /**
+ * A claim named an agent whose identity is already bound to a secret, and
+ * the caller did not present that secret. The edge maps this to 403.
+ */
+export class AgentSecretError extends Error {
+	readonly code: "agent_secret_required" | "agent_secret_invalid";
+	constructor(code: "agent_secret_required" | "agent_secret_invalid", message: string) {
+		super(message);
+		this.name = "AgentSecretError";
+		this.code = code;
+	}
+}
+
+/** String equality without an early exit (for secret hashes). */
+function constantTimeEqual(a: string, b: string): boolean {
+	let diff = a.length ^ b.length;
+	for (let i = 0; i < Math.min(a.length, b.length); i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+	return diff === 0;
+}
+
+/**
  * Register a contender's WorkClaim BEFORE forking or writing code
  * (spec 2 §2). Validates via claims.ts (task/baseline must match the
  * frozen task; empty scope.paths rejected), assigns work_id, version 1,
  * status "claimed", and classifies against all live claims.
+ *
+ * Agent binding (specs/amendments/contender-agent-binding.md): an agent's
+ * first claim mints its secret (32 random bytes, hex), stores only
+ * SHA-256(secret) on the claim and returns the plaintext once as
+ * `agent_secret`. A later claim naming the same agent must present that
+ * secret (AgentSecretError otherwise); it gets the same hash and no secret.
+ *
  * Throws on validation failure — registration rejection is not a state.
  */
 export async function registerClaim(
 	state: AuthorityState,
 	input: NewClaimInput,
 	ctx: Ctx,
-): Promise<{ state: AuthorityState; claim: WorkClaim; reports: ConflictReport[] }> {
+	presentedAgentSecret?: string,
+): Promise<{ state: AuthorityState; claim: WorkClaim; reports: ConflictReport[]; agent_secret: string | null }> {
 	const v = validateClaim(input);
 	if (!v.ok) throw new Error(`claim rejected: ${v.error}`);
+	if (typeof input.agent !== "string" || input.agent === "") {
+		throw new Error("claim rejected: claim.agent (agent identity) is required");
+	}
+	if ("agent_secret_sha256" in input) {
+		throw new Error("claim rejected: agent_secret_sha256 is assigned by the authority");
+	}
 	if (input.task !== state.task.task_hash)
 		throw new Error(
 			`claim rejected: task mismatch (claim references ${input.task}, task is ${state.task.task_hash}) — stale work (spec 1 §5)`,
@@ -327,11 +362,29 @@ export async function registerClaim(
 		throw new Error(
 			`claim rejected: baseline mismatch (claim ${input.baseline} != frozen ${state.task.baseline_commit})`,
 		);
+	const boundHash = state.claims.find(
+		(c) => c.agent === input.agent && typeof c.agent_secret_sha256 === "string",
+	)?.agent_secret_sha256;
+	let agent_secret: string | null = null;
+	let agent_secret_sha256: string;
+	if (boundHash !== undefined) {
+		if (presentedAgentSecret === undefined) {
+			throw new AgentSecretError("agent_secret_required", `claim rejected: agent ${input.agent} requires its secret`);
+		}
+		if (!constantTimeEqual(await ctx.sha256Hex(presentedAgentSecret), boundHash)) {
+			throw new AgentSecretError("agent_secret_invalid", `claim rejected: secret does not match agent ${input.agent}`);
+		}
+		agent_secret_sha256 = boundHash;
+	} else {
+		agent_secret = ctx.randomHex(32);
+		agent_secret_sha256 = await ctx.sha256Hex(agent_secret);
+	}
 	const claim: WorkClaim = {
 		...input,
 		work_id: "W-" + ctx.randomHex(4),
 		status: "claimed",
 		version: 1,
+		agent_secret_sha256,
 	};
 	const live = state.claims.filter((c) => c.status === "claimed" || c.status === "active");
 	const reports = live.map((c) => classifyPair(claim, c));
@@ -341,7 +394,64 @@ export async function registerClaim(
 		{ work_id: claim.work_id, agent: claim.agent, risk: reports.map((r) => r.risk) },
 		ctx,
 	);
-	return { state: s2, claim, reports };
+	return { state: s2, claim, reports, agent_secret };
+}
+
+/**
+ * The agent whose claims carry SHA-256(`secret`), with those claims'
+ * work_ids, or null when the secret matches no claim. Also null (fail
+ * closed) if the hash were ever bound to more than one agent.
+ */
+export async function resolveAgentBySecret(
+	state: AuthorityState,
+	secret: string,
+	ctx: Pick<Ctx, "sha256Hex">,
+): Promise<{ agent: string; work_ids: string[] } | null> {
+	const hash = await ctx.sha256Hex(secret);
+	const matching = state.claims.filter(
+		(c) => typeof c.agent_secret_sha256 === "string" && constantTimeEqual(c.agent_secret_sha256, hash),
+	);
+	if (new Set(matching.map((c) => c.agent)).size !== 1) return null;
+	return { agent: matching[0].agent, work_ids: matching.map((c) => c.work_id) };
+}
+
+/* ------------------------------------------------------------------ */
+/* Contenders                                                          */
+/* ------------------------------------------------------------------ */
+
+/** Every token id minted for a contender (records that predate
+ *  `token_ids` carry only `token_id`). */
+export function contenderTokenIds(contender: ContenderRecord): string[] {
+	return [...new Set([...(contender.token_ids ?? []), contender.token_id])];
+}
+
+/**
+ * Record a contender the edge has forked and credentialed. Create-only: an
+ * existing record for the same contender_id is returned unchanged
+ * (`created: false`) and the state is untouched, so a retry, a race or
+ * another agent's request can never replace the bound agent, fork or token
+ * ids. The caller must revoke any token it minted for a registration that
+ * was not recorded.
+ */
+export async function registerContender(
+	state: AuthorityState,
+	contender: ContenderRecord,
+	ctx: Ctx,
+): Promise<{ state: AuthorityState; record: ContenderRecord; created: boolean }> {
+	const existing = state.contenders[contender.contender_id];
+	if (existing) return { state, record: existing, created: false };
+	const s2 = await appendLedger(
+		{ ...state, contenders: { ...state.contenders, [contender.contender_id]: contender } },
+		"contender_registered",
+		{
+			contender_id: contender.contender_id,
+			agent_id: contender.agent_id,
+			fork_repo: contender.fork_repo,
+			token_ids: contenderTokenIds(contender),
+		},
+		ctx,
+	);
+	return { state: s2, record: contender, created: true };
 }
 
 /* ------------------------------------------------------------------ */
@@ -927,7 +1037,10 @@ export async function quarantineContender(
 		evaluations,
 	};
 	const effects: Effect[] = [
-		{ kind: "revoke_token", repo: contender.fork_repo, token_id: contender.token_id },
+		// Every token ever minted for this contender, not only the latest.
+		...contenderTokenIds(contender).map(
+			(token_id): Effect => ({ kind: "revoke_token", repo: contender.fork_repo, token_id }),
+		),
 		{ kind: "cancel_workflow", contender_id },
 		{
 			kind: "notify",
