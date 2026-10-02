@@ -75,6 +75,13 @@ function capture(cmd, args, opts = {}) {
 	});
 }
 
+async function getJson(url) {
+	const res = await fetch(url);
+	const data = await res.json().catch(() => ({}));
+	if (!res.ok) throw new Error(`GET ${url} -> ${res.status}: ${JSON.stringify(data)}`);
+	return data;
+}
+
 async function postJson(url, body) {
 	const res = await fetch(url, {
 		method: "POST",
@@ -86,9 +93,48 @@ async function postJson(url, body) {
 	return data;
 }
 
+const context = await getJson(`${baseUrl}/tasks/${encodeURIComponent(taskId)}/context`);
+const task = context.task;
+if (!task || typeof task.task_hash !== "string" || typeof task.baseline_commit !== "string") {
+	throw new Error("MADGRIX task context is incomplete");
+}
+
+let claimTemplate = null;
+if (process.env.MADGRIX_CLAIM_TEMPLATE) {
+	try {
+		claimTemplate = JSON.parse(process.env.MADGRIX_CLAIM_TEMPLATE);
+	} catch {
+		throw new Error("MADGRIX_CLAIM_TEMPLATE must be valid JSON");
+	}
+}
+const defaultClaim = {
+	intent: { behavior: [task.intent] },
+	scope: { paths: ["**"], symbols: [] },
+	contracts: { reads: [], modifies: [] },
+	interfaces: [],
+	schema_changes: [],
+	expected_tests: [],
+};
+
 async function runOne(agentId) {
+	const now = new Date();
+	const claimInput = {
+		...(claimTemplate ?? defaultClaim),
+		agent: agentId,
+		task: task.task_hash,
+		baseline: task.baseline_commit,
+		lease: {
+			claimed_at: now.toISOString(),
+			expires_at: new Date(now.getTime() + 60 * 60 * 1000).toISOString(),
+		},
+	};
+	const claimRes = await postJson(`${baseUrl}/tasks/${encodeURIComponent(taskId)}/claim`, { claim: claimInput });
+	const workId = claimRes.work_id;
+	if (typeof workId !== "string") throw new Error(`claim registration returned no work_id for ${agentId}`);
+
 	const contender = await postJson(`${baseUrl}/tasks/${encodeURIComponent(taskId)}/contenders`, {
 		agent_id: agentId,
+		claim_work_id: workId,
 	});
 	const { contender_id: contenderId, remote, token, fork_repo: forkRepo } = contender;
 	if (![contenderId, remote, token, forkRepo].every((x) => typeof x === "string" && x.length > 0)) {
@@ -129,6 +175,7 @@ async function runOne(agentId) {
 		return {
 			agent_id: agentId,
 			contender_id: contenderId,
+			claim_work_id: workId,
 			fork_repo: forkRepo,
 			candidate_sha: candidateSha,
 			baseline_sha: baseline,
