@@ -25,6 +25,7 @@ import { spawn } from "node:child_process";
 const baseUrl = process.env.MADGRIX_BASE_URL?.replace(/\/$/, "");
 const taskId = process.env.MADGRIX_TASK_ID;
 const agentCommand = process.env.MADGRIX_AGENT_COMMAND;
+const agentServiceToken = process.env.MADGRIX_AGENT_SERVICE_TOKEN;
 const agentIds = (process.env.MADGRIX_AGENT_IDS ?? "agent-a,agent-b,agent-c")
 	.split(",")
 	.map((s) => s.trim())
@@ -32,8 +33,8 @@ const agentIds = (process.env.MADGRIX_AGENT_IDS ?? "agent-a,agent-b,agent-c")
 const keep = process.env.MADGRIX_KEEP_WORKSPACES === "1";
 const workRoot = process.env.MADGRIX_WORK_ROOT ?? os.tmpdir();
 
-if (!baseUrl || !taskId || !agentCommand) {
-	console.error("Missing MADGRIX_BASE_URL, MADGRIX_TASK_ID, or MADGRIX_AGENT_COMMAND");
+if (!baseUrl || !taskId || !agentCommand || !agentServiceToken) {
+	console.error("Missing MADGRIX_BASE_URL, MADGRIX_TASK_ID, MADGRIX_AGENT_COMMAND, or MADGRIX_AGENT_SERVICE_TOKEN");
 	process.exit(2);
 }
 if (agentIds.length < 2) {
@@ -76,7 +77,7 @@ function capture(cmd, args, opts = {}) {
 }
 
 async function getJson(url) {
-	const res = await fetch(url);
+	const res = await fetch(url, { headers: { authorization: `Bearer ${agentServiceToken}` } });
 	const data = await res.json().catch(() => ({}));
 	if (!res.ok) throw new Error(`GET ${url} -> ${res.status}: ${JSON.stringify(data)}`);
 	return data;
@@ -85,7 +86,10 @@ async function getJson(url) {
 async function postJson(url, body) {
 	const res = await fetch(url, {
 		method: "POST",
-		headers: { "content-type": "application/json" },
+		headers: {
+			"content-type": "application/json",
+			authorization: `Bearer ${agentServiceToken}`,
+		},
 		body: JSON.stringify(body),
 	});
 	const data = await res.json().catch(() => ({}));
