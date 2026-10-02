@@ -1,3 +1,23 @@
+declare module "cloudflare:workers" {
+	export interface WorkflowEvent<T = unknown> {
+		payload: T;
+		instanceId?: string;
+	}
+	export interface WorkflowStep {
+		do<T>(name: string, fn: () => Promise<T>): Promise<T>;
+		do<T>(
+			name: string,
+			options: Record<string, unknown>,
+			fn: () => Promise<T>,
+		): Promise<T>;
+	}
+	export abstract class WorkflowEntrypoint<E = unknown, P = unknown> {
+		protected env: E;
+		constructor(ctx: unknown, env: E);
+		abstract run(event: WorkflowEvent<P>, step: WorkflowStep): Promise<unknown>;
+	}
+}
+
 /**
  * Minimal ambient declarations for the Durable Object / Worker edge.
  *
