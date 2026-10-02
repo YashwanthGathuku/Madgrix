@@ -26,6 +26,13 @@ jobs:
         run: npm run typecheck
       - name: Cloudflare build
         run: npm run build
+      - name: Validate live-run scripts
+        run: |
+          node --check scripts/run-contenders.mjs
+          node --check scripts/evaluate-candidate.ts
+          node --check scripts/live-e2e.ts
+          bash -n container/promote.sh
+          bash -n container/copy-baseline.sh
       - name: Unit and integration tests
         run: npm test
       - name: Vertical slice
