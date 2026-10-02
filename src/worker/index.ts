@@ -496,13 +496,26 @@ export async function handleCreateContender(
 	const parsed = await readJsonBody(request);
 	if (!parsed.ok) return parsed.response;
 	const agent_id = parsed.body["agent_id"];
+	const claim_work_id = parsed.body["claim_work_id"];
 	if (typeof agent_id !== "string" || agent_id === "") {
 		return json({ error: "agent_id_required" }, 400);
+	}
+	if (claim_work_id !== undefined && (typeof claim_work_id !== "string" || claim_work_id === "")) {
+		return json({ error: "invalid_claim_work_id" }, 400);
 	}
 
 	const stateRes = await doRpc(taskStub(env, taskId), "/state", { method: "GET" });
 	if (!stateRes.ok) return json({ error: "task_not_found", task_id: taskId }, 404);
 	const state = stateRes.body as AuthorityState;
+	let boundClaimWorkId: string | null = null;
+	if (typeof claim_work_id === "string") {
+		const claim = state.claims.find((x) => x.work_id === claim_work_id);
+		if (!claim) return json({ error: "claim_not_found", claim_work_id }, 404);
+		if (claim.agent !== agent_id) {
+			return json({ error: "claim_agent_mismatch", claim_work_id, claim_agent: claim.agent, agent_id }, 409);
+		}
+		boundClaimWorkId = claim.work_id;
+	}
 
 	const contender_id = (await sha256Hex(joinHashParts("contender", taskId, agent_id))).slice(0, 32);
 	const forkOpId = await sha256Hex(joinHashParts("fork", taskId, contender_id));
@@ -579,7 +592,7 @@ export async function handleCreateContender(
 		fork_lineage: { parent_repo: state.task.baseline_repo, parent_commit: state.task.baseline_commit },
 		token_id: credentials.id,
 		status: "forked",
-		claim_work_id: null,
+		claim_work_id: boundClaimWorkId,
 		latest_commit,
 	};
 	const reg = await doRpc(taskStub(env, taskId), "/contender", { body: { contender } });
@@ -598,6 +611,67 @@ export async function handleCreateContender(
 		},
 		created ? 201 : 200,
 	);
+}
+
+/** GET /tasks/:id/context — non-secret frozen task + work graph context. */
+export async function handleTaskContext(env: Env, taskId: string): Promise<Response> {
+	const stateRes = await doRpc(taskStub(env, taskId), "/state", { method: "GET" });
+	if (!stateRes.ok) return json({ error: "task_not_found", task_id: taskId }, 404);
+	const state = stateRes.body as AuthorityState;
+	return json({
+		task: state.task,
+		task_status: state.task_status,
+		claims: state.claims,
+		contenders: Object.values(state.contenders).map((x) => ({
+			contender_id: x.contender_id,
+			agent_id: x.agent_id,
+			fork_repo: x.fork_repo,
+			claim_work_id: x.claim_work_id,
+			latest_commit: x.latest_commit,
+			status: x.status,
+		})),
+	});
+}
+
+/**
+ * POST /tasks/:id/evaluator-credentials — short-lived READ access to one
+ * contender fork. This route is evaluation-domain authenticated and never
+ * mints canonical write authority.
+ */
+export async function handleEvaluatorCredentials(env: Env, taskId: string, request: Request): Promise<Response> {
+	if (!(await requireEvaluationDomain(request, env))) {
+		return json({ error: "evaluation_domain_auth_required" }, 401);
+	}
+	const parsed = await readJsonBody(request);
+	if (!parsed.ok) return parsed.response;
+	const contender_id = parsed.body["contender_id"];
+	if (typeof contender_id !== "string" || contender_id === "") {
+		return json({ error: "contender_id_required" }, 400);
+	}
+	const stateRes = await doRpc(taskStub(env, taskId), "/state", { method: "GET" });
+	if (!stateRes.ok) return json({ error: "task_not_found", task_id: taskId }, 404);
+	const state = stateRes.body as AuthorityState;
+	const contender = state.contenders[contender_id];
+	if (!contender) return json({ error: "contender_not_found", contender_id }, 404);
+	if (state.quarantine[contender_id]?.status === "QUARANTINED") {
+		return json({ error: "contender_quarantined", contender_id }, 409);
+	}
+	const port = productionPort(env);
+	const repo = await port.get(contender.fork_repo);
+	const credentials = await issueEvaluatorCredentials(port, contender.fork_repo, 300);
+	return json({
+		contender_id,
+		fork_repo: contender.fork_repo,
+		remote: repo.remote,
+		token: credentials.plaintext,
+		expires_at: credentials.expiresAt,
+		task_hash: state.task.task_hash,
+		baseline_commit: state.task.baseline_commit,
+		claim: contender.claim_work_id
+			? state.claims.find((x) => x.work_id === contender.claim_work_id) ?? null
+			: null,
+		latest_commit: contender.latest_commit,
+	});
 }
 
 /**
@@ -977,6 +1051,12 @@ export async function fetch(request: Request, env: Env): Promise<Response> {
 		}
 		if (request.method === "POST" && action === "contenders" && parts.length === 3) {
 			return handleCreateContender(env, taskId, request);
+		}
+		if (request.method === "GET" && action === "context" && parts.length === 3) {
+			return handleTaskContext(env, taskId);
+		}
+		if (request.method === "POST" && action === "evaluator-credentials" && parts.length === 3) {
+			return handleEvaluatorCredentials(env, taskId, request);
 		}
 		if (request.method === "POST" && action === "evidence" && parts.length === 3) {
 			return handleEvidence(env, taskId, request);
