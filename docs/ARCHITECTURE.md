@@ -1,6 +1,6 @@
 # Architecture — Verdict Seam
 
-The full protocol contracts live in `../specs/` (specs 1, 3, 5 are FROZEN-v1). This
+The full protocol contracts live in `./specs/` (specs 1, 3, 5 are FROZEN-v1). This
 document is the plain-language map of the system: what runs where, what each part is
 allowed to touch, and how a task moves through the pipeline.
 

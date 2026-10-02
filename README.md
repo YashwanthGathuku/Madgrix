@@ -1,10 +1,10 @@
-# Verdict Seam
+# Madgrix
 
-**A governed promotion protocol for autonomous software agents** — built on Cloudflare Workers + Durable Objects.
+**A governed promotion protocol for autonomous software agents** — built on Cloudflare Workers + Artifacts.
 
-"Verdict Seam" is the working name of the verdict policy layer. The repo's internal
-codename is `seam/` (the folder keeps that name; it is not a public brand — the public
-name is still undecided, see `docs/NAME_SHORTLIST.md`).
+*Madgrix* is the product. Inside the architecture, the verdict layer keeps its
+design name: the **Verdict Seam** — the governed boundary every candidate must
+cross before it can ship.
 
 ## What it is
 
@@ -15,7 +15,7 @@ INTENT → competing implementations → independent evidence
        → VERDICT → exact-state authorization → promotion → verifiable history
 ```
 
-Git records *what changed*. Verdict Seam records everything else: *why the work began,
+Git records *what changed*. Madgrix records everything else: *why the work began,
 what alternatives were tried, what each one claimed, what was independently checked,
 why one was chosen, what authority permitted shipping — and whether the shipped state
 is exactly the reviewed state.*
@@ -70,13 +70,15 @@ no credentials, no network, no deploys.
 ```bash
 npm install
 npm run typecheck                     # must pass
-npm test                              # 74 tests, 20 suites
+npm test                              # 105 tests, 26 suites
 npm run slice                         # the full loop: task → claims → forks → evaluation
                                       # → blind verifiers → verdict → permit → promotion
                                       # → signed bundle → offline verification
                                       # ends with SLICE OK
+npm run headmove                       # destination-head-move loop: permit expiry →
+                                      # re-evaluation → re-promotion (HEAD-MOVE OK)
 npm run verify -- .slice-output/promotion.bundle   # offline check: 8-line transcript + VERIFIED
-npm run bench -- --quick              # benchmark harness (synthetic / harness-validation only)
+npm run bench                         # benchmark harness (synthetic / harness-validation only)
 ```
 
 Notes:
@@ -96,7 +98,7 @@ Notes:
 `src/harness/slice.ts` (`runSlice()`) is the proof the whole protocol works together —
 one realistic task ("`isTokenExpired` returns true iff `exp <= now`"), three contenders
 (one correct, one subtly wrong at the boundary, one that tampers with test material),
-four blind verifiers (one reveals with the wrong nonce → inadmissible, no retry):
+blind verifiers (one reveals with the wrong nonce → inadmissible, no retry):
 
 1. **Freeze task** — intent → task record → task authority (task_hash pins
    intent, baseline, policy).
@@ -109,12 +111,14 @@ four blind verifiers (one reveals with the wrong nonce → inadmissible, no retr
 6. **Evaluation** — admission gates, hidden oracle, manifest-hash tamper →
    mechanical quarantine (token revoked, downstream effects canceled).
 7. **Blind verifiers** — commit → anonymized judging → reveal → report; invalid
-   reveal is inadmissible with no retry (frozen rule).
-8. **Verdict seam** — eligibility gates, objective dominance
+   reveal is inadmissible with no retry (frozen rule); report signatures verified
+   against keys registered at task freeze.
+8. **Verdict seam** — non-compensatory eligibility gates, objective dominance
    (correctness → regressions → security → blast radius → minimality), then blind
    2-of-3 vote → `ACCEPT` with contender-1 the unique dominant candidate.
 9. **Permit + promotion** — single-use exact-state permit; replay is a no-op
-   `ALREADY_CONSUMED` ACK; canonical head moves exactly once.
+   `ALREADY_CONSUMED` ACK; evaluation-bundle hash re-checked at write time;
+   canonical head moves exactly once.
 10. **Attestation** — in-toto link → test result → verification result →
     authority predicate, all DSSE-signed into one bundle.
 11. **Offline verify** — `node src/cli/verify.ts` prints the exact 8-line
@@ -131,16 +135,28 @@ Any unexpected outcome fails the slice with a non-zero exit and a clear message.
   production swaps in real Artifacts without changing protocol logic.
 - **Remote binding untested from this sandbox.** The port is written against the real
   Artifacts API, but no live Cloudflare end-to-end run has happened from here yet —
-  that needs a direct-egress machine or deploy permission.
+  that needs a direct-egress machine or deploy permission. See
+  `docs/PRODUCTION_DEPLOYMENT.md`.
 - **Deterministic verifier stand-ins.** The slice's "contenders" and "verifiers" are
   deterministic harness code, not LLMs. The ordering guarantees (commit before seeing
-  candidates, no retry after an invalid reveal) are real; the judgments are scripted.
+  candidates, no retry after an invalid reveal, signature verification) are real; the
+  judgments are scripted.
 - **Ed25519 slice signer vs production Sigstore.** The slice signs with Ed25519; the
   DSSE envelope shape is identical to production's Sigstore path.
-- **Frozen specs.** `../specs/` holds the protocol specs; specs 1, 3, and 5 are
-  FROZEN-v1 (amendment-only). Never silently change a frozen contract while
-  implementing — open a spec amendment with the failing invariant and the proposed
-  change instead.
+
+## The paper trail
+
+This repo is submission evidence, not just code. The full chain of reasoning is
+checked in:
+
+- `research/RESEARCH.md` — the deep-research report: paper catalog, 25-item Git
+  pain-point ranking, competitive landscape, demo arc, risks.
+- `specs/` — six engineering specifications. **#1 Promotion Protocol, #3 Evaluation
+  Threat Model, #5 Cloudflare Runtime Model are FROZEN-v1** (content hashes in
+  `specs/FROZEN.json`; amendment-only — see `specs/amendments/`). #2 Intent/Conflict
+  Graph, #4 Attestation Protocol, #6 Benchmark Protocol harden in parallel.
+- `docs/DEVELOPMENT_LOG.md` — the build history: what was decided, when, and why.
+- `docs/ENTRY_BLUEPRINT.md` — the earliest sketch (superseded; preserved for the record).
 
 ## API surface
 
@@ -151,7 +167,7 @@ Worker (`src/worker/index.ts`):
 | POST | `/tasks` | Register intent → `task_id`, `task_hash` |
 | POST | `/tasks/:id/claim` | Register work claim → conflict classification |
 | POST | `/tasks/:id/contenders` | Fork baseline per agent → fork repo + short-lived write token |
-| POST | `/tasks/:id/evidence` | Submit evaluation bundle for a contender |
+| POST | `/tasks/:id/evidence` | Submit evaluation bundle (evaluation-domain callers only) |
 | POST | `/tasks/:id/verdict` | Run the verdict seam across contenders |
 | POST | `/tasks/:id/promote` | Present a permit → exact-state, single-consume promotion |
 | GET | `/tasks/:id/ledger` | Verifiable history for the task |
@@ -166,7 +182,7 @@ that carry a `work_id` (authority-issued only) and returns the conflict list;
 ## Benchmark harness
 
 `npm run bench` runs `src/lib/benchmark.ts` — a **synthetic, harness-validation**
-implementation of `../specs/BENCHMARK_PROTOCOL.md`, not the real benchmark:
+implementation of `specs/BENCHMARK_PROTOCOL.md`, not the real benchmark:
 
 - Ordinary stratum: 20 tasks × 3 contenders (6×3 with `--quick`), seeded PRNG,
   arms B/C/D over identical fixed candidate sets, Selection Regret + paired
@@ -179,18 +195,19 @@ implementation of `../specs/BENCHMARK_PROTOCOL.md`, not the real benchmark:
   precision/recall/FPR with 95% CIs, as-measured.
 
 Nothing here is evidence for the competition claim; the report says so on every
-page. The full benchmark on real datasets (SWE-bench etc.) is future work.
+page. The full benchmark on real datasets (SWE-bench etc.) is future work —
+`docs/BENCHMARK_RUNBOOK.md` is the pre-registered procedure for running it.
 
 ## Design notes
 
 - **Fail-closed.** Missing evidence abstains or rejects; nothing is accepted on narration.
 - **Blind verifiers.** Commit before seeing candidates; a wrong reveal is
-  inadmissible, with no retry and no rewritten opinions.
+  inadmissible, with no retry and no rewritten opinions; reports are signature-checked.
 - **Evaluation plane isolation.** Contenders hold write tokens on their forks only —
   never on the baseline, the evaluation material, policy, or the ledger.
 - **Idempotent promotion.** The same permit presented twice returns
   `ALREADY_CONSUMED` (no-op ACK): no duplicate promotions, no duplicate effects,
-  canonical head unchanged.
+  canonical head unchanged. A moved destination head expires the permit.
 - **Mechanical quarantine only.** Agent accusation is never a trigger; revocation
   cancels side effects, freezes evidence, and taints downstream. Quarantined state
   can never be promoted.
@@ -203,17 +220,19 @@ page. The full benchmark on real datasets (SWE-bench etc.) is future work.
   SVG (`docs/architecture.svg`).
 - `docs/SECURITY.md` — threat model: the 13-attack battery, trust zones, credential
   matrix, honest sandbox constraint, non-claims.
-- `docs/NAME_SHORTLIST.md` — public-name candidates with collision verdicts (nothing
-  renamed; decision pending).
-- `docs/SUBMISSION_CHECKLIST.md` — competition requirements mapped to repo locations,
-  plus remaining decisions.
+- `docs/PRODUCTION_DEPLOYMENT.md` — what runs where, deploy commands, honest
+  validated/blocked status.
+- `docs/NAME_SHORTLIST.md` — the naming record: why "SEAM" was rejected, the
+  shortlist, and the decision (Madgrix).
+- `docs/SUBMISSION_CHECKLIST.md` — competition requirements mapped to repo locations.
+- `docs/DEVELOPMENT_LOG.md` — the full build history.
 
 ## Layout
 
 ```
 src/
   lib/            protocol layer (state machines, pure where possible)
-    task-state.ts     task + authority lifecycle (transitions are async)
+    task-state.ts     task + authority lifecycle
     claims.ts         work-claim registration + conflict classification
     evaluation.ts     evaluation bundles + admission gates
     verifiers.ts      commit→judge→reveal protocol + deterministic verifiers
@@ -225,11 +244,12 @@ src/
     benchmark.ts      synthetic/harness-validation benchmark (NOT evidence)
   do/             TaskAuthority Durable Object (platform layer)
   worker/         Worker fetch router (platform layer)
-  harness/        the vertical slice (src/harness/slice.ts)
+  harness/        the vertical slice (src/harness/slice.ts) + head-move loop
   cli/            offline bundle verifier (src/cli/verify.ts)
 test/             unit tests + slice integration test
-docs/             submission docs (demo script, architecture, security, naming, checklist)
-../specs/         FROZEN-v1 protocol specs (amendment-only)
+docs/             submission docs
+specs/            FROZEN-v1 protocol specs (amendment-only) + amendments
+research/         deep-research report
 ```
 
 Conventions: TypeScript strict, erasable syntax only, `.ts` import extensions,

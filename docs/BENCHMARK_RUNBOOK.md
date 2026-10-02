@@ -6,9 +6,9 @@
 > and real money. When the team is ready, follow this document exactly.
 >
 > The frozen competition scope and precommits come from
-> `../specs/BENCHMARK_PROTOCOL.md` (content hash
+> `./specs/BENCHMARK_PROTOCOL.md` (content hash
 > `sha256:d085f245c76a2a8f33fa8e6360e7c2afe4828eee9a401f719f3bdfbc2675a914`
-> in `../specs/FROZEN.json`). **That spec is FROZEN — this runbook may
+> in `./specs/FROZEN.json`). **That spec is FROZEN — this runbook may
 > restate it but must never alter it.** If this runbook and the spec ever
 > disagree, the spec wins and the runbook is amended.
 >
@@ -111,7 +111,7 @@ All commands run from `~/workspace/cloudflare-entry/seam/`
 ### Step 1 — Verify the frozen contracts
 
 ```bash
-cd ../specs
+cd ./specs
 sha256sum BENCHMARK_PROTOCOL.md   # must match FROZEN.json
 sha256sum PROMOTION_PROTOCOL.md   # must match FROZEN.json
 sha256sum EVALUATION_THREAT_MODEL.md

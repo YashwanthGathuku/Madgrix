@@ -1,7 +1,7 @@
 # Production Deployment (internal codename: seam — NOT a public brand)
 
 How this project runs on Cloudflare, what is validated, and what is not.
-Companion to the frozen runtime contract (`../specs/CLOUDFLARE_RUNTIME_MODEL.md`,
+Companion to the frozen runtime contract (`./specs/CLOUDFLARE_RUNTIME_MODEL.md`,
 FROZEN-v1 — this document never overrides it).
 
 ## (a) What runs where
@@ -28,7 +28,7 @@ No real secret values appear below. Nothing here has been deployed.
 ```bash
 cd seam
 
-# 1. Prereqs (account ffabfb0365d341560c55803aade76485 — see ../SETUP_STATUS.md)
+# 1. Prereqs (account <CLOUDFLARE_ACCOUNT_ID> — see ../SETUP_STATUS.md)
 cf queues create seam-events            # queue must exist before deploy
 # cf artifacts namespaces ...           # namespace "default" already exists
 

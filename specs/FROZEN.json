@@ -1,0 +1,23 @@
+# Frozen spec content hashes — FROZEN-v1
+
+Recorded: 2026-10-01 (after the five-decision freeze patch).
+
+**FROZEN-v1 (implementation-blocking; amendment-only changes):**
+
+- `PROMOTION_PROTOCOL.md`: `sha256:05e807bbcffe01d6465397f1bef38b49f4c6aa45202e5effe568befe8ef7b34f`
+- `EVALUATION_THREAT_MODEL.md`: `sha256:4c1bfdaa51745639c7cbbf0ae5a38005c041498d0934b78ee1ed6dd1c3a03e4c`
+- `CLOUDFLARE_RUNTIME_MODEL.md`: `sha256:3f1dc83ebe0f8c9276f259c6561475f231bb564ba012f498f8029e71a9294ae3`
+
+**Competition-scope frozen (benchmark precommit):**
+
+- `BENCHMARK_PROTOCOL.md`: `sha256:d085f245c76a2a8f33fa8e6360e7c2afe4828eee9a401f719f3bdfbc2675a914`
+
+**Stable cores (hardening in parallel):**
+
+- `INTENT_AND_CONFLICT_GRAPH.md`: `sha256:0101f412d15f62760f9d161c6403f7a10211e581ee8e17cfd6c9df0f322fbd1e`
+- `ATTESTATION_PROTOCOL.md`: `sha256:ab2ad6dc003a2c32dca421c0ed83df6af2e9120420f221fc2a19203763c4119e`
+- `README.md`: `sha256:0d2a1f7038f6387134d4d7ff0244160c9565e40729a4ce0dd1504cded7feebbe`
+
+To verify: `sha256sum <file>` must reproduce the hash above. Any mismatch
+means the frozen contract was altered — treat as an unrecorded amendment
+and halt.

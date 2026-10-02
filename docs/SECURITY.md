@@ -1,6 +1,6 @@
 # Security — Verdict Seam
 
-The normative threat model is `../specs/EVALUATION_THREAT_MODEL.md` (FROZEN-v1). This
+The normative threat model is `./specs/EVALUATION_THREAT_MODEL.md` (FROZEN-v1). This
 document is the plain-language summary: what the system defends against, where the
 boundaries are, and — just as important — what it does *not* claim.
 
