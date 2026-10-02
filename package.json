@@ -18,7 +18,9 @@
     "headmove": "node src/harness/head-move.ts",
     "verify": "node src/cli/verify.ts",
     "bench": "node src/lib/benchmark.ts",
-    "test": "node --test \"test/**/*.test.ts\""
+    "test": "node --test \"test/**/*.test.ts\"",
+    "contenders": "node scripts/run-contenders.mjs",
+    "evaluate": "node scripts/evaluate-candidate.ts"
   },
   "type": "module",
   "version": "0.1.0"
