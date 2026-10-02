@@ -21,6 +21,10 @@ export default defineConfig({
 			// Task authority (spec 5 §4): one Durable Object per task id.
 			// Self-binding: the class is defined by this same Worker.
 			TASK_AUTHORITY: bindings.durableObject({ worker: "seam", exportName: "TaskAuthority" }),
+			// Evaluation evidence is accepted only when this secret is presented
+			// as a Bearer token at the Worker edge. The caller's JSON body can
+			// never self-assert the evaluation-domain trust zone.
+			EVALUATION_SERVICE_TOKEN: bindings.secret(),
 		},
 		// Queue consumer (spec 5 §2–§3): Artifact lifecycle events arrive via
 		// this queue (at-least-once, unordered) and are ingested by the
