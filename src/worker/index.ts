@@ -505,18 +505,68 @@ export async function handleCreateContender(
 	const forkName = forkOpId.slice(0, 32);
 
 	const port = productionPort(env);
-	const { repo, created, initialTokenPlaintext } = await forkIdempotent(
+	const { repo, created, initialTokenPlaintext, viaImportFallback } = await forkIdempotent(
 		port,
 		state.task.baseline_repo,
 		forkName,
 	);
-	if (created && initialTokenPlaintext !== null) {
+
+	// Cloudflare's Artifacts beta fork endpoint is currently broken
+	// server-side. forkIdempotent falls back to creating an empty repo; when
+	// that happens we reproduce fork semantics by copying the frozen baseline
+	// commit through the trusted Git container before issuing a contender
+	// credential.
+	if (created && viaImportFallback) {
+		if (initialTokenPlaintext === null) {
+			return json({ error: "fork_fallback_missing_write_token", fork_repo: forkName }, 502);
+		}
+		const baseline = await port.get(state.task.baseline_repo);
+		const sourceToken = await baseline.createToken("read", 300);
+		try {
+			const copyRes = await promotionStub(env, `fork-${forkOpId}`).fetch(
+				new Request("https://promotion/copy-baseline", {
+					method: "POST",
+					headers: { "content-type": "application/json" },
+					body: JSON.stringify({
+						action: "copy_baseline",
+						op_id: forkOpId,
+						source_remote: baseline.remote,
+						source_token: sourceToken.plaintext,
+						source_commit: state.task.baseline_commit,
+						destination_remote: repo.remote,
+						destination_token: initialTokenPlaintext,
+					}),
+				}),
+			);
+			const copy = (await copyRes.json()) as { outcome?: string; head?: string; error?: string };
+			if (!copyRes.ok || (copy.outcome !== "IMPORTED" && copy.outcome !== "ALREADY_IMPORTED")) {
+				return json({ error: "fork_baseline_import_failed", detail: copy }, 502);
+			}
+			if (copy.head !== state.task.baseline_commit) {
+				return json({ error: "fork_baseline_head_mismatch", expected: state.task.baseline_commit, actual: copy.head }, 502);
+			}
+		} finally {
+			await Promise.allSettled([
+				baseline.revokeToken(sourceToken.id),
+				repo.revokeToken(initialTokenPlaintext),
+			]);
+		}
+	} else if (created && initialTokenPlaintext !== null) {
 		// The fork-creation token has the binding default TTL (24h) — too
 		// long for a contender. Revoke it; the contender gets a ≤1h token.
 		await repo.revokeToken(initialTokenPlaintext);
 	}
+
 	const credentials = await issueContenderCredentials(port, forkName, 3600);
 	const latest_commit = await repo.getHead();
+	if (latest_commit !== state.task.baseline_commit) {
+		await repo.revokeToken(credentials.id);
+		return json({
+			error: "contender_fork_not_at_frozen_baseline",
+			expected: state.task.baseline_commit,
+			actual: latest_commit,
+		}, 409);
+	}
 
 	const contender: ContenderRecord = {
 		contender_id,
