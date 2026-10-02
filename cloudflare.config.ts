@@ -1,5 +1,12 @@
-import { bindings, defineConfig, exports, triggers } from "cf/config";
+import { bindings, defineConfig, defineContainer, exports, triggers } from "cf/config";
 import * as entrypoint from "./src/worker/index.ts" with { type: "cf-worker" };
+
+const promotionContainer = defineContainer({
+	name: "madgrix-promotion",
+	image: { dockerfile: "./container/Dockerfile" },
+	instanceType: "lite",
+	maxInstances: 4,
+});
 
 export default defineConfig({
 	worker: {
@@ -12,6 +19,7 @@ export default defineConfig({
 		// storage transaction (spec 5 §4).
 		exports: {
 			TaskAuthority: exports.durableObject({ storage: "sqlite" }),
+			PromotionContainer: exports.durableObject({ storage: "sqlite", container: promotionContainer }),
 		},
 		env: {
 			// Local dev note: workerd cannot reach the remote Artifacts service
@@ -25,6 +33,7 @@ export default defineConfig({
 			// as a Bearer token at the Worker edge. The caller's JSON body can
 			// never self-assert the evaluation-domain trust zone.
 			EVALUATION_SERVICE_TOKEN: bindings.secret(),
+			PROMOTION_CONTAINER: bindings.durableObject({ worker: "seam", exportName: "PromotionContainer" }),
 		},
 		// Queue consumer (spec 5 §2–§3): Artifact lifecycle events arrive via
 		// this queue (at-least-once, unordered) and are ingested by the
@@ -34,4 +43,5 @@ export default defineConfig({
 		// queue is recommended for poison messages (see docs/PRODUCTION_DEPLOYMENT.md).
 		triggers: [triggers.queue({ name: "seam-events", maxBatchSize: 10, maxBatchTimeout: 30 })],
 	},
+	containers: [promotionContainer],
 });
