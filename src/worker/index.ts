@@ -356,6 +356,27 @@ export function verifierCredentials(): null {
 	return null;
 }
 
+async function constantTimeTokenEqual(a: string, b: string): Promise<boolean> {
+	const enc = new TextEncoder();
+	const [ha, hb] = await Promise.all([
+		crypto.subtle.digest("SHA-256", enc.encode(a)),
+		crypto.subtle.digest("SHA-256", enc.encode(b)),
+	]);
+	const aa = new Uint8Array(ha);
+	const bb = new Uint8Array(hb);
+	let diff = aa.length ^ bb.length;
+	for (let i = 0; i < Math.min(aa.length, bb.length); i++) diff |= aa[i] ^ bb[i];
+	return diff === 0;
+}
+
+async function requireEvaluationDomain(request: Request, env: Env): Promise<boolean> {
+	const configured = env.EVALUATION_SERVICE_TOKEN;
+	if (typeof configured !== "string" || configured.length < 16) return false;
+	const auth = request.headers.get("authorization") ?? "";
+	if (!auth.startsWith("Bearer ")) return false;
+	return constantTimeTokenEqual(auth.slice(7), configured);
+}
+
 /* ------------------------------------------------------------------ */
 /* Route logic (also called by Workflow steps)                         */
 /* ------------------------------------------------------------------ */
@@ -528,22 +549,61 @@ export async function handleCreateContender(
  * (spec 3 §6, attack 6).
  */
 export async function handleEvidence(env: Env, taskId: string, request: Request): Promise<Response> {
+	if (!(await requireEvaluationDomain(request, env))) {
+		return json({ error: "evaluation_domain_auth_required" }, 401);
+	}
 	const parsed = await readJsonBody(request);
 	if (!parsed.ok) return parsed.response;
 	const bundle = parsed.body["bundle"] as EvaluationBundle | undefined;
 	if (!bundle || typeof bundle.candidate_sha !== "string") {
 		return json({ error: "invalid_bundle" }, 400);
 	}
-	// Caller identity is enforced INSIDE the authority (zone check in
-	// submitEvaluation is what actually decides admissibility).
-	// TODO: requireEvaluationDomain(request) — mTLS/service-token check
-	// that the caller is the evaluation domain. Without it,
-	// contender-supplied "evidence" reaches the DO asserting whatever
-	// zone the body claims (spec 3 §6). The authority's fail-closed default
-	// ("unknown" zone) is the only defense until this is bound to real
-	// transport auth.
-	const caller = parsed.body["caller"] ?? { zone: "unknown" };
+	// Trust-zone identity is derived by the Worker after transport
+	// authentication. The caller cannot self-assert its zone in JSON.
+	const caller = { zone: "evaluation_domain" as const };
 	const res = await doRpc(taskStub(env, taskId), "/evidence", { body: { bundle, caller } });
+	return json(res.body, res.status);
+}
+
+/**
+ * POST /tasks/:id/verifiers/commit — record a blind-verifier commitment.
+ * Verifier report authenticity is ultimately enforced by the verifier's
+ * Ed25519 key registered when the task was frozen.
+ */
+export async function handleVerifierCommit(env: Env, taskId: string, request: Request): Promise<Response> {
+	const parsed = await readJsonBody(request);
+	if (!parsed.ok) return parsed.response;
+	const res = await doRpc(taskStub(env, taskId), "/verifier/commit", { body: { commitment: parsed.body["commitment"] } });
+	return json(res.body, res.status);
+}
+
+/** POST /tasks/:id/verifiers/labels — assign labels only after commitments. */
+export async function handleCandidateLabels(env: Env, taskId: string, request: Request): Promise<Response> {
+	const parsed = await readJsonBody(request);
+	if (!parsed.ok) return parsed.response;
+	const res = await doRpc(taskStub(env, taskId), "/candidate-labels", { body: { candidate_shas: parsed.body["candidate_shas"] } });
+	return json(res.body, res.status);
+}
+
+/** POST /tasks/:id/verifiers/reveal — verify commit→reveal. */
+export async function handleVerifierReveal(env: Env, taskId: string, request: Request): Promise<Response> {
+	const parsed = await readJsonBody(request);
+	if (!parsed.ok) return parsed.response;
+	const res = await doRpc(taskStub(env, taskId), "/verifier/reveal", {
+		body: {
+			verifier_id: parsed.body["verifier_id"],
+			report: parsed.body["report"],
+			nonce: parsed.body["nonce"],
+		},
+	});
+	return json(res.body, res.status);
+}
+
+/** POST /tasks/:id/verifiers/report — submit a signed blind-verifier report. */
+export async function handleVerifierReport(env: Env, taskId: string, request: Request): Promise<Response> {
+	const parsed = await readJsonBody(request);
+	if (!parsed.ok) return parsed.response;
+	const res = await doRpc(taskStub(env, taskId), "/verifier/report", { body: { report: parsed.body["report"] } });
 	return json(res.body, res.status);
 }
 
@@ -553,15 +613,34 @@ export async function handleEvidence(env: Env, taskId: string, request: Request)
  * vote) is protocol-layer logic owned by the sibling. The platform exposes
  * the route shape; computation is not implemented here.
  */
-export async function handleVerdict(_env: Env, _taskId: string, _request: Request): Promise<Response> {
-	return json(
-		{
-			error: "not_implemented",
-			detail:
-				"verdict seam is protocol-layer (spec 1 §9; sibling-owned). Platform skeleton only.",
-		},
-		501,
-	);
+export async function handleVerdict(env: Env, taskId: string, request: Request): Promise<Response> {
+	const parsed = await readJsonBody(request);
+	if (!parsed.ok) return parsed.response;
+	const candidates = parsed.body["candidates"];
+	const destination_repo = parsed.body["destination_repo"];
+	if (!Array.isArray(candidates) || candidates.length === 0) {
+		return json({ error: "candidates_required" }, 400);
+	}
+	if (typeof destination_repo !== "string" || destination_repo === "") {
+		return json({ error: "destination_repo_required" }, 400);
+	}
+
+	const vr = await doRpc(taskStub(env, taskId), "/verdict", { body: { candidates } });
+	if (!vr.ok) return json(vr.body, vr.status);
+	const verdict = (vr.body as { verdict?: { state?: string; winner_sha?: string | null } }).verdict;
+	if (!verdict) return json({ error: "verdict_authority_invalid_response" }, 502);
+	if (verdict.state !== "ACCEPT" || !verdict.winner_sha) {
+		return json({ verdict, permit: null }, 200);
+	}
+
+	const dest = await productionPort(env).get(destination_repo);
+	const destination_head = await dest.getHead();
+	if (!destination_head) return json({ error: "destination_head_not_found", destination_repo }, 409);
+	const pr = await doRpc(taskStub(env, taskId), "/permit", {
+		body: { winner_sha: verdict.winner_sha, destination_repo, destination_head },
+	});
+	if (!pr.ok) return json({ verdict, error: "permit_issue_failed", detail: pr.body }, pr.status);
+	return json({ verdict, ...(pr.body as Record<string, unknown>) }, 200);
 }
 
 /**
@@ -796,6 +875,12 @@ export async function fetch(request: Request, env: Env): Promise<Response> {
 		}
 		if (request.method === "POST" && action === "evidence" && parts.length === 3) {
 			return handleEvidence(env, taskId, request);
+		}
+		if (request.method === "POST" && action === "verifiers" && parts.length === 4) {
+			if (parts[3] === "commit") return handleVerifierCommit(env, taskId, request);
+			if (parts[3] === "labels") return handleCandidateLabels(env, taskId, request);
+			if (parts[3] === "reveal") return handleVerifierReveal(env, taskId, request);
+			if (parts[3] === "report") return handleVerifierReport(env, taskId, request);
 		}
 		if (request.method === "POST" && action === "verdict" && parts.length === 3) {
 			return handleVerdict(env, taskId, request);
