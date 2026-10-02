@@ -390,6 +390,14 @@ async function requireControlPlane(request: Request, env: Env): Promise<boolean>
 	return requireBearer(request, env.CONTROL_SERVICE_TOKEN);
 }
 
+async function requireAgentDomain(request: Request, env: Env): Promise<boolean> {
+	return requireBearer(request, env.AGENT_SERVICE_TOKEN);
+}
+
+async function requireAgentOrControl(request: Request, env: Env): Promise<boolean> {
+	return (await requireAgentDomain(request, env)) || (await requireControlPlane(request, env));
+}
+
 async function requireEvaluationDomain(request: Request, env: Env): Promise<boolean> {
 	return requireBearer(request, env.EVALUATION_SERVICE_TOKEN);
 }
@@ -400,6 +408,7 @@ async function requireEvaluationDomain(request: Request, env: Env): Promise<bool
 
 /** POST /tasks — freeze a task and seed its task authority. */
 export async function handleCreateTask(env: Env, request: Request): Promise<Response> {
+	if (!(await requireControlPlane(request, env))) return json({ error: "control_plane_auth_required" }, 401);
 	const parsed = await readJsonBody(request);
 	if (!parsed.ok) return parsed.response;
 	const { intent, baseline_repo, baseline_commit, behavior_contract } = parsed.body;
@@ -460,6 +469,7 @@ export async function handleCreateTask(env: Env, request: Request): Promise<Resp
 
 /** POST /tasks/:id/claim — forward a WorkClaim to the task authority. */
 export async function handleClaim(env: Env, taskId: string, request: Request): Promise<Response> {
+	if (!(await requireAgentOrControl(request, env))) return json({ error: "agent_auth_required" }, 401);
 	const parsed = await readJsonBody(request);
 	if (!parsed.ok) return parsed.response;
 	// The contender supplies the claim INPUT (no work_id/status/version —
@@ -500,6 +510,7 @@ export async function handleCreateContender(
 	taskId: string,
 	request: Request,
 ): Promise<Response> {
+	if (!(await requireAgentOrControl(request, env))) return json({ error: "agent_auth_required" }, 401);
 	const parsed = await readJsonBody(request);
 	if (!parsed.ok) return parsed.response;
 	const agent_id = parsed.body["agent_id"];
@@ -621,7 +632,8 @@ export async function handleCreateContender(
 }
 
 /** GET /tasks/:id/context — non-secret frozen task + work graph context. */
-export async function handleTaskContext(env: Env, taskId: string): Promise<Response> {
+export async function handleTaskContext(env: Env, taskId: string, request: Request): Promise<Response> {
+	if (!(await requireAgentOrControl(request, env))) return json({ error: "task_context_auth_required" }, 401);
 	const stateRes = await doRpc(taskStub(env, taskId), "/state", { method: "GET" });
 	if (!stateRes.ok) return json({ error: "task_not_found", task_id: taskId }, 404);
 	const state = stateRes.body as AuthorityState;
@@ -712,6 +724,7 @@ export async function handleEvidence(env: Env, taskId: string, request: Request)
  * Ed25519 key registered when the task was frozen.
  */
 export async function handleVerifierCommit(env: Env, taskId: string, request: Request): Promise<Response> {
+	if (!(await requireControlPlane(request, env))) return json({ error: "control_plane_auth_required" }, 401);
 	const parsed = await readJsonBody(request);
 	if (!parsed.ok) return parsed.response;
 	const res = await doRpc(taskStub(env, taskId), "/verifier/commit", { body: { commitment: parsed.body["commitment"] } });
@@ -720,6 +733,7 @@ export async function handleVerifierCommit(env: Env, taskId: string, request: Re
 
 /** POST /tasks/:id/verifiers/labels — assign labels only after commitments. */
 export async function handleCandidateLabels(env: Env, taskId: string, request: Request): Promise<Response> {
+	if (!(await requireControlPlane(request, env))) return json({ error: "control_plane_auth_required" }, 401);
 	const parsed = await readJsonBody(request);
 	if (!parsed.ok) return parsed.response;
 	const res = await doRpc(taskStub(env, taskId), "/candidate-labels", { body: { candidate_shas: parsed.body["candidate_shas"] } });
@@ -728,6 +742,7 @@ export async function handleCandidateLabels(env: Env, taskId: string, request: R
 
 /** POST /tasks/:id/verifiers/reveal — verify commit→reveal. */
 export async function handleVerifierReveal(env: Env, taskId: string, request: Request): Promise<Response> {
+	if (!(await requireControlPlane(request, env))) return json({ error: "control_plane_auth_required" }, 401);
 	const parsed = await readJsonBody(request);
 	if (!parsed.ok) return parsed.response;
 	const res = await doRpc(taskStub(env, taskId), "/verifier/reveal", {
@@ -742,6 +757,7 @@ export async function handleVerifierReveal(env: Env, taskId: string, request: Re
 
 /** POST /tasks/:id/verifiers/report — submit a signed blind-verifier report. */
 export async function handleVerifierReport(env: Env, taskId: string, request: Request): Promise<Response> {
+	if (!(await requireControlPlane(request, env))) return json({ error: "control_plane_auth_required" }, 401);
 	const parsed = await readJsonBody(request);
 	if (!parsed.ok) return parsed.response;
 	const res = await doRpc(taskStub(env, taskId), "/verifier/report", { body: { report: parsed.body["report"] } });
@@ -755,6 +771,7 @@ export async function handleVerifierReport(env: Env, taskId: string, request: Re
  * the route shape; computation is not implemented here.
  */
 export async function handleVerdict(env: Env, taskId: string, request: Request): Promise<Response> {
+	if (!(await requireControlPlane(request, env))) return json({ error: "control_plane_auth_required" }, 401);
 	const parsed = await readJsonBody(request);
 	if (!parsed.ok) return parsed.response;
 	const candidates = parsed.body["candidates"];
@@ -797,6 +814,7 @@ export async function handlePromote(
 	taskId: string,
 	request: Request,
 ): Promise<Response> {
+	if (!(await requireControlPlane(request, env))) return json({ error: "control_plane_auth_required" }, 401);
 	const parsed = await readJsonBody(request);
 	if (!parsed.ok) return parsed.response;
 	const permit_id = parsed.body["permit_id"];
@@ -1060,7 +1078,7 @@ export async function fetch(request: Request, env: Env): Promise<Response> {
 			return handleCreateContender(env, taskId, request);
 		}
 		if (request.method === "GET" && action === "context" && parts.length === 3) {
-			return handleTaskContext(env, taskId);
+			return handleTaskContext(env, taskId, request);
 		}
 		if (request.method === "POST" && action === "evaluator-credentials" && parts.length === 3) {
 			return handleEvaluatorCredentials(env, taskId, request);
@@ -1159,7 +1177,10 @@ export class PromotionWorkflow extends WorkflowEntrypoint<Env, PromotionWorkflow
 				p.task_id,
 				new Request("https://workflow/promote", {
 					method: "POST",
-					headers: { "content-type": "application/json" },
+					headers: {
+						"content-type": "application/json",
+						authorization: `Bearer ${this.env.CONTROL_SERVICE_TOKEN}`,
+					},
 					body: JSON.stringify({ permit_id: p.permit_id }),
 				}),
 			);
