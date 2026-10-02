@@ -20,7 +20,8 @@
     "bench": "node src/lib/benchmark.ts",
     "test": "node --test \"test/**/*.test.ts\"",
     "contenders": "node scripts/run-contenders.mjs",
-    "evaluate": "node scripts/evaluate-candidate.ts"
+    "evaluate": "node scripts/evaluate-candidate.ts",
+    "live:e2e": "node scripts/live-e2e.ts"
   },
   "type": "module",
   "version": "0.1.0"
