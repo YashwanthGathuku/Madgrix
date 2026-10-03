@@ -84,7 +84,7 @@ async function buildAllOkBundle(opts: { promotions?: number; permitId?: string }
 		verificationResult: "PASSED",
 		policySha256: POLICY,
 		destinationRepo: "acme/api",
-		expectedParent: "dest-head-1",
+		destinationBase: "dest-head-1",
 		nonce: "nonce-1",
 		permitId,
 		issuedAt: "2026-10-01T19:00:00Z",
@@ -94,9 +94,10 @@ async function buildAllOkBundle(opts: { promotions?: number; permitId?: string }
 		[link, test, verif, auth].map((s) => signEnvelope(s, signer)),
 	);
 	const bundle: PromotionBundle = {
-		version: 2,
+		version: 3,
 		statements,
-		ship: { repo: "acme/api", commit: COMMIT, tree_sha256: TREE, parent: "dest-head-1", permit_id: permitId },
+		// The candidate sits two commits above the base: its own parent is not the base.
+		ship: { repo: "acme/api", commit: COMMIT, tree_sha256: TREE, base: "dest-head-1", parent: "candidate-step-1", permit_id: permitId },
 		ledger,
 		authority_pubkey_der_hex: signer.publicKeyDerHex,
 	};
@@ -117,7 +118,7 @@ describe("DSSE envelope", () => {
 			verificationResult: "PASSED",
 			policySha256: POLICY,
 			destinationRepo: "acme/api",
-			expectedParent: "p",
+			destinationBase: "p",
 			nonce: "n",
 			permitId: PERMIT,
 			issuedAt: "2026-10-01T19:00:00Z",
@@ -167,7 +168,7 @@ describe("verifyBundle (spec 4 §7 transcript)", () => {
 				"chain integrity",
 				"hidden evaluation",
 				"policy digest",
-				"destination parent",
+				"destination base",
 				"authority key",
 				"signature",
 				"permit id",
@@ -223,14 +224,25 @@ describe("verifyBundle (spec 4 §7 transcript)", () => {
 		assert.equal(lines.find((l) => l.label === "policy digest")?.status, "FAIL");
 	});
 
-	it("ship parent moved → destination parent FAIL", async () => {
+	it("ship base moved → destination base FAIL", async () => {
 		const { signer, bundle, pin } = await buildAllOkBundle();
 		const { lines, verified } = await verifyBundle(
-			{ ...bundle, ship: { ...bundle.ship, parent: "dest-head-2" } },
+			{ ...bundle, ship: { ...bundle.ship, base: "dest-head-2" } },
 			signer,
 			pin,
 		);
 		assert.equal(verified, false);
-		assert.equal(lines.find((l) => l.label === "destination parent")?.status, "FAIL");
+		assert.deepEqual(
+			lines.filter((l) => l.status === "FAIL").map((l) => l.label),
+			["destination base"],
+		);
+	});
+
+	it("a version-2 bundle (expected_parent, no ship base) does not verify under version 3", async () => {
+		const { signer, bundle, pin } = await buildAllOkBundle();
+		const { base: _base, ...shipV2 } = bundle.ship;
+		const { lines, verified } = await verifyBundle({ ...bundle, ship: shipV2 } as never, signer, pin);
+		assert.equal(verified, false);
+		assert.equal(lines.find((l) => l.label === "destination base")?.status, "FAIL");
 	});
 });

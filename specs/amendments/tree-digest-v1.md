@@ -43,3 +43,6 @@ mismatch with the permit-bound `winning_tree_sha256` produces
 `TREE_MISMATCH`; no write occurs and the permit remains unconsumed.
 
 The production implementation lives in `src/do/PromotionContainer.ts`.
+(Later moved: the digest is computed by `container/promote.sh`, which
+`src/do/PromotionContainer.ts` runs; `src/lib/tree-digest.ts` is the TypeScript
+implementation the tests compare it with. See `rebase-ancestry-v1.md`.)

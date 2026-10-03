@@ -20,10 +20,14 @@
  *   `/evidence` → `submitEvaluation` (rejects bundles for a different
  *   task or for a SHA that is not the contender's latest observed commit;
  *   answers 409 and ledgers `evidence_replacement_rejected` when a labeled
- *   candidate's evidence would be replaced); `/promotion/finalize` →
- *   `attemptPromotion` + `recordPromotionBundle` (signs the ship record with
- *   AUTHORITY_SIGNING_KEY in the same transaction). Verdict, permit, and
- *   quarantine logic lives in task-state.ts.
+ *   candidate's evidence would be replaced); `/permit` → `issuePermit`
+ *   (409 REBASE_REQUIRED, ledgered, when the destination head is not one the
+ *   candidate is known to descend from); `/rebase` → `recordRebase` (the
+ *   rebase container's report: REBASED/UP_TO_DATE record ancestry, CONFLICT
+ *   escalates with the paths as data; specs/amendments/rebase-ancestry-v1.md);
+ *   `/promotion/finalize` → `attemptPromotion` + `recordPromotionBundle`
+ *   (signs the ship record with AUTHORITY_SIGNING_KEY in the same
+ *   transaction). Verdict, permit, and quarantine logic lives in task-state.ts.
  *
  * Structural typing note: this class does NOT extend a real DurableObject
  * (no base class importable here; see workers.d.ts). The runtime only needs
@@ -40,6 +44,7 @@ import {
 	ingestQueueEvent,
 	issuePermit,
 	recordPromotionBundle,
+	recordRebase,
 	registerClaim,
 	registerContender,
 	registerOperatorKeys,
@@ -51,6 +56,7 @@ import {
 	type Ctx,
 	type Effect,
 	type NewClaimInput,
+	type RebaseReport,
 } from "../lib/task-state.ts";
 import type {
 	AuthorityState,
@@ -452,10 +458,51 @@ export class TaskAuthority {
 				if (state === null) return json({ error: "not_initialized" }, 404);
 				try {
 					const r = await issuePermit(state, body.winner_sha!, body.destination_repo!, body.destination_head!, ctx);
-					await this.doState.storage.put(STATE_KEY, r.state);
-					return json({ permit: r.permit });
+					if (r.state !== state) await this.doState.storage.put(STATE_KEY, r.state);
+					if (r.outcome === "REBASE_REQUIRED") {
+						// The refusal is ledgered (persisted above); no permit exists.
+						return json(
+							{
+								outcome: "REBASE_REQUIRED",
+								winner_sha: body.winner_sha,
+								contender_id: r.contender_id,
+								destination_head: body.destination_head,
+								bases: r.bases,
+							},
+							409,
+						);
+					}
+					return json({ outcome: "ISSUED", permit: r.permit });
 				} catch (err) {
 					return json({ error: "permit_rejected", detail: (err as Error).message }, 422);
+				}
+			});
+		}
+
+		/* -- POST /rebase — the rebase container's report -------------------- */
+		// specs/amendments/rebase-ancestry-v1.md: REBASED / UP_TO_DATE record
+		// that `onto` is an ancestor of the (new) candidate; CONFLICT escalates
+		// the task with the conflicting paths as data.
+		if (request.method === "POST" && path === "/rebase") {
+			const parsed = await readJsonBody(request);
+			if (!parsed.ok) return parsed.response;
+			const report = (parsed.body as { report?: RebaseReport }).report;
+			if (!report || typeof report !== "object") return json({ error: "invalid_rebase_report" }, 400);
+			const ctx = await productionCtx();
+			return this.doState.storage.transaction(async () => {
+				const state = await this.loadState();
+				if (state === null) return json({ error: "not_initialized" }, 404);
+				try {
+					const r = await recordRebase(state, report, ctx);
+					if (r.state !== state) await this.doState.storage.put(STATE_KEY, r.state);
+					return json({
+						outcome: r.outcome,
+						contender: r.state.contenders[report.contender_id],
+						task_status: r.state.task_status,
+						effects: r.effects,
+					});
+				} catch (err) {
+					return json({ error: "rebase_report_rejected", detail: (err as Error).message }, 422);
 				}
 			});
 		}
@@ -469,11 +516,21 @@ export class TaskAuthority {
 			if (!parsed.ok) return parsed.response;
 			const body = parsed.body as {
 				permit_id?: string;
-				verified_parent?: string;
+				verified_base?: string;
 				tree_sha256?: string;
 				promoted_sha?: string;
+				promoted_parent?: string;
 			};
-			if (!body.permit_id || !body.verified_parent || !body.tree_sha256 || !body.promoted_sha) {
+			// verified_base: the permit-bound head promote.sh fast-forwarded from;
+			// promoted_parent: the promoted commit's own parent as git reported it
+			// ("" for a root commit).
+			if (
+				!body.permit_id ||
+				!body.verified_base ||
+				!body.tree_sha256 ||
+				!body.promoted_sha ||
+				typeof body.promoted_parent !== "string"
+			) {
 				return json({ error: "invalid_promotion_finalize" }, 400);
 			}
 			// Without the signing key no ship record can be recorded, so nothing
@@ -488,7 +545,7 @@ export class TaskAuthority {
 			return this.doState.storage.transaction(async () => {
 				const state = await this.loadState();
 				if (state === null) return json({ error: "not_initialized" }, 404);
-				const r = await attemptPromotion(state, body.permit_id!, body.verified_parent!, body.tree_sha256!, ctx);
+				const r = await attemptPromotion(state, body.permit_id!, body.verified_base!, body.tree_sha256!, ctx);
 				if (r.outcome !== "PROMOTED" && r.outcome !== "ALREADY_CONSUMED") {
 					if (r.state !== state) await this.doState.storage.put(STATE_KEY, r.state);
 					return json({ outcome: r.outcome, effects: r.effects }, 409);
@@ -497,7 +554,13 @@ export class TaskAuthority {
 				const stored = r.state.promotion_bundles?.[body.permit_id!];
 				if (stored) return json({ outcome: r.outcome, effects: r.effects, bundle: stored });
 				try {
-					const recorded = await recordPromotionBundle(r.state, body.permit_id!, body.promoted_sha!, signer, ctx);
+					const recorded = await recordPromotionBundle(
+						r.state,
+						body.permit_id!,
+						{ commit: body.promoted_sha!, parent: body.promoted_parent! },
+						signer,
+						ctx,
+					);
 					await this.doState.storage.put(STATE_KEY, recorded.state);
 					return json({ outcome: r.outcome, effects: r.effects, bundle: recorded.bundle });
 				} catch (err) {

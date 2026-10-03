@@ -60,6 +60,8 @@ import {
 	forkIdempotent,
 } from "../lib/artifacts-port.ts";
 import { FakeArtifacts } from "../lib/fake-artifacts.ts";
+import { treeDigestOfFiles } from "../lib/tree-digest.ts";
+import { fakePromote } from "./fake-container.ts";
 import {
 	attemptPromotion,
 	commitVerifier,
@@ -372,6 +374,7 @@ export async function runSlice(opts: SliceOptions = {}): Promise<SliceResult> {
 			agent_id: cid,
 			fork_repo: forkName,
 			fork_lineage: { parent_repo: "canonical", parent_commit: baseline },
+			fork_base: baseline,
 			token_id: tok.id,
 			status: "forked",
 			claim_work_id: workIds[cid],
@@ -403,10 +406,8 @@ export async function runSlice(opts: SliceOptions = {}): Promise<SliceResult> {
 		},
 	};
 	const candidateShas: Record<string, string> = {};
-	const candidateMessages: Record<string, string> = {};
 	for (const cid of contenderIds) {
 		const message = `${cid}: fix isTokenExpired`;
-		candidateMessages[cid] = message;
 		const sha = await fake.pushAsToken({
 			repo: forkNames[cid],
 			ref: "main",
@@ -500,7 +501,9 @@ export async function runSlice(opts: SliceOptions = {}): Promise<SliceResult> {
 		});
 		const meta = await repo.readCommit(candidateShas[cid]);
 		check(meta !== null, `commit ${short(candidateShas[cid])} must exist`);
-		const treeSha256 = (meta as { treeHash: string }).treeHash;
+		// tree-digest/v1 (specs/amendments/tree-digest-v1.md), the digest the
+		// promotion container recomputes before it writes.
+		const treeSha256 = await treeDigestOfFiles(tree);
 
 		// The evaluator must NOT be able to write with its read token.
 		let scopeDenied = false;
@@ -822,7 +825,8 @@ export async function runSlice(opts: SliceOptions = {}): Promise<SliceResult> {
 	check(canonicalHeadBefore === baseline, "canonical head must still be the baseline");
 	const ip = await issuePermit(state, record.winner_sha as string, "canonical", canonicalHeadBefore as string, ctx);
 	state = ip.state;
-	const permit = ip.permit;
+	check(ip.outcome === "ISSUED" && ip.permit !== null, `a permit at the fork base must be ISSUED (got ${ip.outcome})`);
+	const permit = ip.permit!;
 	log(`permit issued: ${permit.permit_id}`);
 	log(`  binds task + baseline + winning tree + eval bundle + policy + expected destination head`);
 
@@ -833,23 +837,32 @@ export async function runSlice(opts: SliceOptions = {}): Promise<SliceResult> {
 	check(a1.outcome === "PROMOTED", `first attempt must PROMOTE (got ${a1.outcome})`);
 	log(`attemptPromotion #1 → ${a1.outcome}`);
 	let promotedSha = "";
+	let promotedParent = "";
 	for (const e of a1.effects) {
 		if (e.kind === "canonical_write") {
-			// The promotion service is the ONLY canonical writer (spec 3 §2).
-			// The write preserves the candidate commit BIT-FOR-BIT (same
-			// parents, tree, message → same SHA, as in real git): what was
+			// The promotion service is the ONLY canonical writer (spec 3 §2):
+			// the promotion container's procedure (container/promote.sh, run
+			// here over FakeArtifacts by src/harness/fake-container.ts)
+			// fast-forwards the canonical main from the permit-bound head to the
+			// reviewed commit itself. No commit is created, so what was
 			// reviewed at SHA X is what ships at SHA X. verifyBundle's
 			// "candidate digest" line checks exactly this — no substitution
 			// between review and ship (spec 3 §6 attack #7).
 			log(`  executing canonical_write effect via the promotion service (sole canonical writer)`);
-			log(`  promotion preserves the reviewed commit bit-for-bit (same parents/tree/message → same SHA, as in real git)`);
-			promotedSha = await fake.adminPush({
-				repo: "canonical",
-				ref: "main",
-				tree: candidateTrees["contender-1"],
-				message: candidateMessages["contender-1"],
-				parents: [canonicalHeadBefore as string],
+			const promoted = await fakePromote(fake, {
+				source: forkNames["contender-1"],
+				destination: e.repo,
+				candidate_sha: e.commit,
+				expected_head: e.base,
+				winning_tree_sha256: e.tree_sha256,
 			});
+			check(
+				promoted.status === 200 && promoted.body.outcome === "PROMOTED",
+				`the promotion container must promote (got ${promoted.status} ${promoted.body.outcome})`,
+			);
+			promotedSha = promoted.body.promoted_sha as string;
+			promotedParent = promoted.body.parent as string;
+			log(`  fast-forward ${short(e.base)} → ${short(promotedSha)} (base ${short(promoted.body.base as string)}, parent ${short(promotedParent)})`);
 			check(promotedSha === (record.winner_sha as string), "promoted commit must be the reviewed candidate commit (no substitution)");
 		}
 	}
@@ -872,7 +885,7 @@ export async function runSlice(opts: SliceOptions = {}): Promise<SliceResult> {
 	const winnerSha = record.winner_sha as string;
 	// The ship record is built and signed from the authority state by the same
 	// function the TaskAuthority runs at /promotion/finalize.
-	const recorded = await recordPromotionBundle(state, permit.permit_id, promotedSha, signer, ctx);
+	const recorded = await recordPromotionBundle(state, permit.permit_id, { commit: promotedSha, parent: promotedParent }, signer, ctx);
 	state = recorded.state;
 	const bundle = recorded.bundle;
 	log(`signed 4 DSSE envelopes (link → test result → verification result → promotion authority) with the harness authority key`);

@@ -328,20 +328,26 @@ export class FakeArtifacts implements ArtifactsPort, SimulatedGit {
 		parents?: string[],
 	): Promise<string> {
 		const resolvedParents = parents ?? (st.branches.has(ref) ? [st.branches.get(ref) as string] : []);
+		const hash = await this.putCommit(st, tree, message, resolvedParents);
+		st.branches.set(ref, hash);
+		st.lastPushAt = new Date(this.nowMs()).toISOString();
+		return hash;
+	}
+
+	/** Store a commit object; no ref moves. */
+	private async putCommit(
+		st: FakeRepoState,
+		tree: Record<string, string>,
+		message: string,
+		parents: string[],
+	): Promise<string> {
 		this.checkLimits(st, tree);
 		for (const content of Object.values(tree)) {
 			if (!st.blobBytes.has(content)) st.blobBytes.set(content, utf8Bytes(content));
 		}
 		const treeHash = await sha256Hex(canonicalJson(tree));
-		const hash = await sha256Hex(canonicalJson({ parents: resolvedParents, tree, message }));
-		st.commits.set(hash, {
-			parents: resolvedParents,
-			tree: { ...tree },
-			message,
-			treeHash,
-		});
-		st.branches.set(ref, hash);
-		st.lastPushAt = new Date(this.nowMs()).toISOString();
+		const hash = await sha256Hex(canonicalJson({ parents, tree, message }));
+		st.commits.set(hash, { parents: [...parents], tree: { ...tree }, message, treeHash });
 		return hash;
 	}
 
@@ -445,5 +451,69 @@ export class FakeArtifacts implements ArtifactsPort, SimulatedGit {
 		// from contenders). Size limits still enforced.
 		const st = this.requireRepo(args.repo);
 		return this.storeCommit(st, args.ref, args.tree, args.message, args.parents);
+	}
+
+	/* ------------- Promotion-container simulation ------------------- */
+	/* SIMULATION ONLY: the object-level git operations that             */
+	/* container/promote.sh and container/rebase.sh perform, for         */
+	/* src/harness/fake-container.ts. No token checks: in production the */
+	/* trusted container holds short-lived repo-scoped tokens.           */
+
+	/** A commit object stored in `repo`, or null. */
+	readCommitObject(repo: string, sha: string): { parents: string[]; tree: Record<string, string>; message: string } | null {
+		const c = this.requireRepo(repo).commits.get(sha);
+		return c ? { parents: [...c.parents], tree: { ...c.tree }, message: c.message } : null;
+	}
+
+	/** Store a commit object in `repo` without moving any ref (git commit-tree). */
+	async writeCommit(repo: string, commit: { parents: string[]; tree: Record<string, string>; message: string }): Promise<string> {
+		return this.putCommit(this.requireRepo(repo), commit.tree, commit.message, commit.parents);
+	}
+
+	/** True when `sha` is reachable from one of `repo`'s branches: what
+	 *  git upload-pack serves when asked for a commit by id. */
+	isReachable(repo: string, sha: string): boolean {
+		const st = this.requireRepo(repo);
+		const seen = new Set<string>();
+		const stack = [...st.branches.values()];
+		while (stack.length > 0) {
+			const cur = stack.pop() as string;
+			if (cur === sha) return true;
+			if (seen.has(cur)) continue;
+			seen.add(cur);
+			stack.push(...(st.commits.get(cur)?.parents ?? []));
+		}
+		return false;
+	}
+
+	/** Copy `sha` and every commit it reaches from `from` into `to` (the
+	 *  object transfer of a fetch or push). False when `from` lacks `sha`. */
+	importHistory(from: string, to: string, sha: string): boolean {
+		const src = this.requireRepo(from);
+		const dst = this.requireRepo(to);
+		if (!src.commits.has(sha)) return false;
+		const stack = [sha];
+		while (stack.length > 0) {
+			const cur = stack.pop() as string;
+			if (dst.commits.has(cur)) continue;
+			const c = src.commits.get(cur);
+			if (!c) continue;
+			dst.commits.set(cur, { ...c, parents: [...c.parents], tree: { ...c.tree } });
+			for (const content of Object.values(c.tree)) {
+				if (!dst.blobBytes.has(content)) dst.blobBytes.set(content, utf8Bytes(content));
+			}
+			stack.push(...c.parents);
+		}
+		return true;
+	}
+
+	/** Point `ref` at `next` iff it currently is `expected` (null: absent):
+	 *  the atomic ref update a push performs. `next` must be stored in `repo`. */
+	casRef(repo: string, ref: string, expected: string | null, next: string): boolean {
+		const st = this.requireRepo(repo);
+		if ((st.branches.get(ref) ?? null) !== expected || !st.commits.has(next)) return false;
+		st.branches.set(ref, next);
+		st.lastPushAt = new Date(this.nowMs()).toISOString();
+		return true;
 	}
 }

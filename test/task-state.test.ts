@@ -75,6 +75,7 @@ function makeContender(): ContenderRecord {
 		agent_id: "agent-1",
 		fork_repo: "fork-1",
 		fork_lineage: { parent_repo: "acme/api", parent_commit: BASELINE },
+		fork_base: BASELINE,
 		token_id: "tok-1",
 		status: "forked",
 		claim_work_id: null,
@@ -409,17 +410,19 @@ describe("permit + promotion", () => {
 		const ctx = makeCtx();
 		const bundle = await makeBundle();
 		let state = await authorityWithAccept(ctx, bundle);
-		const { state: s2, permit } = await issuePermit(state, "csha1", "acme/api", "dest-head-1", ctx);
+		const { state: s2, permit } = await issuePermit(state, "csha1", "acme/api", BASELINE, ctx);
+		assert.ok(permit);
 		assert.equal(permit.consumed, false);
 
-		const r1 = await attemptPromotion(s2, permit.permit_id, "dest-head-1", "tree1", ctx);
+		const r1 = await attemptPromotion(s2, permit.permit_id, BASELINE, "tree1", ctx);
 		assert.equal(r1.outcome, "PROMOTED");
 		assert.equal(r1.state.task_status, "promoted");
+		// Fast-forward the destination from the permit-bound head to the candidate.
 		assert.deepEqual(r1.effects, [
-			{ kind: "canonical_write", repo: "acme/api", tree_sha256: "tree1", parent: "dest-head-1" },
+			{ kind: "canonical_write", repo: "acme/api", commit: "csha1", tree_sha256: "tree1", base: BASELINE },
 		]);
 
-		const r2 = await attemptPromotion(r1.state, permit.permit_id, "dest-head-1", "tree1", ctx);
+		const r2 = await attemptPromotion(r1.state, permit.permit_id, BASELINE, "tree1", ctx);
 		assert.equal(r2.outcome, "ALREADY_CONSUMED");
 		assert.equal(r2.effects.length, 0);
 	});
@@ -435,7 +438,8 @@ describe("permit + promotion", () => {
 		const ctx = makeCtx();
 		const bundle = await makeBundle();
 		let state = await authorityWithAccept(ctx, bundle);
-		const issued = await issuePermit(state, "csha1", "acme/api", "dest-head-1", ctx);
+		const issued = await issuePermit(state, "csha1", "acme/api", BASELINE, ctx);
+		assert.ok(issued.permit);
 		const r = await attemptPromotion(issued.state, issued.permit.permit_id, "dest-head-2", "tree1", ctx);
 		assert.equal(r.outcome, "EXPIRED_HEAD_MOVED");
 		assert.equal(r.state.permits[issued.permit.permit_id].consumed, false);
@@ -445,8 +449,9 @@ describe("permit + promotion", () => {
 		const ctx = makeCtx();
 		const bundle = await makeBundle();
 		let state = await authorityWithAccept(ctx, bundle);
-		const issued = await issuePermit(state, "csha1", "acme/api", "dest-head-1", ctx);
-		const r = await attemptPromotion(issued.state, issued.permit.permit_id, "dest-head-1", "other-tree", ctx);
+		const issued = await issuePermit(state, "csha1", "acme/api", BASELINE, ctx);
+		assert.ok(issued.permit);
+		const r = await attemptPromotion(issued.state, issued.permit.permit_id, BASELINE, "other-tree", ctx);
 		assert.equal(r.outcome, "TREE_MISMATCH");
 		assert.equal(r.state.permits[issued.permit.permit_id].consumed, false);
 	});
@@ -455,9 +460,10 @@ describe("permit + promotion", () => {
 		const ctx = makeCtx();
 		const bundle = await makeBundle();
 		let state = await authorityWithAccept(ctx, bundle);
-		const issued = await issuePermit(state, "csha1", "acme/api", "dest-head-1", ctx);
+		const issued = await issuePermit(state, "csha1", "acme/api", BASELINE, ctx);
+		assert.ok(issued.permit);
 		const q = await quarantineContender(issued.state, "contender-1", "candidate_sha_substitution", "ev-hash", ctx);
-		const r = await attemptPromotion(q.state, issued.permit.permit_id, "dest-head-1", "tree1", ctx);
+		const r = await attemptPromotion(q.state, issued.permit.permit_id, BASELINE, "tree1", ctx);
 		assert.equal(r.outcome, "QUARANTINED_CANDIDATE");
 		assert.equal(r.state.permits[issued.permit.permit_id].consumed, false);
 	});
@@ -624,7 +630,7 @@ describe("escalation", () => {
 		state = esc.state;
 		assert.equal(state.task_status, "escalated");
 		await assert.rejects(
-			issuePermit(state, "csha1", "acme/api", "dest-head-1", ctx),
+			issuePermit(state, "csha1", "acme/api", BASELINE, ctx),
 			/BLOCKED/,
 		);
 	});

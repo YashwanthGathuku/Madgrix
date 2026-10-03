@@ -81,6 +81,12 @@ Sigstore signing remains future hardening (spec 4 §6).
 | Evaluation-domain auth on `/evidence` | ⚠️ TODO in code | Currently accepts + records; production must authenticate the evaluation domain (spec 3 §2) before recording |
 | `cf deploy` to the account | ❌ not attempted | Per hard rules: no deploy from this machine without explicit instruction; first deploy belongs on a direct-egress machine |
 
+Update 2026-10-03 (`specs/amendments/rebase-ancestry-v1.md`): the "Merge sandbox" row
+above is out of date. The canonical write is `container/promote.sh`, a fast-forward to
+the reviewed commit, and a moved destination is handled by `container/rebase.sh`; the
+promotion container (`src/do/PromotionContainer.ts`) runs both. They have been run only
+against local git repositories (`test/promotion-fixtures.test.ts`), never on Cloudflare.
+
 Boot transcript (remote-free instance, `CLOUDFLARE_VITE_FORCE_LOCAL=true`,
 all bindings local; full log in `docs/dev-boot-local-20261001.log`):
 

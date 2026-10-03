@@ -343,7 +343,16 @@ async function mockSignedBundle(taskId: string, p: MockPromotion, promotedSha: s
 		{ permit_id: p.permit.permit_id, tree_sha256: p.permit.winning_tree_sha256 },
 		ctx,
 	);
-	return (await recordPromotionBundle(state, p.permit.permit_id, promotedSha, fx.authority, ctx)).bundle;
+	// The candidate is one commit above the baseline, the permit-bound head.
+	return (
+		await recordPromotionBundle(
+			state,
+			p.permit.permit_id,
+			{ commit: promotedSha, parent: p.permit.expected_destination_head },
+			fx.authority,
+			ctx,
+		)
+	).bundle;
 }
 
 async function startMock(): Promise<Mock> {
@@ -464,6 +473,7 @@ async function startMock(): Promise<Mock> {
 						latest_commit: head(c),
 						agent_id: c.agentId,
 						fork_lineage: { parent_repo: "madgrix/env-isolation", parent_commit: fx.baselineSha },
+						evaluation_bases: [fx.baselineSha],
 					});
 				}
 				case "POST verdict": {

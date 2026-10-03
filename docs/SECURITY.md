@@ -196,6 +196,46 @@ next to the baseline and hidden tests and can read or rewrite them while the sui
 runs (white-box caveat below). The tool log is the agent's own statement. The
 evaluator checks its form and binding, not that the listed actions happened.
 
+## A moved destination: rebase, never re-permit
+
+The amendment is `specs/amendments/rebase-ancestry-v1.md`.
+
+- **Promotion is a fast-forward.** `container/promote.sh` moves the canonical branch
+  to the reviewed commit itself, and only if the permit-bound head is that commit's
+  ancestor (exit 47 otherwise). Nothing is rebuilt, so the shipped SHA is the
+  reviewed SHA.
+- **A permit binds only a head the candidate descends from.** The task authority
+  issues a permit only at the contender's fork base (the task baseline) or at a head
+  a recorded rebase put under that exact SHA. Any other head is `REBASE_REQUIRED`:
+  no permit, and the refusal is ledgered. Re-evaluating the same SHA does not change
+  this, so the same commit cannot be re-promoted after the destination moved.
+- **A rebase makes a new candidate.** `POST /tasks/:id/rebase` (control plane) runs
+  `container/rebase.sh`. It replays the contender's latest commit onto the current
+  destination head and pushes the result to the contender's fork with a five-minute
+  fork-scoped write token, as a compare-and-swap on the candidate SHA. The
+  destination gets only a read token. The authority records the new SHA as the
+  contender's candidate; it has no evidence until the evaluation domain evaluates
+  it, against the head it now sits on (`evaluation_base`), so the head's own changes
+  are not counted as the contender's.
+- **The candidate cannot choose how conflicts merge.** `rebase.sh` reads git
+  attributes from the empty tree, so a candidate's own `.gitattributes`
+  (`merge=union`, say) cannot turn a conflict into a silent merge. A conflict
+  escalates the task to the operator-of-record; the conflicting paths, which the
+  contender chose, are kept as structured data, never in the escalation's text.
+- **Terminal refusals stay terminal.** Every refusal of `promote.sh` and
+  `rebase.sh` (head moved, tree or baseline mismatch, refused push, unsupported tree
+  entry, conflict) is a 409 that the PromotionWorkflow does not retry; only git
+  failures (502) are retried. The permit stays unconsumed.
+
+`test/promotion-fixtures.test.ts` runs both scripts against real git repositories on
+a shared fixture table (`test/fixtures/promotion-cases.json`) and checks that the
+TypeScript model the harnesses use agrees on every case.
+
+What this does **not** do: the authority has no git. It trusts the evaluation
+domain's `exact_baseline` gate for the fork base and the promotion container's report
+for a rebase; `promote.sh` re-checks real ancestry before any write. The scripts have
+run only against local repositories, never against Cloudflare Artifacts.
+
 ## The honest sandbox constraint
 
 One sandbox is not an adversarial boundary: processes inside it share the filesystem

@@ -97,7 +97,7 @@ are NOT edited.
    chain integrity....... OK
    hidden evaluation..... PASSED
    policy digest......... OK
-   destination parent.... OK
+   destination parent.... OK          # renamed "destination base" by rebase-ancestry-v1.md
    authority key......... PINNED                        # embedded key equals the pinned key
    signature............. VALID                         # every envelope verifies under the pinned key
    permit id............. RECOMPUTED FROM BOUND FIELDS  # the §4 rule; replaces CONSUMED ONCE

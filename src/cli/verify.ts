@@ -87,14 +87,15 @@ export async function verifyWithTrustedKey(
 	return verifyBundle(bundle, signer, { policyHash, trustedKeyDerHex });
 }
 
-/** The transcript lines, in order (spec 4 §7 as amended by authority-signing-v1). */
+/** The transcript lines, in order (spec 4 §7 as amended by authority-signing-v1
+ *  and rebase-ancestry-v1, which renames "destination parent" to "destination base"). */
 const TRANSCRIPT_LABELS = [
 	"subject digest",
 	"candidate digest",
 	"chain integrity",
 	"hidden evaluation",
 	"policy digest",
-	"destination parent",
+	"destination base",
 	"authority key",
 	"signature",
 	"permit id",

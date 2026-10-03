@@ -52,7 +52,7 @@ const fx = {} as {
 	baselineSha: string;
 	url: string;
 	server: Server;
-	contenders: Map<string, { bare: string; scope: string[]; agent: string }>;
+	contenders: Map<string, { bare: string; scope: string[]; agent: string; bases?: string[] }>;
 	/** Requests the mock Worker received. */
 	requests: number;
 };
@@ -123,6 +123,37 @@ async function makeCandidate(
 	git(work, "push", "--quiet", "origin", "HEAD:refs/heads/main");
 	fx.contenders.set(contenderId, { bare, scope, agent });
 	return { contenderId, sha: git(work, "rev-parse", "HEAD") };
+}
+
+/**
+ * A contender fork whose candidate was rebased onto a moved destination
+ * head: the baseline, then the head's commit (`headChanges`), then the
+ * candidate's commit (`changes`). With `recorded`, the mock authority lists
+ * the head among the contender's evaluation bases, as it does after
+ * recording the rebase (specs/amendments/rebase-ancestry-v1.md).
+ */
+async function makeRebasedCandidate(
+	contenderId: string,
+	headChanges: Record<string, string | null>,
+	changes: Record<string, string | null>,
+	scope: string[],
+	recorded: boolean,
+): Promise<{ contenderId: string; sha: string; head: string }> {
+	const agent = `agent-${contenderId}`;
+	const bare = path.join(fx.root, "forks", `${contenderId}.git`);
+	git(fx.root, "clone", "--quiet", "--bare", fx.seed, bare);
+	const work = path.join(fx.root, "work", contenderId);
+	git(fx.root, "clone", "--quiet", bare, work);
+	await writeFiles(work, headChanges);
+	git(work, "add", "-A");
+	git(work, "commit", "--quiet", "-m", "destination: a change merged after the baseline");
+	const head = git(work, "rev-parse", "HEAD");
+	await writeFiles(work, changes);
+	git(work, "add", "-A");
+	git(work, "commit", "--quiet", "-m", `candidate ${contenderId}, rebased`);
+	git(work, "push", "--quiet", "origin", "HEAD:refs/heads/main");
+	fx.contenders.set(contenderId, { bare, scope, agent, bases: recorded ? [fx.baselineSha, head] : undefined });
+	return { contenderId, sha: git(work, "rev-parse", "HEAD"), head };
 }
 
 interface Evaluation {
@@ -209,6 +240,7 @@ async function startMock(): Promise<Server> {
 				latest_commit: git(c.bare, "rev-parse", "refs/heads/main"),
 				agent_id: c.agent,
 				fork_lineage: { parent_repo: "madgrix/sum", parent_commit: fx.baselineSha },
+				...(c.bases ? { evaluation_bases: c.bases } : {}),
 			});
 		}
 		if (req.method === "POST" && pathname === `/tasks/${TASK_ID}/evidence`) return send(200, { recorded: true });
@@ -338,6 +370,59 @@ describe("evaluate-candidate.ts: tool-status log gates", () => {
 		assert.equal(result.bundle.admission.exact_baseline, true);
 		assert.equal(result.bundle.admission.scope_compliance, true);
 		assert.equal(result.bundle.admission.no_eval_tampering, true);
+	});
+});
+
+describe("evaluate-candidate.ts: a rebased candidate is compared with the head it was rebased onto", () => {
+	/** The moved head: a new test file, and package.json's test script runs it too. */
+	const headChanges = (marker: string): Record<string, string> => ({
+		"package.json":
+			JSON.stringify({ ...BASELINE_PACKAGE, scripts: { test: "node test/sum.test.js && node test/sum.extra.test.js" } }, null, 2) + "\n",
+		"test/sum.extra.test.js":
+			`require("node:fs").writeFileSync(${JSON.stringify(marker)}, "ran");\n` +
+			'const assert = require("node:assert");\nconst { sum } = require("../src/sum.js");\nassert.strictEqual(sum(1, 1), 2);\n',
+	});
+
+	it("with the rebase head recorded: only the candidate's own change counts, and the head's runner configuration runs", async () => {
+		const id = "rebased";
+		const marker = path.join(fx.root, "rebased-head-test.ran");
+		const candidate = await makeRebasedCandidate(
+			id,
+			headChanges(marker),
+			{ "src/sum.js": FIXED_SUM, ".madgrix/tool-status.jsonl": toolLog(id, `agent-${id}`) },
+			["src/**"],
+			true,
+		);
+		const { code, stderr, result } = await evaluate(candidate);
+		assert.equal(code, 0, `evaluate-candidate failed:\n${stderr}`);
+		assert.equal(result.bundle.evaluation_base, candidate.head, "the newest known base the candidate descends from");
+		assert.deepEqual(result.bundle.admission, {
+			exact_baseline: true,
+			scope_compliance: true,
+			valid_tool_states: true,
+			no_eval_tampering: true,
+			provenance_complete: true,
+		});
+		assert.deepEqual(result.bundle.eval_file_changes, [], "the head's test and package.json changes are not the candidate's");
+		assert.ok(!result.changed_files.includes("package.json") && !result.changed_files.includes("test/sum.extra.test.js"));
+		assert.ok(result.changed_files.includes("src/sum.js"));
+		assert.equal(result.bundle.hidden_oracle.passed, true);
+		assert.equal(await readFile(marker, "utf8"), "ran", "the head's package.json and test file ran");
+	});
+
+	it("compared with the baseline instead, the head's changes look like the candidate tampering (why the base matters)", async () => {
+		const id = "rebased-unrecorded";
+		const candidate = await makeRebasedCandidate(
+			id,
+			headChanges(path.join(fx.root, "unrecorded-head-test.ran")),
+			{ "src/sum.js": FIXED_SUM, ".madgrix/tool-status.jsonl": toolLog(id, `agent-${id}`) },
+			["src/**"],
+			false,
+		);
+		const { code, stderr, result } = await evaluate(candidate);
+		assert.equal(code, 0, `evaluate-candidate failed:\n${stderr}`);
+		assert.equal(result.bundle.admission.no_eval_tampering, false);
+		assert.deepEqual(result.bundle.eval_file_changes, ["package.json", "test/sum.extra.test.js"]);
 	});
 });
 

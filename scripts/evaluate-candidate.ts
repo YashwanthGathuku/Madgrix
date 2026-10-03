@@ -30,10 +30,19 @@
  *
  * Run directory (specs/amendments/evidence-integrity-v1.md): every command
  * runs in a fresh directory outside the candidate checkout that holds the
- * BASELINE's runner configuration and test material, the candidate's other
+ * BASE's runner configuration and test material, the candidate's other
  * files, and the hidden tests. A candidate change to runner configuration,
  * to a path matched by a test glob, or to a path outside its claim scope
  * fails no_eval_tampering.
+ *
+ * Base (specs/amendments/rebase-ancestry-v1.md): the task baseline, unless
+ * the candidate was rebased onto a later destination head. The authority
+ * lists the contender's known bases (`evaluation_bases`: the fork base, then
+ * every recorded rebase head); the base is the newest of them the candidate
+ * descends from, and the bundle names it (`evaluation_base`). The candidate's
+ * changes are counted against that base, so a destination head's own changes
+ * are never attributed to the contender. exact_baseline and the tool-status
+ * log still bind the task baseline.
  *
  * Configuration digest (specs/amendments/evaluation-config-digest-v1.md):
  * before any candidate is fetched, the commands, test globs, a digest of the
@@ -351,11 +360,28 @@ try {
 	const baselineAvailable = await gitSucceeds(["cat-file", "-e", `${baselineCommit}^{commit}`], dir);
 	const descendsFromBaseline =
 		baselineAvailable && (await gitSucceeds(["merge-base", "--is-ancestor", baselineCommit, candidateSha], dir));
+	// The newest known base the candidate descends from (rebase-ancestry-v1);
+	// the task baseline when the authority lists none.
+	const knownBases: string[] =
+		Array.isArray(creds.evaluation_bases) && creds.evaluation_bases.every((b: unknown) => typeof b === "string" && /^[0-9a-f]{7,64}$/i.test(b))
+			? creds.evaluation_bases
+			: [baselineCommit];
+	let evaluationBase = baselineCommit;
+	for (const base of [...knownBases].reverse()) {
+		if (
+			(await gitSucceeds(["cat-file", "-e", `${base}^{commit}`], dir)) &&
+			(await gitSucceeds(["merge-base", "--is-ancestor", base, candidateSha], dir))
+		) {
+			evaluationBase = base;
+			break;
+		}
+	}
+	const baseAvailable = evaluationBase === baselineCommit ? baselineAvailable : true;
 	// Everything read from the clone is read before any candidate code runs.
 	const tree_sha256 = await treeDigestV1(dir, candidateSha);
 	const candidateTree = await lsTree(dir, candidateSha);
-	const baselineTree = baselineAvailable ? await lsTree(dir, baselineCommit) : [];
-	const changed = changedPaths(baselineTree, candidateTree);
+	const baseTree = baseAvailable ? await lsTree(dir, evaluationBase) : [];
+	const changed = changedPaths(baseTree, candidateTree);
 	const toolStatus = checkToolStatusLog(await readToolStatusLog(dir, candidateTree), {
 		task_id: taskId,
 		contender_id: contenderId,
@@ -373,14 +399,14 @@ try {
 		forkLineage: creds.fork_lineage,
 	});
 
-	// Without the baseline there is no runner configuration or test material
+	// Without the base there is no runner configuration or test material
 	// to run the candidate against: nothing runs and every suite fails.
-	const notRun = { passed: false, detail: `not run: baseline commit ${baselineCommit} is unavailable` };
-	const run = (command: string) => (baselineAvailable ? exitCode(command, runDir) : Promise.resolve(notRun));
+	const notRun = { passed: false, detail: `not run: base commit ${evaluationBase} is unavailable` };
+	const run = (command: string) => (baseAvailable ? exitCode(command, runDir) : Promise.resolve(notRun));
 	const optional = (command: string | undefined) =>
 		command ? run(command) : Promise.resolve({ passed: true, detail: "" });
-	if (baselineAvailable) {
-		const files = composeRunTree(baselineTree, candidateTree, testGlobs, await hiddenTestPaths());
+	if (baseAvailable) {
+		const files = composeRunTree(baseTree, candidateTree, testGlobs, await hiddenTestPaths());
 		await materialize(dir, runDir, files);
 	}
 	const [hidden, regressions, semantic, staticCheck, security] = await Promise.all([
@@ -412,6 +438,8 @@ try {
 		evaluated_at,
 		tainted: false,
 		evaluation_config_sha256: evaluationConfigSha256,
+		// The commit the candidate's changes and the run's configuration came from.
+		evaluation_base: evaluationBase,
 		// Non-empty: the authority quarantines the contender (tamper-quarantine-v1).
 		eval_file_changes: gates.evalFileChanges,
 	};

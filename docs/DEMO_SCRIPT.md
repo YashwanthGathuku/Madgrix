@@ -76,7 +76,7 @@ candidate digest...... OK
 chain integrity....... OK
 hidden evaluation..... PASSED
 policy digest......... OK
-destination parent.... OK
+destination base...... OK
 authority key......... PINNED
 signature............. VALID
 permit id............. RECOMPUTED FROM BOUND FIELDS

@@ -49,10 +49,13 @@ import type {
 	CallerIdentity,
 	ConflictReport,
 	ContenderRecord,
+	EscalationRecord,
 	EvaluationBundle,
 	LedgerEntry,
 	PermitRecord,
 	PromotionOutcome,
+	RebaseConflictData,
+	RebaseRecord,
 	QueuePushEvent,
 	QuarantineRecord,
 	QuarantineTrigger,
@@ -92,7 +95,9 @@ export type Effect =
 	| { kind: "revoke_token"; repo: string; token_id: string }
 	| { kind: "cancel_workflow"; contender_id: string }
 	| { kind: "notify"; to: string[]; message: string }
-	| { kind: "canonical_write"; repo: string; tree_sha256: string; parent: string };
+	/** Fast-forward `repo`'s main from `base` to `commit` (the reviewed
+	 *  candidate, unchanged). Only the promotion service performs it. */
+	| { kind: "canonical_write"; repo: string; commit: string; tree_sha256: string; base: string };
 
 /**
  * Append a content-hashed ledger entry linked to the previous one
@@ -500,7 +505,8 @@ export function contenderTokenIds(contender: ContenderRecord): string[] {
  * (`created: false`) and the state is untouched, so a retry, a race or
  * another agent's request can never replace the bound agent, fork or token
  * ids. The caller must revoke any token it minted for a registration that
- * was not recorded.
+ * was not recorded. A new record's fork_base must be the task's baseline
+ * commit (specs/amendments/rebase-ancestry-v1.md).
  */
 export async function registerContender(
 	state: AuthorityState,
@@ -509,6 +515,12 @@ export async function registerContender(
 ): Promise<{ state: AuthorityState; record: ContenderRecord; created: boolean }> {
 	const existing = state.contenders[contender.contender_id];
 	if (existing) return { state, record: existing, created: false };
+	// A permit may bind the fork base as the destination head
+	// (rebase-ancestry-v1), so it must be the commit every fork starts at.
+	if (contender.fork_base !== state.task.baseline_commit)
+		throw new Error(
+			`registerContender: fork_base ${JSON.stringify(contender.fork_base)} is not the task's baseline commit ${state.task.baseline_commit}`,
+		);
 	const s2 = await appendLedger(
 		{ ...state, contenders: { ...state.contenders, [contender.contender_id]: contender } },
 		"contender_registered",
@@ -516,6 +528,7 @@ export async function registerContender(
 			contender_id: contender.contender_id,
 			agent_id: contender.agent_id,
 			fork_repo: contender.fork_repo,
+			fork_base: contender.fork_base,
 			token_ids: contenderTokenIds(contender),
 		},
 		ctx,
@@ -551,7 +564,8 @@ export type SubmitEvaluationOutcome = "RECORDED" | "ACK_DUP" | "REPLACEMENT_REJE
  * a known contender, and its candidate_sha must be that contender's
  * latest_commit — the newest push the authority observed. Anything else
  * throws: evidence for a commit the contender has moved past, or never
- * pushed, is not evidence about its candidate.
+ * pushed, is not evidence about its candidate. An evaluation_base, when
+ * present, must be one of the contender's known bases (rebase-ancestry-v1).
  *
  * Idempotency: re-submitting the identical bundle (same candidate_sha +
  * bundle_hash, e.g. an evaluation-domain retry) is an ACK_DUP — no state
@@ -621,6 +635,11 @@ export async function submitEvaluation(
 		throw new Error(
 			`evaluation rejected: candidate ${bundle.candidate_sha} is not the latest observed commit of ` +
 				`${bundle.contender_id} (${contender.latest_commit ?? "no push observed"})`,
+		);
+	if (bundle.evaluation_base !== undefined && !evaluationBases(contender).includes(bundle.evaluation_base))
+		throw new Error(
+			`evaluation rejected: evaluation_base ${JSON.stringify(bundle.evaluation_base)} is neither ` +
+				`${bundle.contender_id}'s fork base nor a recorded rebase head`,
 		);
 	const existing = state.evaluations[bundle.candidate_sha];
 	if (existing && existing.bundle_hash === bundle.bundle_hash) {
@@ -982,11 +1001,57 @@ export async function runVerdictSeam(
 /* ------------------------------------------------------------------ */
 
 /**
+ * The destination heads a permit for `candidate_sha` may bind
+ * (specs/amendments/rebase-ancestry-v1.md): the contender's fork base, which
+ * every candidate on its fork descends from, then each head a recorded
+ * rebase put under that SHA. promote.sh fast-forwards the destination to
+ * the candidate, so any other head is one it cannot promote from.
+ */
+export function permitBases(contender: ContenderRecord, candidate_sha: string): string[] {
+	const bases: string[] = typeof contender.fork_base === "string" && contender.fork_base !== "" ? [contender.fork_base] : [];
+	for (const r of contender.rebases ?? []) {
+		if (r.new_sha === candidate_sha && !bases.includes(r.onto)) bases.push(r.onto);
+	}
+	return bases;
+}
+
+/**
+ * Every base the contender's work is known to sit on, oldest first: the
+ * fork base, then each recorded rebase head. The evaluator compares a
+ * candidate with the newest of these it descends from
+ * (specs/amendments/rebase-ancestry-v1.md).
+ */
+export function evaluationBases(contender: ContenderRecord): string[] {
+	const bases: string[] = typeof contender.fork_base === "string" && contender.fork_base !== "" ? [contender.fork_base] : [];
+	for (const r of contender.rebases ?? []) if (!bases.includes(r.onto)) bases.push(r.onto);
+	return bases;
+}
+
+export type IssuePermitResult =
+	| { state: AuthorityState; outcome: "ISSUED"; permit: PermitRecord }
+	| {
+			state: AuthorityState;
+			outcome: "REBASE_REQUIRED";
+			permit: null;
+			contender_id: string;
+			/** The heads a permit for this candidate could bind. */
+			bases: string[];
+	  };
+
+/**
  * Issue the exact-state, single-use permit for an ACCEPT verdict
  * (spec 1 §10). Requires the LATEST verdict record to be ACCEPT with
  * winner_sha. Throws if the task is escalated — promotion is BLOCKED
  * while escalated (spec 1 §9.4); the operator must create a new
  * policy/task state and re-evaluate, never override.
+ *
+ * Ancestry (specs/amendments/rebase-ancestry-v1.md): the destination head
+ * must be one the candidate is known to descend from — the contender's
+ * fork base, or a head a recorded rebase put under this SHA. Any other
+ * head is REBASE_REQUIRED: no permit is stored, the refusal is ledgered
+ * (`permit_refused`), and the caller rebases the candidate onto the head
+ * (container/rebase.sh), which yields a new SHA that must be evaluated
+ * again before it can get a permit.
  */
 export async function issuePermit(
 	state: AuthorityState,
@@ -994,7 +1059,7 @@ export async function issuePermit(
 	destination_repo: string,
 	destination_head: string,
 	ctx: Ctx,
-): Promise<{ state: AuthorityState; permit: PermitRecord }> {
+): Promise<IssuePermitResult> {
 	const latest = state.verdicts[state.verdicts.length - 1];
 	if (!latest || latest.state !== "ACCEPT" || latest.winner_sha !== winner_sha)
 		throw new Error(
@@ -1004,6 +1069,25 @@ export async function issuePermit(
 		throw new Error("issuePermit: promotion BLOCKED — task is escalated (spec 1 §9.4)");
 	const ev = state.evaluations[winner_sha];
 	if (!ev) throw new Error(`issuePermit: no evaluation bundle for winner ${winner_sha}`);
+	const contender = Object.hasOwn(state.contenders, ev.contender_id) ? state.contenders[ev.contender_id] : undefined;
+	if (!contender) throw new Error(`issuePermit: the winner's contender ${ev.contender_id} is unknown`);
+	const bases = permitBases(contender, winner_sha);
+	if (!bases.includes(destination_head)) {
+		const refused = await appendLedger(
+			state,
+			"permit_refused",
+			{
+				outcome: "REBASE_REQUIRED",
+				winner_sha,
+				contender_id: ev.contender_id,
+				destination_repo,
+				destination_head,
+				bases,
+			},
+			ctx,
+		);
+		return { state: refused, outcome: "REBASE_REQUIRED", permit: null, contender_id: ev.contender_id, bases };
+	}
 	// Idempotent issuance: the permit_id is deterministic over the bound
 	// fields (spec 5 §5: promote = permit_id is the idempotent operation
 	// id), so a retry of the issue step converges to the SAME record.
@@ -1024,7 +1108,7 @@ export async function issuePermit(
 		ctx.sha256Hex,
 	);
 	const existing = state.permits[permitId];
-	if (existing) return { state, permit: existing };
+	if (existing) return { state, outcome: "ISSUED", permit: existing };
 	const permit = await createPermit(
 		{
 			task_hash: state.task.task_hash,
@@ -1044,7 +1128,7 @@ export async function issuePermit(
 		permits: { ...state.permits, [permit.permit_id]: permit },
 	};
 	const s3 = await appendLedger(s2, "permit_issued", { permit_id: permit.permit_id, winner_sha }, ctx);
-	return { state: s3, permit };
+	return { state: s3, outcome: "ISSUED", permit };
 }
 
 /**
@@ -1060,7 +1144,8 @@ export async function issuePermit(
  * permit NOT consumed, so a legitimate retry after re-evaluation remains
  * possible.
  * On success: permit consumed (+consumed_at), task promoted, and the
- * single canonical_write effect for the platform layer to execute.
+ * single canonical_write effect: fast-forward the destination from the
+ * permit-bound head (`base`) to the reviewed candidate commit.
  */
 export async function attemptPromotion(
 	state: AuthorityState,
@@ -1117,8 +1202,9 @@ export async function attemptPromotion(
 			{
 				kind: "canonical_write",
 				repo: permit.destination_repo,
+				commit: permit.winner_candidate_sha,
 				tree_sha256,
-				parent: permit.expected_destination_head,
+				base: permit.expected_destination_head,
 			},
 		],
 	};
@@ -1134,17 +1220,29 @@ export async function attemptPromotion(
  * the ledger the bundle ships with. The bundle is stored under the permit
  * id; it adds no ledger entry of its own, so its head stays the ledger's
  * head at promotion. Throws if the permit is not consumed or its evidence
- * is missing.
+ * is missing, or if the promoted commit is not the permit's candidate:
+ * promotion fast-forwards to the reviewed commit itself.
+ *
+ * The ship record's `base` is the permit-bound destination head; its
+ * `parent` is the promoted commit's own first parent as git reported it
+ * (promote.sh's PARENT; "" for a root commit). The two differ whenever the
+ * candidate is more than one commit above the base
+ * (specs/amendments/rebase-ancestry-v1.md).
  */
 export async function recordPromotionBundle(
 	state: AuthorityState,
 	permit_id: string,
-	promoted_sha: string,
+	promoted: { commit: string; parent: string },
 	signer: Signer & { publicKeyDerHex: string },
 	ctx: Ctx,
 ): Promise<{ state: AuthorityState; bundle: PromotionBundle }> {
 	const permit = state.permits[permit_id];
 	if (!permit?.consumed) throw new Error(`promotion bundle: permit ${permit_id} is not consumed`);
+	if (promoted.commit !== permit.winner_candidate_sha)
+		throw new Error(
+			`promotion bundle: the promoted commit ${promoted.commit} is not permit ${permit_id}'s candidate ${permit.winner_candidate_sha}`,
+		);
+	if (typeof promoted.parent !== "string") throw new Error("promotion bundle: the promoted commit's parent is missing");
 	const evaluation = state.evaluations[permit.winner_candidate_sha];
 	if (!evaluation || evaluation.bundle_hash !== permit.evaluation_bundle_hash) {
 		throw new Error(`promotion bundle: permit ${permit_id}'s evaluation bundle is not stored`);
@@ -1186,7 +1284,7 @@ export async function recordPromotionBundle(
 			verificationResult: verification,
 			policySha256: permit.selector_policy_hash,
 			destinationRepo: permit.destination_repo,
-			expectedParent: permit.expected_destination_head,
+			destinationBase: permit.expected_destination_head,
 			nonce: permit.nonce,
 			permitId: permit.permit_id,
 			issuedAt: permit.issued_at,
@@ -1196,13 +1294,14 @@ export async function recordPromotionBundle(
 	const envelopes = [];
 	for (const statement of statements) envelopes.push(await signEnvelope(statement, signer));
 	const bundle: PromotionBundle = {
-		version: 2,
+		version: 3,
 		statements: envelopes,
 		ship: {
 			repo: permit.destination_repo,
-			commit: promoted_sha,
+			commit: promoted.commit,
 			tree_sha256: tree,
-			parent: permit.expected_destination_head,
+			base: permit.expected_destination_head,
+			parent: promoted.parent,
 			permit_id,
 		},
 		ledger: { head_sha256: head, entries: ledger },
@@ -1430,12 +1529,131 @@ export async function escalateToOperator(
 	state: AuthorityState,
 	reason: string,
 	ctx: Ctx,
+	data?: RebaseConflictData,
 ): Promise<{ state: AuthorityState }> {
+	const escalation: EscalationRecord = { reason, at: ctx.now(), resolved: false, ...(data === undefined ? {} : { data }) };
 	const s2: AuthorityState = {
 		...state,
 		task_status: "escalated",
-		escalations: [...state.escalations, { reason, at: ctx.now(), resolved: false }],
+		escalations: [...state.escalations, escalation],
 	};
-	const s3 = await appendLedger(s2, "escalated", { reason }, ctx);
+	const s3 = await appendLedger(s2, "escalated", data === undefined ? { reason } : { reason, data }, ctx);
 	return { state: s3 };
+}
+
+/* ------------------------------------------------------------------ */
+/* Rebase reports (specs/amendments/rebase-ancestry-v1.md)              */
+/* ------------------------------------------------------------------ */
+
+/** What container/rebase.sh reported, as the Worker forwards it. */
+export interface RebaseReport {
+	contender_id: string;
+	outcome: "REBASED" | "UP_TO_DATE" | "CONFLICT";
+	/** The candidate the rebase service was asked to rebase. */
+	from_sha: string;
+	/** The destination head it rebased onto. */
+	onto: string;
+	/** REBASED only: the commit pushed to the contender's fork. */
+	new_sha?: string;
+	/** CONFLICT only: the conflicting paths. */
+	paths?: string[];
+}
+
+export type RecordRebaseOutcome = "RECORDED" | "ESCALATED" | "ACK_DUP";
+
+/** Conflict paths kept on an escalation; the total is recorded beside them. */
+const MAX_CONFLICT_PATHS = 1000;
+
+function nonEmptyString(v: unknown): v is string {
+	return typeof v === "string" && v !== "";
+}
+
+/**
+ * Record what the rebase service reported for a contender's candidate
+ * (specs/amendments/rebase-ancestry-v1.md).
+ *
+ * - REBASED: `onto` is now an ancestor of `new_sha`, the commit the service
+ *   pushed to the contender's fork. If the authority's latest observed
+ *   commit for the contender is still `from_sha`, it becomes `new_sha`: the
+ *   rebased commit re-enters evaluation and has no evidence until the
+ *   evaluation domain submits some. A newer observed push is never moved
+ *   back.
+ * - UP_TO_DATE: `from_sha` already descended from `onto`; the record says so
+ *   and nothing else changes.
+ * - CONFLICT: the task is escalated to the operator-of-record (spec 1
+ *   §9.4). The conflicting paths are kept as structured data on the
+ *   escalation, never in its reason text: the contender chose them.
+ *
+ * A report identical to one already recorded is ACK_DUP (no state change).
+ * Throws for an unknown, quarantined or revoked contender, or a malformed
+ * report. The caller (the Worker's rebase route) is the control plane;
+ * the report comes from the trusted promotion container.
+ */
+export async function recordRebase(
+	state: AuthorityState,
+	report: RebaseReport,
+	ctx: Ctx,
+): Promise<{ state: AuthorityState; outcome: RecordRebaseOutcome; effects: Effect[] }> {
+	const contender = Object.hasOwn(state.contenders, report?.contender_id) ? state.contenders[report.contender_id] : undefined;
+	if (contender === undefined) throw new Error(`recordRebase: unknown contender ${JSON.stringify(report?.contender_id)}`);
+	const sanction = state.quarantine[report.contender_id]?.status;
+	if (sanction === "QUARANTINED" || sanction === "REVOKED")
+		throw new Error(`recordRebase: contender ${report.contender_id} is ${sanction.toLowerCase()}`);
+	if (!nonEmptyString(report.from_sha) || !nonEmptyString(report.onto))
+		throw new Error("recordRebase: from_sha and onto are required");
+
+	if (report.outcome === "CONFLICT") {
+		const paths = report.paths;
+		if (!Array.isArray(paths) || paths.length === 0 || !paths.every(nonEmptyString))
+			throw new Error("recordRebase: a CONFLICT report needs its conflicting paths");
+		const data: RebaseConflictData = {
+			kind: "rebase_conflict",
+			contender_id: report.contender_id,
+			candidate_sha: report.from_sha,
+			onto: report.onto,
+			paths: paths.slice(0, MAX_CONFLICT_PATHS),
+			paths_total: paths.length,
+		};
+		const open = state.escalations.some(
+			(e) => !e.resolved && e.data !== undefined && canonicalJson(e.data) === canonicalJson(data),
+		);
+		if (open && state.task_status === "escalated") return { state, outcome: "ACK_DUP", effects: [] };
+		const escalated = await escalateToOperator(state, "rebase conflict: the candidate does not apply cleanly onto the destination head", ctx, data);
+		return { state: escalated.state, outcome: "ESCALATED", effects: [] };
+	}
+
+	let record: RebaseRecord;
+	if (report.outcome === "REBASED") {
+		if (!nonEmptyString(report.new_sha) || report.new_sha === report.from_sha || report.new_sha === report.onto)
+			throw new Error("recordRebase: a REBASED report needs the new_sha it pushed, distinct from from_sha and onto");
+		record = { outcome: "REBASED", from_sha: report.from_sha, onto: report.onto, new_sha: report.new_sha, at: ctx.now() };
+	} else if (report.outcome === "UP_TO_DATE") {
+		if (report.new_sha !== undefined && report.new_sha !== report.from_sha)
+			throw new Error("recordRebase: an UP_TO_DATE report's new_sha, if any, is its from_sha");
+		record = { outcome: "UP_TO_DATE", from_sha: report.from_sha, onto: report.onto, new_sha: report.from_sha, at: ctx.now() };
+	} else {
+		throw new Error(`recordRebase: unknown outcome ${JSON.stringify((report as { outcome?: unknown }).outcome)}`);
+	}
+	const same = (r: RebaseRecord) =>
+		r.outcome === record.outcome && r.from_sha === record.from_sha && r.onto === record.onto && r.new_sha === record.new_sha;
+	if ((contender.rebases ?? []).some(same)) return { state, outcome: "ACK_DUP", effects: [] };
+	const updated: ContenderRecord = {
+		...contender,
+		rebases: [...(contender.rebases ?? []), record],
+		latest_commit:
+			record.outcome === "REBASED" && contender.latest_commit === record.from_sha ? record.new_sha : contender.latest_commit,
+	};
+	const s2 = await appendLedger(
+		{ ...state, contenders: { ...state.contenders, [report.contender_id]: updated } },
+		"rebase_recorded",
+		{
+			contender_id: report.contender_id,
+			outcome: record.outcome,
+			from_sha: record.from_sha,
+			onto: record.onto,
+			new_sha: record.new_sha,
+		},
+		ctx,
+	);
+	return { state: s2, outcome: "RECORDED", effects: [] };
 }

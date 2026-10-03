@@ -45,6 +45,8 @@ const TASK_ID = "task_bundle_route";
 const CANDIDATE = "c0ffee0000000000000000000000000000000001";
 const HEAD = "5eed000000000000000000000000000000000002";
 const BASELINE = "ba5e000000000000000000000000000000000003";
+/** The contender's commit before it was rebased onto HEAD. */
+const PRE_REBASE = "01d0000000000000000000000000000000000004";
 /** The evaluator's configuration digest the stored evaluation carries. */
 const EVALUATION_CONFIG_SHA256 = "e7a1".repeat(16);
 
@@ -84,6 +86,10 @@ async function seededState(ctx: Ctx) {
 				agent_id: "agent-a",
 				fork_repo: "fork-contender-a",
 				fork_lineage: { parent_repo: "acme/api", parent_commit: BASELINE },
+				fork_base: BASELINE,
+				// The candidate is a rebase onto HEAD (rebase-ancestry-v1), so a
+				// permit may bind HEAD, which is not the baseline.
+				rebases: [{ outcome: "REBASED", from_sha: PRE_REBASE, onto: HEAD, new_sha: CANDIDATE, at: ctx.now() }],
 				token_id: "tok-a",
 				token_ids: ["tok-a"],
 				status: "forked",
@@ -121,8 +127,10 @@ async function seededState(ctx: Ctx) {
 		ctx,
 	);
 	assert.equal(verdict.record.state, "ACCEPT");
-	const { state: withPermit, permit } = await issuePermit(verdict.state, CANDIDATE, "acme/canonical", HEAD, ctx);
-	return { state: withPermit, permit };
+	const issued = await issuePermit(verdict.state, CANDIDATE, "acme/canonical", HEAD, ctx);
+	assert.equal(issued.outcome, "ISSUED");
+	assert.ok(issued.permit);
+	return { state: issued.state, permit: issued.permit };
 }
 
 /** In-memory Durable Object storage: structured-clone round-trips, one transaction at a time. */
@@ -182,9 +190,11 @@ describe("TaskAuthority signs the ship record at /promotion/finalize", () => {
 		fx.permitId = permit.permit_id;
 		fx.finalize = {
 			permit_id: permit.permit_id,
-			verified_parent: HEAD,
+			verified_base: HEAD,
 			tree_sha256: permit.winning_tree_sha256,
 			promoted_sha: CANDIDATE,
+			// The rebased candidate's own parent is HEAD.
+			promoted_parent: HEAD,
 		};
 		fx.env = {
 			TASK_AUTHORITY: { idFromName: (n: string) => ({ toString: () => n }), get: () => fx.withKey },
@@ -214,6 +224,18 @@ describe("TaskAuthority signs the ship record at /promotion/finalize", () => {
 		assert.equal((await getBundle(TOKENS.control)).status, 404);
 	});
 
+	it("a promoted commit other than the permit's candidate is refused: nothing is consumed or signed", async () => {
+		// Promotion fast-forwards to the reviewed commit itself
+		// (rebase-ancestry-v1), so any other promoted SHA is a substitution.
+		const res = await rpc(fx.withKey, "POST", "/promotion/finalize", { ...fx.finalize, promoted_sha: "5ub5717u7ed00000000000000000000000000005" });
+		assert.equal(res.status, 500);
+		assert.equal(res.body.error, "promotion_bundle_failed");
+		assert.match(res.body.detail, /is not permit .*'s candidate/);
+		const state = (await rpc(fx.withKey, "GET", "/state")).body as AuthorityState;
+		assert.equal(state.permits[fx.permitId].consumed, false);
+		assert.equal(state.promotion_bundles, undefined);
+	});
+
 	it("consumes, ledgers and signs in one step; GET /tasks/:id/bundle serves it; it verifies against the pinned key", async () => {
 		const res = await rpc(fx.withKey, "POST", "/promotion/finalize", fx.finalize);
 		assert.equal(res.status, 200, JSON.stringify(res.body));
@@ -226,6 +248,9 @@ describe("TaskAuthority signs the ship record at /promotion/finalize", () => {
 		assert.equal(fx.bundle.ledger.head_sha256, state.ledger.at(-1)?.entry_hash, "the bundle signs the ledger head at promotion");
 		assert.deepEqual(state.promotion_bundles?.[fx.permitId], fx.bundle);
 		assert.equal(fx.bundle.ship.commit, CANDIDATE);
+		assert.equal(fx.bundle.version, 3);
+		assert.equal(fx.bundle.ship.base, HEAD, "the ship's base is the permit-bound head");
+		assert.equal(fx.bundle.ship.parent, HEAD, "the ship's parent is what the container read from git");
 		assert.equal(fx.bundle.authority_pubkey_der_hex, fx.pinnedKeyDerHex);
 
 		const served = await getBundle(TOKENS.control, `?permit_id=${fx.permitId}`);

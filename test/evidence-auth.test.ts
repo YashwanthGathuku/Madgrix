@@ -96,6 +96,7 @@ function makeContender(latest_commit: string | null): ContenderRecord {
 		agent_id: "agent-1",
 		fork_repo: "fork-1",
 		fork_lineage: { parent_repo: "acme/api", parent_commit: "base123" },
+		fork_base: "base123",
 		token_id: "tok-1",
 		token_ids: ["tok-1"],
 		status: "forked",

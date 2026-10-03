@@ -110,7 +110,7 @@ async function forgeBundle(opts: { withLedger: boolean }) {
 		candidate_commit: "0123456789abcdef0123456789abcdef01234567",
 		tree_sha256: await sha256Hex("a tree nobody evaluated"),
 		evaluation_bundle_hash: await sha256Hex("an evaluation that never ran"),
-		expected_parent: "2222222222222222222222222222222222222222",
+		base: "2222222222222222222222222222222222222222",
 		nonce: "9".repeat(64),
 	};
 	const permit_id = await buildPermitId(
@@ -120,7 +120,7 @@ async function forgeBundle(opts: { withLedger: boolean }) {
 			winning_tree_sha256: fabricated.tree_sha256,
 			evaluation_bundle_hash: fabricated.evaluation_bundle_hash,
 			selector_policy_hash: policy,
-			expected_destination_head: fabricated.expected_parent,
+			expected_destination_head: fabricated.base,
 		},
 		sha256Hex,
 	);
@@ -134,7 +134,7 @@ async function forgeBundle(opts: { withLedger: boolean }) {
 		verificationResult: "PASSED",
 		policySha256: policy,
 		destinationRepo: "acme/canonical",
-		expectedParent: fabricated.expected_parent,
+		destinationBase: fabricated.base,
 		nonce: fabricated.nonce,
 		permitId: permit_id,
 		issuedAt: "2026-10-02T12:00:00.000Z",
@@ -178,13 +178,14 @@ async function forgeBundle(opts: { withLedger: boolean }) {
 		statements.push(await signEnvelope(statement, forger));
 	}
 	const bundle = {
-		version: opts.withLedger ? 2 : 1,
+		version: opts.withLedger ? 3 : 1,
 		statements,
 		ship: {
 			repo: "acme/canonical",
 			commit: fabricated.candidate_commit,
 			tree_sha256: fabricated.tree_sha256,
-			parent: fabricated.expected_parent,
+			base: fabricated.base,
+			parent: fabricated.base,
 			permit_id,
 		},
 		...(ledger ? { ledger } : {}),
@@ -264,7 +265,7 @@ describe("forged promotion bundles", () => {
 					["chain integrity", "OK"],
 					["hidden evaluation", "PASSED"],
 					["policy digest", "OK"],
-					["destination parent", "OK"],
+					["destination base", "OK"],
 					["authority key", "PINNED"],
 					["signature", "VALID"],
 					["permit id", "RECOMPUTED FROM BOUND FIELDS"],

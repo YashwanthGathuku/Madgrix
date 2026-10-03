@@ -1,0 +1,567 @@
+{
+	"format": "madgrix-git-fixtures/v1",
+	"about": [
+		"Shared fixture table for container/promote.sh and container/rebase.sh (specs/amendments/rebase-ancestry-v1.md).",
+		"test/promotion-fixtures.test.ts runs every case twice: the real bash script against real git repositories built from `commits`,",
+		"and the TypeScript model (src/lib/git-promotion.ts) against FakeArtifacts repositories built from the same table.",
+		"Both must produce `expect.exit` and `expect.fields`, leave `destination_after` / `fork_after` behind, map to `expect.http`",
+		"through the PromotionContainer result mapping, and drive the task authority to `expect.authority`.",
+		"Labels stand for commit SHAs. `<new>` is a commit the rebase created. `<candidate>` is the tree-digest/v1 of the candidate's files.",
+		"A file value {\"gitlink\": LABEL} is a gitlink (submodule) entry pointing at that commit.",
+		"`destination_moves_during_push_to` / `fork_moves_during_push_to`: another writer moves that ref to the given commit just before the script's push (bash: a git shim; TS: the adapter's concurrentPush)."
+	],
+	"cases": [
+		{
+			"name": "promote: the candidate on the permit-bound head fast-forwards",
+			"commits": {
+				"B": {"parents": [], "files": {"README.md": "base\n"}},
+				"X": {"parents": ["B"], "files": {"README.md": "base\n", "fix.txt": "fix\n"}}
+			},
+			"destination": "B",
+			"fork": "X",
+			"promote": {"candidate": "X", "expected_head": "B", "winning_tree": "candidate"},
+			"expect": {
+				"exit": 0,
+				"fields": {
+					"OUTCOME": "PROMOTED",
+					"PROMOTED_SHA": "X",
+					"TREE_DIGEST": "<candidate>",
+					"BASE": "B",
+					"PARENT": "B"
+				},
+				"destination_after": "X",
+				"http": {"status": 200, "outcome": "PROMOTED"},
+				"authority": {"fork_base": "B", "recorded": [], "permit": "ISSUED"}
+			}
+		},
+		{
+			"name": "promote: PARENT is the candidate's own parent read from git; BASE is the permit-bound head",
+			"commits": {
+				"B": {"parents": [], "files": {"README.md": "base\n"}},
+				"C1": {"parents": ["B"], "files": {"README.md": "base\n", "fix.txt": "step 1\n"}},
+				"X": {"parents": ["C1"], "files": {"README.md": "base\n", "fix.txt": "step 2\n"}}
+			},
+			"destination": "B",
+			"fork": "X",
+			"promote": {"candidate": "X", "expected_head": "B", "winning_tree": "candidate"},
+			"expect": {
+				"exit": 0,
+				"fields": {
+					"OUTCOME": "PROMOTED",
+					"PROMOTED_SHA": "X",
+					"TREE_DIGEST": "<candidate>",
+					"BASE": "B",
+					"PARENT": "C1"
+				},
+				"destination_after": "X",
+				"http": {"status": 200, "outcome": "PROMOTED"},
+				"authority": {"fork_base": "B", "recorded": [], "permit": "ISSUED"}
+			}
+		},
+		{
+			"name": "promote retry: the destination already is the candidate",
+			"commits": {
+				"B": {"parents": [], "files": {"README.md": "base\n"}},
+				"X": {"parents": ["B"], "files": {"README.md": "base\n", "fix.txt": "fix\n"}}
+			},
+			"destination": "X",
+			"fork": "X",
+			"promote": {"candidate": "X", "expected_head": "B", "winning_tree": "candidate"},
+			"expect": {
+				"exit": 0,
+				"fields": {
+					"OUTCOME": "ALREADY_WRITTEN",
+					"PROMOTED_SHA": "X",
+					"TREE_DIGEST": "<candidate>",
+					"BASE": "B",
+					"PARENT": "B"
+				},
+				"destination_after": "X",
+				"http": {"status": 200, "outcome": "ALREADY_WRITTEN"},
+				"authority": {"fork_base": "B", "recorded": [], "permit": "ISSUED"}
+			}
+		},
+		{
+			"name": "promote retry: the candidate is already in the destination's history under a later commit",
+			"commits": {
+				"B": {"parents": [], "files": {"README.md": "base\n"}},
+				"X": {"parents": ["B"], "files": {"README.md": "base\n", "fix.txt": "fix\n"}},
+				"Z": {"parents": ["X"], "files": {"README.md": "base\n", "fix.txt": "fix\n", "later.txt": "later\n"}}
+			},
+			"destination": "Z",
+			"fork": "X",
+			"promote": {"candidate": "X", "expected_head": "B", "winning_tree": "candidate"},
+			"expect": {
+				"exit": 0,
+				"fields": {
+					"OUTCOME": "ALREADY_WRITTEN",
+					"PROMOTED_SHA": "X",
+					"TREE_DIGEST": "<candidate>",
+					"BASE": "B",
+					"PARENT": "B"
+				},
+				"destination_after": "Z",
+				"http": {"status": 200, "outcome": "ALREADY_WRITTEN"},
+				"authority": {"fork_base": "B", "recorded": [], "permit": "ISSUED"}
+			}
+		},
+		{
+			"name": "promote: the destination head moved (concurrent merge) -> EXPIRED_HEAD_MOVED",
+			"commits": {
+				"B": {"parents": [], "files": {"README.md": "base\n"}},
+				"X": {"parents": ["B"], "files": {"README.md": "base\n", "fix.txt": "fix\n"}},
+				"H2": {"parents": ["B"], "files": {"README.md": "base\n", "other.txt": "other\n"}}
+			},
+			"destination": "H2",
+			"fork": "X",
+			"promote": {"candidate": "X", "expected_head": "B", "winning_tree": "candidate"},
+			"expect": {
+				"exit": 42,
+				"fields": {"OUTCOME": "EXPIRED_HEAD_MOVED", "CURRENT_HEAD": "H2"},
+				"destination_after": "H2",
+				"http": {"status": 409, "outcome": "EXPIRED_HEAD_MOVED"},
+				"authority": {"fork_base": "B", "recorded": [], "permit": "ISSUED"}
+			}
+		},
+		{
+			"name": "promote: the same SHA bound to the moved head -> BASELINE_MISMATCH; the authority never issues that permit",
+			"commits": {
+				"B": {"parents": [], "files": {"README.md": "base\n"}},
+				"X": {"parents": ["B"], "files": {"README.md": "base\n", "fix.txt": "fix\n"}},
+				"H2": {"parents": ["B"], "files": {"README.md": "base\n", "other.txt": "other\n"}}
+			},
+			"destination": "H2",
+			"fork": "X",
+			"promote": {"candidate": "X", "expected_head": "H2", "winning_tree": "candidate"},
+			"expect": {
+				"exit": 47,
+				"fields": {"OUTCOME": "BASELINE_MISMATCH"},
+				"destination_after": "H2",
+				"http": {"status": 409, "outcome": "BASELINE_MISMATCH"},
+				"authority": {"fork_base": "B", "recorded": [], "permit": "REBASE_REQUIRED"}
+			}
+		},
+		{
+			"name": "promote: the same SHA after the head moved to its descendant (the old head-move step 5) -> BASELINE_MISMATCH",
+			"commits": {
+				"B": {"parents": [], "files": {"README.md": "base\n"}},
+				"X": {"parents": ["B"], "files": {"README.md": "base\n", "fix.txt": "fix\n"}},
+				"H2": {"parents": ["X"], "files": {"README.md": "base\n", "fix.txt": "fix\n", "other.txt": "other\n"}}
+			},
+			"destination": "H2",
+			"fork": "X",
+			"promote": {"candidate": "X", "expected_head": "H2", "winning_tree": "candidate"},
+			"expect": {
+				"exit": 47,
+				"fields": {"OUTCOME": "BASELINE_MISMATCH"},
+				"destination_after": "H2",
+				"http": {"status": 409, "outcome": "BASELINE_MISMATCH"},
+				"authority": {"fork_base": "B", "recorded": [], "permit": "REBASE_REQUIRED"}
+			}
+		},
+		{
+			"name": "promote: the rebased candidate fast-forwards from the moved head",
+			"commits": {
+				"B": {"parents": [], "files": {"README.md": "base\n"}},
+				"H2": {"parents": ["B"], "files": {"README.md": "base\n", "other.txt": "other\n"}},
+				"X2": {"parents": ["H2"], "files": {"README.md": "base\n", "other.txt": "other\n", "fix.txt": "fix\n"}}
+			},
+			"destination": "H2",
+			"fork": "X2",
+			"promote": {"candidate": "X2", "expected_head": "H2", "winning_tree": "candidate"},
+			"expect": {
+				"exit": 0,
+				"fields": {
+					"OUTCOME": "PROMOTED",
+					"PROMOTED_SHA": "X2",
+					"TREE_DIGEST": "<candidate>",
+					"BASE": "H2",
+					"PARENT": "H2"
+				},
+				"destination_after": "X2",
+				"http": {"status": 200, "outcome": "PROMOTED"},
+				"authority": {"fork_base": "B", "recorded": [["H2", "X2"]], "permit": "ISSUED"}
+			}
+		},
+		{
+			"name": "promote: the candidate's tree digest is not the permit's -> TREE_MISMATCH",
+			"commits": {
+				"B": {"parents": [], "files": {"README.md": "base\n"}},
+				"X": {"parents": ["B"], "files": {"README.md": "base\n", "fix.txt": "fix\n"}}
+			},
+			"destination": "B",
+			"fork": "X",
+			"promote": {"candidate": "X", "expected_head": "B", "winning_tree": "other"},
+			"expect": {
+				"exit": 43,
+				"fields": {"OUTCOME": "TREE_MISMATCH", "TREE_DIGEST": "<candidate>"},
+				"destination_after": "B",
+				"http": {"status": 409, "outcome": "TREE_MISMATCH"}
+			}
+		},
+		{
+			"name": "promote: a gitlink in the candidate tree -> UNSUPPORTED_TREE_ENTRY (terminal)",
+			"commits": {
+				"B": {"parents": [], "files": {"README.md": "base\n"}},
+				"X": {"parents": ["B"], "files": {"README.md": "base\n", "vendor/lib": {"gitlink": "B"}}}
+			},
+			"destination": "B",
+			"fork": "X",
+			"promote": {"candidate": "X", "expected_head": "B", "winning_tree": "other"},
+			"expect": {
+				"exit": 46,
+				"fields": {"OUTCOME": "UNSUPPORTED_TREE_ENTRY"},
+				"destination_after": "B",
+				"http": {"status": 409, "outcome": "UNSUPPORTED_TREE_ENTRY"}
+			}
+		},
+		{
+			"name": "promote: the destination refuses the push -> PUSH_REJECTED (terminal)",
+			"commits": {
+				"B": {"parents": [], "files": {"README.md": "base\n"}},
+				"X": {"parents": ["B"], "files": {"README.md": "base\n", "fix.txt": "fix\n"}}
+			},
+			"destination": "B",
+			"fork": "X",
+			"destination_rejects_push": true,
+			"promote": {"candidate": "X", "expected_head": "B", "winning_tree": "candidate"},
+			"expect": {
+				"exit": 44,
+				"fields": {"OUTCOME": "PUSH_REJECTED"},
+				"destination_after": "B",
+				"http": {"status": 409, "outcome": "PUSH_REJECTED"}
+			}
+		},
+		{
+			"name": "promote: another writer moves the destination just before the push -> PUSH_REJECTED; its commit stands",
+			"commits": {
+				"B": {"parents": [], "files": {"README.md": "base\n"}},
+				"X": {"parents": ["B"], "files": {"README.md": "base\n", "fix.txt": "fix\n"}},
+				"H2": {"parents": ["B"], "files": {"README.md": "base\n", "other.txt": "other\n"}}
+			},
+			"destination": "B",
+			"fork": "X",
+			"destination_moves_during_push_to": "H2",
+			"promote": {"candidate": "X", "expected_head": "B", "winning_tree": "candidate"},
+			"expect": {
+				"exit": 44,
+				"fields": {"OUTCOME": "PUSH_REJECTED"},
+				"destination_after": "H2",
+				"http": {"status": 409, "outcome": "PUSH_REJECTED"}
+			}
+		},
+		{
+			"name": "promote: the candidate is not in the contender repository -> git error (retryable 502)",
+			"commits": {
+				"B": {"parents": [], "files": {"README.md": "base\n"}},
+				"X": {"parents": ["B"], "files": {"README.md": "base\n", "fix.txt": "fix\n"}}
+			},
+			"destination": "B",
+			"fork": "B",
+			"promote": {"candidate": "X", "expected_head": "B", "winning_tree": "candidate"},
+			"expect": {
+				"exit": 128,
+				"fields": {},
+				"destination_after": "B",
+				"http": {"status": 502, "outcome": "GIT_ERROR"}
+			}
+		},
+		{
+			"name": "rebase: a clean replay onto the moved head -> REBASED, a new commit on top of onto",
+			"commits": {
+				"B": {"parents": [], "files": {"README.md": "base\n"}},
+				"X": {"parents": ["B"], "files": {"README.md": "base\n", "fix.txt": "fix\n"}},
+				"H2": {"parents": ["B"], "files": {"README.md": "base\n", "other.txt": "other\n"}}
+			},
+			"destination": "H2",
+			"fork": "X",
+			"rebase": {"candidate": "X", "onto": "H2"},
+			"expect": {
+				"exit": 0,
+				"fields": {"OUTCOME": "REBASED", "REBASED_SHA": "<new>", "ONTO": "H2"},
+				"new_commit": {
+					"commits_above_onto": 1,
+					"files": {"README.md": "base\n", "fix.txt": "fix\n", "other.txt": "other\n"}
+				},
+				"fork_after": "<new>",
+				"destination_after": "H2",
+				"http": {"status": 200, "outcome": "REBASED"},
+				"authority": {"record": "RECORDED", "permit_at_onto": "ISSUED"}
+			}
+		},
+		{
+			"name": "rebase: both sides changed README.md -> CONFLICT with the path; the fork is unchanged",
+			"commits": {
+				"B": {"parents": [], "files": {"README.md": "base\n"}},
+				"X": {"parents": ["B"], "files": {"README.md": "candidate\n"}},
+				"H2": {"parents": ["B"], "files": {"README.md": "destination\n"}}
+			},
+			"destination": "H2",
+			"fork": "X",
+			"rebase": {"candidate": "X", "onto": "H2"},
+			"expect": {
+				"exit": 49,
+				"fields": {"OUTCOME": "CONFLICT", "ONTO": "H2", "CONFLICT_PATHS": ["README.md"]},
+				"fork_after": "X",
+				"destination_after": "H2",
+				"http": {"status": 409, "outcome": "CONFLICT", "paths": ["README.md"]},
+				"authority": {"record": "ESCALATED", "permit_at_onto": "BLOCKED"}
+			}
+		},
+		{
+			"name": "rebase: conflict paths are data (a space, a newline, non-ASCII)",
+			"commits": {
+				"B": {
+					"parents": [],
+					"files": {
+						"README.md": "base\n",
+						"docs/release notes.md": "v1\n",
+						"weird\nname.txt": "w1\n",
+						"src/ünï.js": "u1\n"
+					}
+				},
+				"X": {
+					"parents": ["B"],
+					"files": {
+						"README.md": "base\n",
+						"docs/release notes.md": "v1 cand\n",
+						"weird\nname.txt": "w1 cand\n",
+						"src/ünï.js": "u1 cand\n"
+					}
+				},
+				"H2": {
+					"parents": ["B"],
+					"files": {
+						"README.md": "base\n",
+						"docs/release notes.md": "v1 dest\n",
+						"weird\nname.txt": "w1 dest\n",
+						"src/ünï.js": "u1 dest\n"
+					}
+				}
+			},
+			"destination": "H2",
+			"fork": "X",
+			"rebase": {"candidate": "X", "onto": "H2"},
+			"expect": {
+				"exit": 49,
+				"fields": {
+					"OUTCOME": "CONFLICT",
+					"ONTO": "H2",
+					"CONFLICT_PATHS": ["docs/release notes.md", "src/ünï.js", "weird\nname.txt"]
+				},
+				"fork_after": "X",
+				"destination_after": "H2",
+				"http": {
+					"status": 409,
+					"outcome": "CONFLICT",
+					"paths": ["docs/release notes.md", "src/ünï.js", "weird\nname.txt"]
+				},
+				"authority": {"record": "ESCALATED", "permit_at_onto": "BLOCKED"}
+			}
+		},
+		{
+			"name": "rebase: the candidate already descends from onto -> UP_TO_DATE, nothing pushed",
+			"commits": {
+				"B": {"parents": [], "files": {"README.md": "base\n"}},
+				"H2": {"parents": ["B"], "files": {"README.md": "base\n", "other.txt": "other\n"}},
+				"X": {"parents": ["H2"], "files": {"README.md": "base\n", "other.txt": "other\n", "fix.txt": "fix\n"}}
+			},
+			"destination": "H2",
+			"fork": "X",
+			"rebase": {"candidate": "X", "onto": "H2"},
+			"expect": {
+				"exit": 0,
+				"fields": {"OUTCOME": "UP_TO_DATE", "REBASED_SHA": "X", "ONTO": "H2"},
+				"fork_after": "X",
+				"destination_after": "H2",
+				"http": {"status": 200, "outcome": "UP_TO_DATE"},
+				"authority": {"record": "RECORDED", "permit_at_onto": "ISSUED"}
+			}
+		},
+		{
+			"name": "rebase: the candidate is already in onto's history -> ALREADY_IN_DESTINATION",
+			"commits": {
+				"B": {"parents": [], "files": {"README.md": "base\n"}},
+				"X": {"parents": ["B"], "files": {"README.md": "base\n", "fix.txt": "fix\n"}},
+				"H2": {"parents": ["X"], "files": {"README.md": "base\n", "fix.txt": "fix\n", "other.txt": "other\n"}}
+			},
+			"destination": "H2",
+			"fork": "X",
+			"rebase": {"candidate": "X", "onto": "H2"},
+			"expect": {
+				"exit": 48,
+				"fields": {"OUTCOME": "ALREADY_IN_DESTINATION", "ONTO": "H2"},
+				"fork_after": "X",
+				"destination_after": "H2",
+				"http": {"status": 409, "outcome": "ALREADY_IN_DESTINATION"},
+				"authority": {"record": null, "permit_at_onto": "REBASE_REQUIRED"}
+			}
+		},
+		{
+			"name": "rebase: the candidate's change is already upstream -> ALREADY_IN_DESTINATION",
+			"commits": {
+				"B": {"parents": [], "files": {"README.md": "base\n"}},
+				"X": {"parents": ["B"], "files": {"README.md": "base\n", "fix.txt": "fix\n"}},
+				"H2": {"parents": ["B"], "files": {"README.md": "base\n", "fix.txt": "fix\n", "other.txt": "other\n"}}
+			},
+			"destination": "H2",
+			"fork": "X",
+			"rebase": {"candidate": "X", "onto": "H2"},
+			"expect": {
+				"exit": 48,
+				"fields": {"OUTCOME": "ALREADY_IN_DESTINATION", "ONTO": "H2"},
+				"fork_after": "X",
+				"destination_after": "H2",
+				"http": {"status": 409, "outcome": "ALREADY_IN_DESTINATION"},
+				"authority": {"record": null, "permit_at_onto": "REBASE_REQUIRED"}
+			}
+		},
+		{
+			"name": "rebase: the fork moved past the candidate -> FORK_MOVED, nothing pushed",
+			"commits": {
+				"B": {"parents": [], "files": {"README.md": "base\n"}},
+				"X": {"parents": ["B"], "files": {"README.md": "base\n", "fix.txt": "fix\n"}},
+				"Y": {"parents": ["X"], "files": {"README.md": "base\n", "fix.txt": "fix\n", "more.txt": "more\n"}},
+				"H2": {"parents": ["B"], "files": {"README.md": "base\n", "other.txt": "other\n"}}
+			},
+			"destination": "H2",
+			"fork": "Y",
+			"rebase": {"candidate": "X", "onto": "H2"},
+			"expect": {
+				"exit": 42,
+				"fields": {"OUTCOME": "FORK_MOVED", "FORK_HEAD": "Y"},
+				"fork_after": "Y",
+				"destination_after": "H2",
+				"http": {"status": 409, "outcome": "FORK_MOVED"},
+				"authority": {"record": null, "permit_at_onto": "REBASE_REQUIRED"}
+			}
+		},
+		{
+			"name": "rebase: tool-status logs on both sides -> the candidate's log is kept, REBASED",
+			"commits": {
+				"B": {"parents": [], "files": {"README.md": "base\n"}},
+				"X": {
+					"parents": ["B"],
+					"files": {
+						"README.md": "base\n",
+						"fix.txt": "fix\n",
+						".madgrix/tool-status.jsonl": "{\"log\":\"candidate\"}\n"
+					}
+				},
+				"H2": {
+					"parents": ["B"],
+					"files": {
+						"README.md": "base\n",
+						"other.txt": "other\n",
+						".madgrix/tool-status.jsonl": "{\"log\":\"earlier winner\"}\n"
+					}
+				}
+			},
+			"destination": "H2",
+			"fork": "X",
+			"rebase": {"candidate": "X", "onto": "H2"},
+			"expect": {
+				"exit": 0,
+				"fields": {"OUTCOME": "REBASED", "REBASED_SHA": "<new>", "ONTO": "H2"},
+				"new_commit": {
+					"commits_above_onto": 1,
+					"files": {
+						"README.md": "base\n",
+						"fix.txt": "fix\n",
+						"other.txt": "other\n",
+						".madgrix/tool-status.jsonl": "{\"log\":\"candidate\"}\n"
+					}
+				},
+				"fork_after": "<new>",
+				"destination_after": "H2",
+				"http": {"status": 200, "outcome": "REBASED"},
+				"authority": {"record": "RECORDED", "permit_at_onto": "ISSUED"}
+			}
+		},
+		{
+			"name": "rebase: two candidate commits are replayed in order -> REBASED two commits above onto",
+			"commits": {
+				"B": {"parents": [], "files": {"README.md": "base\n"}},
+				"C1": {"parents": ["B"], "files": {"README.md": "base\n", "a.txt": "a\n"}},
+				"X": {"parents": ["C1"], "files": {"README.md": "base\n", "a.txt": "a\n", "b.txt": "b\n"}},
+				"H2": {"parents": ["B"], "files": {"README.md": "base\n", "other.txt": "other\n"}}
+			},
+			"destination": "H2",
+			"fork": "X",
+			"rebase": {"candidate": "X", "onto": "H2"},
+			"expect": {
+				"exit": 0,
+				"fields": {"OUTCOME": "REBASED", "REBASED_SHA": "<new>", "ONTO": "H2"},
+				"new_commit": {
+					"commits_above_onto": 2,
+					"files": {"README.md": "base\n", "a.txt": "a\n", "b.txt": "b\n", "other.txt": "other\n"}
+				},
+				"fork_after": "<new>",
+				"destination_after": "H2",
+				"http": {"status": 200, "outcome": "REBASED"},
+				"authority": {"record": "RECORDED", "permit_at_onto": "ISSUED"}
+			}
+		},
+		{
+			"name": "rebase: the candidate's own .gitattributes (merge=union) cannot turn a conflict into a merge",
+			"commits": {
+				"B": {"parents": [], "files": {"README.md": "base\n"}},
+				"C1": {"parents": ["B"], "files": {"README.md": "base\n", ".gitattributes": "* merge=union\n"}},
+				"X": {"parents": ["C1"], "files": {"README.md": "candidate\n", ".gitattributes": "* merge=union\n"}},
+				"H2": {"parents": ["B"], "files": {"README.md": "destination\n"}}
+			},
+			"destination": "H2",
+			"fork": "X",
+			"rebase": {"candidate": "X", "onto": "H2"},
+			"expect": {
+				"exit": 49,
+				"fields": {"OUTCOME": "CONFLICT", "ONTO": "H2", "CONFLICT_PATHS": ["README.md"]},
+				"fork_after": "X",
+				"destination_after": "H2",
+				"http": {"status": 409, "outcome": "CONFLICT", "paths": ["README.md"]},
+				"authority": {"record": "ESCALATED", "permit_at_onto": "BLOCKED"}
+			}
+		},
+		{
+			"name": "rebase: the fork refuses the push -> PUSH_REJECTED",
+			"commits": {
+				"B": {"parents": [], "files": {"README.md": "base\n"}},
+				"X": {"parents": ["B"], "files": {"README.md": "base\n", "fix.txt": "fix\n"}},
+				"H2": {"parents": ["B"], "files": {"README.md": "base\n", "other.txt": "other\n"}}
+			},
+			"destination": "H2",
+			"fork": "X",
+			"fork_rejects_push": true,
+			"rebase": {"candidate": "X", "onto": "H2"},
+			"expect": {
+				"exit": 44,
+				"fields": {"OUTCOME": "PUSH_REJECTED"},
+				"fork_after": "X",
+				"destination_after": "H2",
+				"http": {"status": 409, "outcome": "PUSH_REJECTED"},
+				"authority": {"record": null, "permit_at_onto": "REBASE_REQUIRED"}
+			}
+		},
+		{
+			"name": "rebase: the contender pushes just before the rebase's push -> PUSH_REJECTED; the contender's commit stands",
+			"commits": {
+				"B": {"parents": [], "files": {"README.md": "base\n"}},
+				"X": {"parents": ["B"], "files": {"README.md": "base\n", "fix.txt": "fix\n"}},
+				"Y": {"parents": ["X"], "files": {"README.md": "base\n", "fix.txt": "fix\n", "more.txt": "more\n"}},
+				"H2": {"parents": ["B"], "files": {"README.md": "base\n", "other.txt": "other\n"}}
+			},
+			"destination": "H2",
+			"fork": "X",
+			"fork_moves_during_push_to": "Y",
+			"rebase": {"candidate": "X", "onto": "H2"},
+			"expect": {
+				"exit": 44,
+				"fields": {"OUTCOME": "PUSH_REJECTED"},
+				"fork_after": "Y",
+				"destination_after": "H2",
+				"http": {"status": 409, "outcome": "PUSH_REJECTED"},
+				"authority": {"record": null, "permit_at_onto": "REBASE_REQUIRED"}
+			}
+		}
+	]
+}

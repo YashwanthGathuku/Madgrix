@@ -71,9 +71,13 @@ component that can write canonical state, and it lives inside the control plane.
    task, baseline, winning tree SHA, evaluation bundle, policy version, and the
    expected destination head.
 9. **Promote.** The promotion service — the sole canonical writer — verifies the
-   permit, writes the tree, records the ship, and consumes the permit atomically.
+   permit, fast-forwards the canonical branch to the reviewed commit itself
+   (`container/promote.sh`), records the ship, and consumes the permit atomically.
    A replayed permit returns `ALREADY_CONSUMED` (no-op ACK). If the destination HEAD
-   moved after the verdict, the permit is EXPIRED and the task must be re-evaluated.
+   moved after the verdict, the permit is EXPIRED, and the same commit gets no
+   permit at the new head (`REBASE_REQUIRED`): the rebase service replays it onto
+   the new head as a new commit (`container/rebase.sh`), which is evaluated again
+   before it can be promoted (`specs/amendments/rebase-ancestry-v1.md`).
 10. **Attest.** Each step emits an in-toto statement (link, test result, verification
     result, plus the custom `AgentPromotionAuthority/v1` predicate), chained and
     signed in DSSE envelopes into `promotion.bundle`. The TaskAuthority signs them
@@ -82,7 +86,7 @@ component that can write canonical state, and it lives inside the control plane.
 11. **Verify offline.** Anyone holding the pinned authority public key can check the
     bundle with `npm run verify -- --trust-key <key> <bundle>` (default key:
     `keys/authority.pub`): ten transcript lines (`subject digest`, `candidate digest`,
-    `chain integrity`, `hidden evaluation`, `policy digest`, `destination parent`,
+    `chain integrity`, `hidden evaluation`, `policy digest`, `destination base`,
     `authority key`, `signature`, `permit id`, `ledger chain`) and `VERIFIED` — no
     network; the key embedded in the bundle is never trusted.
 

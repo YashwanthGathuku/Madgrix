@@ -86,6 +86,7 @@ function observedContender(state: AuthorityState, workId: string, cand: string):
 				agent_id: "contender-1",
 				fork_repo: "fork-contender-1",
 				fork_lineage: { parent_repo: "acme/api", parent_commit: "base123" },
+				fork_base: "base123",
 				token_id: "tok-1",
 				token_ids: ["tok-1"],
 				status: "forked",
@@ -134,8 +135,10 @@ async function authorityWithPermit(ctx: Ctx, task_hash: string, cand: string, tr
 	);
 	state = v.state;
 	assert.equal(v.record.state, "ACCEPT");
-	const { state: s2, permit } = await issuePermit(state, cand, "canonical", head, ctx);
-	return { state: s2, permit };
+	const issued = await issuePermit(state, cand, "canonical", head, ctx);
+	assert.equal(issued.outcome, "ISSUED");
+	assert.ok(issued.permit);
+	return { state: issued.state, permit: issued.permit };
 }
 
 describe("promotion attacks", () => {
@@ -144,7 +147,7 @@ describe("promotion attacks", () => {
 		const SHA_X = "sha-x-reviewed";
 		const TREE_X = "tree-x";
 		const TREE_Y = "tree-y-attacker";
-		const HEAD = "head-0";
+		const HEAD = "base123";
 		const { state: s0, permit } = await authorityWithPermit(ctx, "taskhash-swap", SHA_X, TREE_X, HEAD);
 
 		// Attacker pushes SHA Y after review; permit for X is presented
@@ -170,39 +173,41 @@ describe("promotion attacks", () => {
 
 	it("permit double-issue before consumption converges; replay after promote → ALREADY_CONSUMED", async () => {
 		const ctx = makeCtx();
-		const { state: s0, permit } = await authorityWithPermit(ctx, "taskhash-dbl1", "sha-d", "tree-d", "head-0");
+		const { state: s0, permit } = await authorityWithPermit(ctx, "taskhash-dbl1", "sha-d", "tree-d", "base123");
 
 		// Re-issue before consumption → the SAME record (idempotent), still
 		// unconsumed. permit_id is deterministic over the bound fields.
-		const re = await issuePermit(s0, "sha-d", "canonical", "head-0", ctx);
+		const re = await issuePermit(s0, "sha-d", "canonical", "base123", ctx);
+		assert.ok(re.permit);
 		assert.equal(re.permit.permit_id, permit.permit_id, "re-issue must converge to the same permit_id");
 		assert.equal(re.permit.consumed, false, "unconsumed permit stays unconsumed");
 		assert.equal(re.state, s0, "idempotent re-issue must not change state");
 
 		// Present once → PROMOTED.
-		const a1 = await attemptPromotion(re.state, permit.permit_id, "head-0", "tree-d", ctx);
+		const a1 = await attemptPromotion(re.state, permit.permit_id, "base123", "tree-d", ctx);
 		assert.equal(a1.outcome, "PROMOTED");
 
 		// Present again → ALREADY_CONSUMED, no effects, no second write.
-		const a2 = await attemptPromotion(a1.state, permit.permit_id, "head-0", "tree-d", ctx);
+		const a2 = await attemptPromotion(a1.state, permit.permit_id, "base123", "tree-d", ctx);
 		assert.equal(a2.outcome, "ALREADY_CONSUMED");
 		assert.equal(a2.effects.length, 0, "replay must have no effects");
 	});
 
 	it("re-issue AFTER consumption returns the consumed record (no resurrection)", async () => {
 		const ctx = makeCtx();
-		const { state: s0, permit } = await authorityWithPermit(ctx, "taskhash-dbl2", "sha-r", "tree-r", "head-0");
-		const a1 = await attemptPromotion(s0, permit.permit_id, "head-0", "tree-r", ctx);
+		const { state: s0, permit } = await authorityWithPermit(ctx, "taskhash-dbl2", "sha-r", "tree-r", "base123");
+		const a1 = await attemptPromotion(s0, permit.permit_id, "base123", "tree-r", ctx);
 		assert.equal(a1.outcome, "PROMOTED");
 
 		// The attack this guards: issuePermit used to OVERWRITE the permit
 		// record, resetting consumed=false. Now it must return the stored
 		// (consumed) record.
-		const re = await issuePermit(a1.state, "sha-r", "canonical", "head-0", ctx);
+		const re = await issuePermit(a1.state, "sha-r", "canonical", "base123", ctx);
+		assert.ok(re.permit);
 		assert.equal(re.permit.permit_id, permit.permit_id);
 		assert.equal(re.permit.consumed, true, "re-issue must not resurrect a consumed permit");
 
-		const a2 = await attemptPromotion(re.state, permit.permit_id, "head-0", "tree-r", ctx);
+		const a2 = await attemptPromotion(re.state, permit.permit_id, "base123", "tree-r", ctx);
 		assert.equal(a2.outcome, "ALREADY_CONSUMED");
 		assert.equal(a2.effects.length, 0, "no second promotion possible");
 	});

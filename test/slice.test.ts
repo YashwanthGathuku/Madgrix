@@ -33,9 +33,13 @@ describe("vertical slice (quiet)", () => {
 
 		// Independent offline verification of the written bundle.
 		const bundle = JSON.parse(await readFile(r.bundlePath, "utf8")) as PromotionBundle;
-		assert.equal(bundle.version, 2);
+		assert.equal(bundle.version, 3);
 		assert.equal(bundle.ship.commit, r.winnerSha);
 		assert.equal(bundle.ship.permit_id, r.permitId);
+		// The canonical repo was fast-forwarded from the baseline to the
+		// candidate, whose own parent is the baseline.
+		assert.equal(bundle.ship.base, r.baseline);
+		assert.equal(bundle.ship.parent, r.baseline);
 		const pinned = parseTrustedKey(await readFile(r.trustKeyPath, "utf8"));
 		const { lines, verified } = await verifyWithTrustedKey(bundle, pinned);
 		assert.equal(verified, true);

@@ -56,6 +56,7 @@ import {
 	ingestQueueEvent,
 	issuePermit,
 	quarantineContender,
+	recordRebase,
 	runVerdictSeam,
 	submitEvaluation,
 	taskHashFor,
@@ -706,6 +707,7 @@ async function miniAuthority(contenderId = "cont-a", forkRepo = "fork-a"): Promi
 		agent_id: "agent-1",
 		fork_repo: forkRepo,
 		fork_lineage: { parent_repo: "base", parent_commit: "base0" },
+		fork_base: "base0",
 		token_id: "tok_synthetic_1",
 		status: "submitted",
 		claim_work_id: null,
@@ -797,9 +799,12 @@ async function buildPromotionScenario(ctx: Ctx, seed: number): Promise<{
 	);
 	expect(record.state === "ACCEPT", `expected ACCEPT verdict, got ${record.state}`);
 	expect(record.winner_sha === shaX, "winner must be shaX");
-	const headH1 = await synthHex(seed, "adv|headH1");
-	const { state: s3, permit } = await issuePermit(s2, shaX, "canonical", headH1, ctx);
-	return { state: s3, permit_id: permit.permit_id, shaX, treeX, headH1 };
+	// The destination is still at the contender's fork base: the one head
+	// every candidate on the fork descends from (rebase-ancestry-v1).
+	const headH1 = "base0";
+	const issued = await issuePermit(s2, shaX, "canonical", headH1, ctx);
+	expect(issued.outcome === "ISSUED" && issued.permit !== null, `a permit at the fork base must be ISSUED, got ${issued.outcome}`);
+	return { state: issued.state, permit_id: issued.permit!.permit_id, shaX, treeX, headH1 };
 }
 
 async function runTrial(
@@ -1318,17 +1323,49 @@ async function runAdversarialStratum(seed: number): Promise<AdversarialStratum> 
 		expect(r.state.task_status !== "promoted", "nothing may be promoted on a stale head");
 		return "Destination HEAD moved after permit issue -> EXPIRED_HEAD_MOVED; permit unconsumed; task not promoted. Zero stale promotions.";
 	});
-	await t(24, 12, "attack-12b head-moved (fresh permit at new head promotes)", async () => {
+	await t(24, 12, "attack-12b head-moved (same SHA refused; rebased SHA re-evaluated promotes)", async () => {
 		const { state, permit_id, shaX, treeX, headH1 } = await buildPromotionScenario(ctx, seed);
 		const headH2 = await synthHex(seed, "adv|headH2-moved");
+		expect(headH1 !== headH2, "sanity");
 		const stale = await attemptPromotion(state, permit_id, headH2, treeX, ctx);
 		expect(stale.outcome === "EXPIRED_HEAD_MOVED", "setup: stale attempt must fail");
-		const { state: s2, permit } = await issuePermit(stale.state, shaX, "canonical", headH2, ctx);
-		expect(permit.permit_id !== permit_id, "fresh permit at the new head must be a different permit");
-		const fresh = await attemptPromotion(s2, permit.permit_id, headH2, treeX, ctx);
-		expect(fresh.outcome === "PROMOTED", `fresh permit at the new head must PROMOTE, got ${fresh.outcome}`);
-		expect(headH1 !== headH2, "sanity");
-		return "Re-issued permit bound to the NEW head -> PROMOTED. The mechanism distinguishes stale from fresh, not just fail-everything.";
+		// The same SHA at the new head: shaX descends from base0, not headH2,
+		// so promote.sh could not fast-forward to it.
+		const same = await issuePermit(stale.state, shaX, "canonical", headH2, ctx);
+		expect(same.outcome === "REBASE_REQUIRED" && same.permit === null, `same SHA at the new head must be REBASE_REQUIRED, got ${same.outcome}`);
+		// The rebase service's report: shaX replayed onto headH2 as a new commit.
+		const shaX2 = await synthHex(seed, "adv|shaX-rebased");
+		const treeX2 = await synthHex(seed, "adv|treeX-rebased");
+		const rebased = await recordRebase(
+			same.state,
+			{ contender_id: "cont-a", outcome: "REBASED", from_sha: shaX, onto: headH2, new_sha: shaX2 },
+			ctx,
+		);
+		expect(rebased.state.contenders["cont-a"].latest_commit === shaX2, "the rebased SHA must re-enter evaluation");
+		const bundle = await synthBundle({
+			taskIdx: 901,
+			candIdx: 0,
+			candidate_sha: shaX2,
+			tree_sha256: treeX2,
+			contender_id: "cont-a",
+			task_hash: rebased.state.task.task_hash,
+			hiddenPassed: true,
+			hiddenFailed: [],
+			regressionsPassed: true,
+			regressionFailed: [],
+		});
+		const evaluated = await submitEvaluation(rebased.state, bundle, { zone: "evaluation_domain" }, ctx);
+		const verdict = await runVerdictSeam(
+			evaluated.state,
+			[{ contender_id: "cont-a", candidate_sha: shaX2, blast_radius: 1, change_surface: 1 }],
+			ctx,
+		);
+		expect(verdict.record.state === "ACCEPT", `the re-evaluated rebased SHA must be ACCEPTed, got ${verdict.record.state}`);
+		const fresh = await issuePermit(verdict.state, shaX2, "canonical", headH2, ctx);
+		expect(fresh.outcome === "ISSUED" && fresh.permit !== null, `the rebased SHA must get a permit at the new head, got ${fresh.outcome}`);
+		const promoted = await attemptPromotion(fresh.state, fresh.permit!.permit_id, headH2, treeX2, ctx);
+		expect(promoted.outcome === "PROMOTED", `the rebased SHA's permit must PROMOTE, got ${promoted.outcome}`);
+		return "Same SHA at the new head -> REBASE_REQUIRED (no permit); the rebased SHA, re-evaluated, gets a permit bound to the new head -> PROMOTED.";
 	});
 
 	/* -- Attack 13: candidate attempts canonical write ----------------- */
@@ -1592,7 +1629,7 @@ function buildPrecommitChecklist(
 		{
 			name: "Zero-tolerance: destination HEAD race — 0 stale promotions",
 			status: advOk ? "PASS" : "FAIL",
-			note: "REAL MODULES: trials 23–24 (attack-12a/b): moved head -> EXPIRED_HEAD_MOVED, permit unconsumed; fresh permit at new head promotes.",
+			note: "REAL MODULES: trials 23–24 (attack-12a/b): moved head -> EXPIRED_HEAD_MOVED, permit unconsumed; the same SHA gets REBASE_REQUIRED at the new head; only a rebased, re-evaluated SHA promotes.",
 		},
 		{
 			name: "Zero-tolerance: duplicate Cloudflare events — 0 duplicate effects",

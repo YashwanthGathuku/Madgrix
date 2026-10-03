@@ -148,6 +148,35 @@ export interface ContenderRecord {
 	claim_work_id: string | null;
 	/** Last observed commit SHA on the contender's branch. */
 	latest_commit: string | null;
+	/**
+	 * The commit the contender's fork was created at: the task's baseline
+	 * commit (registerContender refuses any other). Every candidate the
+	 * contender pushes on its fork descends from it, so a permit may bind it
+	 * as the destination head (specs/amendments/rebase-ancestry-v1.md).
+	 */
+	fork_base: string;
+	/**
+	 * What the rebase service (container/rebase.sh) reported for this
+	 * contender, in order: each record says `onto` is an ancestor of
+	 * `new_sha`. Absent until the first rebase.
+	 */
+	rebases?: RebaseRecord[];
+}
+
+/**
+ * One rebase of a contender's candidate onto a destination head
+ * (specs/amendments/rebase-ancestry-v1.md). REBASED: container/rebase.sh
+ * replayed `from_sha` onto `onto` and pushed the result, `new_sha`, to the
+ * contender's fork. UP_TO_DATE: `from_sha` already descended from `onto`;
+ * nothing was pushed and `new_sha` is `from_sha`. Either way the authority
+ * may bind `onto` as the destination head of a permit for `new_sha`.
+ */
+export interface RebaseRecord {
+	outcome: "REBASED" | "UP_TO_DATE";
+	from_sha: string;
+	onto: string;
+	new_sha: string;
+	at: string;
 }
 
 /** Admission gates (spec 1 §6). All boolean; evaluated by the control plane. */
@@ -196,6 +225,16 @@ export interface EvaluationBundle {
 	 * slice harness, and bundles recorded before this field existed, lack it.
 	 */
 	evaluation_config_sha256?: string;
+	/**
+	 * The commit whose runner configuration and test material the evaluation
+	 * ran with, and against which it computed the candidate's changes: the
+	 * newest of the contender's known bases (fork base, recorded rebase
+	 * heads) that the candidate descends from. submitEvaluation refuses a
+	 * base the authority does not know (specs/amendments/rebase-ancestry-v1.md).
+	 * scripts/evaluate-candidate.ts always sets it; bundles from the in-process
+	 * harnesses, and bundles recorded before this field existed, lack it.
+	 */
+	evaluation_base?: string;
 	/**
 	 * The evaluation files the candidate changed: runner configuration and
 	 * test material, as the evaluator classifies them
@@ -390,7 +429,7 @@ export interface AuthorityState {
 	 */
 	candidate_labels: Record<string, string>;
 	seen_event_keys: string[];
-	escalations: { reason: string; at: string; resolved: boolean }[];
+	escalations: EscalationRecord[];
 	ledger: LedgerEntry[];
 	/**
 	 * Authority-signed promotion bundles (ship records), keyed by the
@@ -406,6 +445,29 @@ export interface AuthorityState {
 	 * enrollment, whose first claim mints the secret instead.
 	 */
 	agent_enrollment?: Record<string, string>;
+}
+
+/** An escalation to the operator-of-record (spec 1 §9.4). */
+export interface EscalationRecord {
+	reason: string;
+	at: string;
+	resolved: boolean;
+	/**
+	 * Structured detail, kept out of `reason`: a rebase conflict's paths are
+	 * chosen by the contender (specs/amendments/rebase-ancestry-v1.md).
+	 */
+	data?: RebaseConflictData;
+}
+
+export interface RebaseConflictData {
+	kind: "rebase_conflict";
+	contender_id: string;
+	candidate_sha: string;
+	onto: string;
+	/** The conflicting paths as rebase.sh reported them (at most 1000). */
+	paths: string[];
+	/** How many paths rebase.sh reported. */
+	paths_total: number;
 }
 
 /** Queue push event (spec 5 §3). NOTE: event_key is derived from content,

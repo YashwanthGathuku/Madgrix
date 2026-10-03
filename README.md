@@ -133,9 +133,9 @@ npm run bench
 Expected test summary at the current competition-critical branch:
 
 ```
-tests 181
-suites 47
-pass 181
+tests 256
+suites 80
+pass 256
 fail 0
 ```
 
@@ -174,7 +174,8 @@ Provider-specific coding agents are deliberately not hardcoded. `MADGRIX_AGENT_C
 | POST | `/tasks/:id/verifiers/labels` | CONTROL | Assign anonymized candidate labels after commitments |
 | POST | `/tasks/:id/verifiers/reveal` | CONTROL | Validate one-time reveal |
 | POST | `/tasks/:id/verifiers/report` | CONTROL | Submit signed verifier report |
-| POST | `/tasks/:id/verdict` | CONTROL | Execute Verdict Seam and issue permit on ACCEPT |
+| POST | `/tasks/:id/verdict` | CONTROL | Execute Verdict Seam and issue permit on ACCEPT (409 `REBASE_REQUIRED` when the destination moved past the winner's base) |
+| POST | `/tasks/:id/rebase` | CONTROL | Rebase a contender's latest commit onto the destination head; the new commit is pushed to its fork and must be evaluated again |
 | POST | `/tasks/:id/promote` | CONTROL | Exact-state canonical promotion |
 | GET | `/tasks/:id/bundle` | CONTROL | Promotion bundle the task authority signed at finalize |
 | GET | `/tasks/:id/ledger` | current route | Task ledger |
@@ -196,7 +197,9 @@ The trusted container:
 7. fast-forward pushes the **candidate SHA itself** to canonical `main`,
 8. lets the Durable Object consume the permit only after the canonical write is known to exist.
 
-A retry after a lost response sees the exact candidate already canonical and reconciles as `ALREADY_WRITTEN`; it does not create a second change.
+A retry after a lost response finds the candidate already in canonical history, even under later commits, and reconciles as `ALREADY_WRITTEN`; it does not create a second change. The result names `BASE` (the permit-bound head) and `PARENT` (the candidate's own parent, read from git); the signed ship record carries both.
+
+If the destination moved after the verdict, the permit expires and the same commit gets no new permit at the new head (`REBASE_REQUIRED`): the task authority only binds a head the candidate is known to descend from. `container/rebase.sh` replays the candidate onto the new head and pushes the result to the contender's fork as a new commit; that commit is evaluated again before it can get a permit. Conflicts escalate to the operator-of-record with the conflicting paths as data (`specs/amendments/rebase-ancestry-v1.md`). `test/promotion-fixtures.test.ts` runs both scripts against real git repositories, on a fixture table the in-memory harnesses' model must also pass.
 
 `tree-digest/v1` is specified in `specs/amendments/tree-digest-v1.md`.
 
@@ -214,6 +217,7 @@ src/
 container/
   Dockerfile
   promote.sh
+  rebase.sh
   copy-baseline.sh
 
 scripts/

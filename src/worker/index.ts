@@ -26,10 +26,14 @@
  *   fork only, ≤1h), `issueEvaluatorCredentials` (READ, per-evaluation),
  *   verifiers get NONE.
  * - The promotion service is the ONLY canonical writer (spec 3 §2). The
- *   `/promote` route below is a skeleton that performs the platform-owned
- *   preconditions (permit lookup, consumed check, quarantine check,
- *   destination-HEAD check, tree check); the canonical write itself happens
- *   in the merge sandbox with a merge-scoped token (spec 5 §7).
+ *   `/promote` route performs the platform-owned preconditions (permit
+ *   lookup, consumed check, quarantine check, permit-id recompute, evidence
+ *   check) and mints five-minute repo-scoped tokens; the canonical write
+ *   itself is container/promote.sh in the trusted promotion container, which
+ *   fast-forwards the destination to the reviewed commit (spec 5 §7;
+ *   specs/amendments/rebase-ancestry-v1.md). `/rebase` replays a candidate
+ *   onto a moved destination head with container/rebase.sh and pushes the
+ *   new commit to the contender's fork, never to the destination.
  *
  * No credentials in code or logs. No network calls from this module beyond
  * the platform's own RPCs. Plaintext tokens are returned once in a response
@@ -65,7 +69,8 @@ import type {
 } from "../lib/types.ts";
 import { SELECTOR_POLICY_VERSION } from "../lib/types.ts";
 import type { Effect } from "../lib/task-state.ts";
-import { AGENT_ID_PATTERN, resolveAgentBySecret, taskHashFor } from "../lib/task-state.ts";
+import { AGENT_ID_PATTERN, evaluationBases, resolveAgentBySecret, taskHashFor, type RebaseReport } from "../lib/task-state.ts";
+import type { PromotionResult, RebaseResult } from "../lib/git-promotion.ts";
 import { computePermitId, TaskAuthority } from "../do/TaskAuthority.ts";
 import { PromotionContainer } from "../do/PromotionContainer.ts";
 
@@ -670,6 +675,7 @@ export async function handleCreateContender(
 		agent_id,
 		fork_repo: forkName,
 		fork_lineage: { parent_repo: state.task.baseline_repo, parent_commit: state.task.baseline_commit },
+		fork_base: state.task.baseline_commit,
 		token_id: credentials.id,
 		token_ids: [credentials.id],
 		status: "forked",
@@ -769,6 +775,11 @@ export async function handleEvaluatorCredentials(env: Env, taskId: string, reque
 		// provenance_complete (specs/amendments/tool-status-v1.md).
 		agent_id: contender.agent_id,
 		fork_lineage: contender.fork_lineage,
+		// The commits the contender's work may sit on, oldest first: the fork
+		// base, then every head a recorded rebase put under one of its
+		// candidates. The evaluator compares the candidate with the newest of
+		// these it descends from (specs/amendments/rebase-ancestry-v1.md).
+		evaluation_bases: evaluationBases(contender),
 	});
 }
 
@@ -881,6 +892,12 @@ export async function handleVerdict(env: Env, taskId: string, request: Request):
 	const pr = await doRpc(taskStub(env, taskId), "/permit", {
 		body: { winner_sha: verdict.winner_sha, destination_repo, destination_head },
 	});
+	// The destination moved past the winner's base: no permit. The control
+	// plane rebases the candidate (POST /tasks/:id/rebase), which makes a new
+	// SHA to evaluate (specs/amendments/rebase-ancestry-v1.md).
+	if (pr.status === 409 && (pr.body as { outcome?: unknown } | null)?.outcome === "REBASE_REQUIRED") {
+		return json({ verdict, permit: null, ...(pr.body as Record<string, unknown>) }, 409);
+	}
 	if (!pr.ok) return json({ verdict, error: "permit_issue_failed", detail: pr.body }, pr.status);
 	return json({ verdict, ...(pr.body as Record<string, unknown>) }, 200);
 }
@@ -889,7 +906,9 @@ export async function handleVerdict(env: Env, taskId: string, request: Request):
  * POST /tasks/:id/promote — exact-state canonical promotion.
  * The Worker validates the permit/evidence, mints short-lived Git
  * capabilities, delegates the single canonical write to the trusted
- * promotion container, then atomically finalizes/consumes the permit.
+ * promotion container (container/promote.sh: a fast-forward to the reviewed
+ * commit), then atomically finalizes/consumes the permit. The container's
+ * 409 answers are terminal and pass through as 409; git failures are 502.
  */
 export async function handlePromote(
 	env: Env,
@@ -946,16 +965,10 @@ export async function handlePromote(
 		return json({ outcome: "TREE_MISMATCH" satisfies PromotionOutcome, permit_id, detail: "candidate commit missing from contender repo" }, 409);
 	}
 	const destinationRepo = await port.get(permit.destination_repo);
-	const currentHead = await destinationRepo.getHead();
-	// Pre-check only. The Git push inside the trusted promotion container is
-	// the final compare-and-swap and catches a race after this read.
-	if (currentHead !== permit.expected_destination_head) {
-		// A retry after a successful push is reconciled by the promotion
-		// container, so only reject immediately when the permit cannot have
-		// been our own previous exact-state write.
-		// We do not know that deterministic commit id here; let the container
-		// compute it and distinguish ALREADY_WRITTEN from a foreign head move.
-	}
+	// No head pre-check here: the container decides. A destination that moved
+	// on from our own earlier write still holds the candidate in its history
+	// (ALREADY_WRITTEN, so the permit can be finalized); any other move is
+	// EXPIRED_HEAD_MOVED, and the push itself is the final compare-and-swap.
 
 	// The only credentials with canonical write authority are minted here and
 	// live for at most five minutes. They are never persisted or logged.
@@ -979,26 +992,20 @@ export async function handlePromote(
 				}),
 			}),
 		);
-		const promotion = (await promoRes.json()) as {
-			outcome?: string;
-			promoted_sha?: string;
-			tree_sha256?: string;
-			parent?: string;
-			detail?: string;
-		};
+		const promotion = (await promoRes.json()) as Partial<PromotionResult>;
 		if (!promoRes.ok) {
-			const status =
-				promotion.outcome === "EXPIRED_HEAD_MOVED" ||
-				promotion.outcome === "TREE_MISMATCH" ||
-				promotion.outcome === "BASELINE_MISMATCH"
-					? 409
-					: 502;
-			return json({ ...promotion, permit_id }, status);
+			// The container answers 409 for every terminal refusal
+			// (EXPIRED_HEAD_MOVED, TREE_MISMATCH, PUSH_REJECTED,
+			// UNSUPPORTED_TREE_ENTRY, BASELINE_MISMATCH): the PromotionWorkflow
+			// does not retry those. Anything else is a git failure it may retry.
+			return json({ ...promotion, permit_id }, promoRes.status === 409 ? 409 : 502);
 		}
 		if (
 			(promotion.outcome !== "PROMOTED" && promotion.outcome !== "ALREADY_WRITTEN") ||
+			promotion.promoted_sha !== permit.winner_candidate_sha ||
 			promotion.tree_sha256 !== permit.winning_tree_sha256 ||
-			promotion.parent !== permit.expected_destination_head
+			promotion.base !== permit.expected_destination_head ||
+			typeof promotion.parent !== "string"
 		) {
 			return json({ error: "promotion_container_invalid_result", permit_id, promotion }, 502);
 		}
@@ -1011,9 +1018,10 @@ export async function handlePromote(
 		const finalized = await doRpc(taskStub(env, taskId), "/promotion/finalize", {
 			body: {
 				permit_id,
-				verified_parent: permit.expected_destination_head,
+				verified_base: promotion.base,
 				tree_sha256: permit.winning_tree_sha256,
 				promoted_sha: promotion.promoted_sha,
+				promoted_parent: promotion.parent,
 			},
 		});
 		if (!finalized.ok) {
@@ -1036,6 +1044,105 @@ export async function handlePromote(
 			sourceRepo.revokeToken(sourceToken.id),
 			destinationRepo.revokeToken(destinationToken.id),
 		]);
+	}
+}
+
+/**
+ * POST /tasks/:id/rebase — rebase a contender's latest candidate onto the
+ * destination's current head (specs/amendments/rebase-ancestry-v1.md).
+ * Control plane only; body `{ contender_id, destination_repo }`.
+ *
+ * The trusted promotion container replays the candidate (container/rebase.sh)
+ * and pushes the result to the contender's fork with a fork-scoped write token
+ * minted here for at most five minutes; nothing is written to the
+ * destination, which gets only a read token. The task authority records the
+ * report: REBASED and UP_TO_DATE make the head a recorded ancestor of the
+ * (new) candidate — a REBASED commit is a new SHA with no evidence until the
+ * evaluation domain evaluates it — and CONFLICT escalates the task with the
+ * conflicting paths as data (409). The container's other refusals
+ * (FORK_MOVED, PUSH_REJECTED, ALREADY_IN_DESTINATION) pass through as 409,
+ * git failures as 502.
+ */
+export async function handleRebase(env: Env, taskId: string, request: Request): Promise<Response> {
+	if (!(await requireControlPlane(request, env))) return json({ error: "control_plane_auth_required" }, 401);
+	const parsed = await readJsonBody(request);
+	if (!parsed.ok) return parsed.response;
+	const contender_id = parsed.body["contender_id"];
+	const destination_repo = parsed.body["destination_repo"];
+	if (typeof contender_id !== "string" || contender_id === "") return json({ error: "contender_id_required" }, 400);
+	if (typeof destination_repo !== "string" || destination_repo === "") {
+		return json({ error: "destination_repo_required" }, 400);
+	}
+
+	const stateRes = await doRpc(taskStub(env, taskId), "/state", { method: "GET" });
+	if (!stateRes.ok) return json({ error: "task_not_found", task_id: taskId }, 404);
+	const state = stateRes.body as AuthorityState;
+	const contender = Object.hasOwn(state.contenders, contender_id) ? state.contenders[contender_id] : undefined;
+	if (!contender) return json({ error: "contender_not_found", contender_id }, 404);
+	const sanction = state.quarantine[contender_id]?.status;
+	if (sanction === "QUARANTINED" || sanction === "REVOKED") {
+		return json({ error: "contender_quarantined", contender_id }, 409);
+	}
+	const candidate = contender.latest_commit;
+	if (!candidate) return json({ error: "no_candidate", contender_id }, 409);
+
+	const port = productionPort(env);
+	const fork = await port.get(contender.fork_repo);
+	const destination = await port.get(destination_repo);
+	const onto = await destination.getHead();
+	if (!onto) return json({ error: "destination_head_not_found", destination_repo }, 409);
+
+	const opId = (await sha256Hex(joinHashParts("rebase", taskId, contender_id, candidate, onto))).slice(0, 32);
+	const forkToken = await fork.createToken("write", 300);
+	const destinationToken = await destination.createToken("read", 300);
+	try {
+		const res = await promotionStub(env, `rebase-${opId}`).fetch(
+			new Request("https://promotion/rebase", {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({
+					action: "rebase",
+					op_id: opId,
+					fork_remote: fork.remote,
+					fork_token: forkToken.plaintext,
+					candidate_sha: candidate,
+					destination_remote: destination.remote,
+					destination_token: destinationToken.plaintext,
+					onto,
+				}),
+			}),
+		);
+		const result = (await res.json()) as Partial<RebaseResult>;
+		const where = { contender_id, candidate_sha: candidate, onto };
+		let report: RebaseReport;
+		if (res.ok && result.outcome === "REBASED" && typeof result.rebased_sha === "string" && result.rebased_sha !== candidate) {
+			report = { contender_id, outcome: "REBASED", from_sha: candidate, onto, new_sha: result.rebased_sha };
+		} else if (res.ok && result.outcome === "UP_TO_DATE" && result.rebased_sha === candidate) {
+			report = { contender_id, outcome: "UP_TO_DATE", from_sha: candidate, onto };
+		} else if (res.status === 409 && result.outcome === "CONFLICT" && Array.isArray(result.paths)) {
+			report = { contender_id, outcome: "CONFLICT", from_sha: candidate, onto, paths: result.paths };
+		} else if (res.status === 409) {
+			return json({ ...result, ...where }, 409);
+		} else if (!res.ok) {
+			return json({ ...result, ...where }, 502);
+		} else {
+			return json({ error: "rebase_container_invalid_result", ...where, result }, 502);
+		}
+		if (result.onto !== onto) return json({ error: "rebase_container_invalid_result", ...where, result }, 502);
+
+		const recorded = await doRpc(taskStub(env, taskId), "/rebase", { body: { report } });
+		if (!recorded.ok) {
+			// A pushed rebase the authority did not record: a retry rebases the
+			// fork's new head, which is UP_TO_DATE on `onto`.
+			return json({ error: "rebase_record_failed", ...where, result, detail: recorded.body }, 502);
+		}
+		const authority = recorded.body as { outcome?: string; task_status?: string };
+		return json(
+			{ ...result, ...where, authority: authority.outcome, task_status: authority.task_status },
+			report.outcome === "CONFLICT" ? 409 : 200,
+		);
+	} finally {
+		await Promise.allSettled([fork.revokeToken(forkToken.id), destination.revokeToken(destinationToken.id)]);
 	}
 }
 
@@ -1145,10 +1252,11 @@ export async function executeEffects(port: ArtifactsPort, effects: Effect[]): Pr
 				break;
 			}
 			case "canonical_write": {
-				// Canonical writes ONLY happen through the promote route /
-				// merge sandbox (spec 3 §2, spec 5 §7). An effect carrying a
-				// canonical write is a protocol-layer signal; executing it
-				// here would bypass the promotion service. Log and stop.
+				// Canonical writes ONLY happen through the promote route and
+				// the promotion container's fast-forward (container/promote.sh;
+				// spec 3 §2, spec 5 §7). An effect carrying a canonical write is
+				// a protocol-layer signal; executing it here would bypass the
+				// promotion service. Log and stop.
 				console.warn(
 					`executeEffects: canonical_write effect for ${effect.repo} NOT executed here — canonical writes go through the promotion service only`,
 				);
@@ -1200,6 +1308,9 @@ export async function fetch(request: Request, env: Env): Promise<Response> {
 		}
 		if (request.method === "POST" && action === "promote" && parts.length === 3) {
 			return handlePromote(env, taskId, request);
+		}
+		if (request.method === "POST" && action === "rebase" && parts.length === 3) {
+			return handleRebase(env, taskId, request);
 		}
 		if (request.method === "GET" && action === "ledger" && parts.length === 3) {
 			return handleLedger(env, taskId);
@@ -1271,8 +1382,13 @@ export interface PromotionWorkflowParams {
 /**
  * Durable wrapper around the exact-state promotion operation. The permit id
  * is the idempotent step name. A retry after a lost response is safe because
- * the promotion container deterministically reconstructs the same commit and
- * reports ALREADY_WRITTEN; the task authority then consumes the same permit.
+ * promotion creates no commit: container/promote.sh fast-forwards the
+ * destination to the reviewed candidate itself, so on a retry it finds that
+ * commit already in the destination's history (even under later commits),
+ * reports ALREADY_WRITTEN, and the task authority consumes the same permit.
+ * Only 5xx answers are retried; 409s (expired head, tree or baseline
+ * mismatch, a refused push, an unsupported tree entry) are terminal and leave
+ * the permit unconsumed (specs/amendments/rebase-ancestry-v1.md).
  */
 export class PromotionWorkflow extends WorkflowEntrypoint<Env, PromotionWorkflowParams> {
 	async run(event: WorkflowEvent<PromotionWorkflowParams>, step: WorkflowStep) {
