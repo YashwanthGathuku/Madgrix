@@ -16,7 +16,10 @@ Recorded: 2026-10-01 (after the five-decision freeze patch).
 
 - `INTENT_AND_CONFLICT_GRAPH.md`: `sha256:0101f412d15f62760f9d161c6403f7a10211e581ee8e17cfd6c9df0f322fbd1e`
 - `ATTESTATION_PROTOCOL.md`: `sha256:ab2ad6dc003a2c32dca421c0ed83df6af2e9120420f221fc2a19203763c4119e`
-- `README.md`: `sha256:0d2a1f7038f6387134d4d7ff0244160c9565e40729a4ce0dd1504cded7feebbe`
+- `README.md`: `sha256:9f4d24609ced99afba1a3dd9fedf51d02e54f415b614d3559ed2b056445d28b5`
+  (re-recorded 2026-10-03, `amendments/frozen-readme-rehash.md`: the value
+  recorded at the freeze, sha256:0d2a1f7038f6387134d4d7ff0244160c9565e40729a4ce0dd1504cded7feebbe,
+  matches no version of the file in this repository)
 
 To verify: `sha256sum <file>` must reproduce the hash above. Any mismatch
 means the frozen contract was altered — treat as an unrecorded amendment
