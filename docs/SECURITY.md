@@ -63,6 +63,10 @@ Five zones (see `ARCHITECTURE.md` for the full table):
 | Judge / verifiers | **NO Git access** | — | They read evidence, not repos |
 | Promotion service | WRITE canonical repo | Per-promotion, single use | Held only inside the control plane; never leaves it |
 
+- **Agents are enrolled.** `POST /tasks` names the agent ids and returns one secret
+  per agent, once, to the control plane. Every `/claim` and `/contenders` call
+  presents the agent's own secret, so no holder of the shared agent token can take
+  an agent id first (`specs/amendments/agent-enrollment-v1.md`).
 - All tokens are minted by the control plane via the Artifacts binding
   (`repo.createToken(scope, ttl)`); plaintext is delivered once, never logged, never
   persisted.
@@ -147,8 +151,9 @@ What this boundary does **not** do:
 
 ## Evidence integrity and the evaluation run directory
 
-The amendments are `specs/amendments/evidence-integrity-v1.md` and
-`specs/amendments/tool-status-v1.md`.
+The amendments are `specs/amendments/evidence-integrity-v1.md`,
+`tool-status-v1.md`, `tamper-quarantine-v1.md` and
+`evaluation-config-digest-v1.md` (all in `specs/amendments/`).
 
 - **Evidence names the observed commit.** The task authority records an evaluation
   bundle only when its `candidate_sha` is the contender's `latest_commit`, the newest
@@ -163,12 +168,22 @@ The amendments are `specs/amendments/evidence-integrity-v1.md` and
   `__mocks__/`), the candidate's other files, and the hidden tests from
   `MADGRIX_HIDDEN_TESTS_DIR`. A candidate change to runner configuration, to a path a
   test glob matches, or to a path outside its claim fails `no_eval_tampering`.
+- **A changed evaluation file quarantines.** The evaluator lists the changed runner
+  configuration and test files in the bundle (`eval_file_changes`). Recording a
+  bundle with any quarantines the contender (trigger `eval_file_modification`): every
+  fork token is revoked and its evaluations are tainted. A path outside the claim
+  scope fails the gate without quarantine (spec 3 §6 attack 5).
+- **The bundle commits to its configuration.** Before fetching a candidate, the
+  evaluator hashes its commands, test globs, hidden tests, version and runtime into
+  `evaluation_config_sha256`. The authority signs that digest as the test result's
+  configuration digest.
 - **Claims are bounded.** A claim scope of `"**"` is refused at `/claim` and by the
   contender runner, and fails `scope_compliance` at evaluation.
 - **Tool receipts come from the agent.** `valid_tool_states` and `provenance_complete`
   are read from the agent's `.madgrix/tool-status.jsonl`, bound to the task,
   contender, agent and baseline. The model id comes from that log, never from the
-  evaluator's environment.
+  evaluator's environment. For Claude Code, `scripts/adapters/claude-code-tool-log.mjs`
+  writes the log from `claude -p ... --output-format stream-json --verbose`.
 
 `test/evaluator-isolation.test.ts` runs the evaluator against a mock Worker and bare
 Git repositories. A candidate whose only change sets `package.json` `"test"` to

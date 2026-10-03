@@ -257,8 +257,10 @@ export class TaskAuthority {
 							risk: rep.risk,
 							explanation: rep.explanation,
 						})),
-						// Plaintext leaves the authority once, on the agent's first
-						// claim; only its SHA-256 was stored.
+						// Unenrolled tasks only: the plaintext leaves the authority
+						// once, on the agent's first claim; only its SHA-256 was
+						// stored. Enrolled agents got theirs from POST /tasks.
+						// (specs/amendments/agent-enrollment-v1.md)
 						...(r.agent_secret === null ? {} : { agent_secret: r.agent_secret }),
 					});
 				} catch (err) {
