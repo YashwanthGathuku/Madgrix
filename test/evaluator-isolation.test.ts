@@ -348,13 +348,14 @@ describe("claim scope: no default \"**\" claim", () => {
 	});
 
 	it("run-contenders.mjs refuses a missing or unbounded claim scope before any Worker call", async () => {
-		for (const scope of [
+		const scopes: Array<Record<string, string>> = [
 			{},
 			{ MADGRIX_CLAIM_PATHS: "**" },
 			{ MADGRIX_CLAIM_PATHS: "src/**, **" },
 			{ MADGRIX_CLAIM_TEMPLATE: JSON.stringify({ scope: { paths: ["**"], symbols: [] } }) },
 			{ MADGRIX_CLAIM_TEMPLATE: JSON.stringify({ scope: { paths: [], symbols: [] } }) },
-		]) {
+		];
+		for (const scope of scopes) {
 			const before = fx.requests;
 			const run = await runNode("scripts/run-contenders.mjs", { ...base(), ...scope });
 			assert.equal(run.code, 2, `${JSON.stringify(scope)}: ${run.stderr}`);

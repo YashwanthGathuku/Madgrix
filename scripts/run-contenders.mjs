@@ -60,13 +60,15 @@ if (agentIds.length < 2) {
 	console.error("MADGRIX requires at least two concurrent agents; the competition demo should use three.");
 	process.exit(2);
 }
-let agentEnvAllowlist;
+/** @type {string[]} */
+let agentEnvAllowlist = [];
 try {
 	agentEnvAllowlist = parseAgentEnvAllowlist(process.env.MADGRIX_AGENT_ENV_ALLOWLIST);
 } catch (err) {
-	console.error(err.message);
+	console.error(/** @type {Error} */ (err).message);
 	process.exit(2);
 }
+/** @type {Record<string, any> | null} */
 let claimTemplate = null;
 if (process.env.MADGRIX_CLAIM_TEMPLATE) {
 	try {
@@ -93,6 +95,12 @@ if (scopePaths.includes("**")) {
 	process.exit(2);
 }
 
+/**
+ * @param {string} cmd
+ * @param {string[]} args
+ * @param {{ cwd?: string, env?: Record<string, string>, stdio?: import("node:child_process").StdioOptions }} [opts]
+ * @returns {Promise<void>}
+ */
 function run(cmd, args, opts = {}) {
 	return new Promise((resolve, reject) => {
 		const child = spawn(cmd, args, {
@@ -108,6 +116,12 @@ function run(cmd, args, opts = {}) {
 	});
 }
 
+/**
+ * @param {string} cmd
+ * @param {string[]} args
+ * @param {{ cwd?: string, env?: Record<string, string> }} [opts]
+ * @returns {Promise<string>}
+ */
 function capture(cmd, args, opts = {}) {
 	return new Promise((resolve, reject) => {
 		const child = spawn(cmd, args, {
@@ -128,6 +142,10 @@ function capture(cmd, args, opts = {}) {
 	});
 }
 
+/**
+ * @param {string} url
+ * @returns {Promise<any>}
+ */
 async function getJson(url) {
 	const res = await fetch(url, { headers: { authorization: `Bearer ${agentServiceToken}` } });
 	const data = await res.json().catch(() => ({}));
@@ -135,6 +153,12 @@ async function getJson(url) {
 	return data;
 }
 
+/**
+ * @param {string} url
+ * @param {unknown} body
+ * @param {Record<string, string>} [extraHeaders]
+ * @returns {Promise<any>}
+ */
 async function postJson(url, body, extraHeaders = {}) {
 	const res = await fetch(url, {
 		method: "POST",
@@ -150,7 +174,8 @@ async function postJson(url, body, extraHeaders = {}) {
 	return data;
 }
 
-const context = await getJson(`${baseUrl}/tasks/${encodeURIComponent(taskId)}/context`);
+const taskUrl = `${baseUrl}/tasks/${encodeURIComponent(taskId)}`;
+const context = await getJson(`${taskUrl}/context`);
 const task = context.task;
 if (!task || typeof task.task_hash !== "string" || typeof task.baseline_commit !== "string") {
 	throw new Error("MADGRIX task context is incomplete");
@@ -165,7 +190,8 @@ const defaultClaim = {
 	expected_tests: [],
 };
 
-async function runOne(agentId) {
+/** @param {string} agentId */
+const runOne = async (agentId) => {
 	const now = new Date();
 	const claimInput = {
 		...(claimTemplate ?? defaultClaim),
@@ -177,7 +203,7 @@ async function runOne(agentId) {
 			expires_at: new Date(now.getTime() + 60 * 60 * 1000).toISOString(),
 		},
 	};
-	const claimRes = await postJson(`${baseUrl}/tasks/${encodeURIComponent(taskId)}/claim`, { claim: claimInput });
+	const claimRes = await postJson(`${taskUrl}/claim`, { claim: claimInput });
 	const workId = claimRes.work_id;
 	if (typeof workId !== "string") throw new Error(`claim registration returned no work_id for ${agentId}`);
 	// Proves to /contenders that this runner registered agentId's claim. Held
@@ -189,7 +215,7 @@ async function runOne(agentId) {
 	}
 
 	const contender = await postJson(
-		`${baseUrl}/tasks/${encodeURIComponent(taskId)}/contenders`,
+		`${taskUrl}/contenders`,
 		{ agent_id: agentId, claim_work_id: workId },
 		{ "x-madgrix-agent-secret": agentSecret },
 	);
@@ -247,7 +273,7 @@ async function runOne(agentId) {
 		// a remote URL/config; clone used only an ephemeral extraHeader.
 		if (!keep) await rm(dir, { recursive: true, force: true });
 	}
-}
+};
 
 const started = Date.now();
 const settled = await Promise.allSettled(agentIds.map(runOne));
@@ -256,7 +282,7 @@ if (failed.length) {
 	for (const f of failed) console.error("[madgrix] contender failed:", f.reason);
 	process.exit(1);
 }
-const candidates = settled.map((r) => r.value);
+const candidates = settled.flatMap((r) => (r.status === "fulfilled" ? [r.value] : []));
 const result = {
 	task_id: taskId,
 	concurrent_agents: candidates.length,

@@ -13,7 +13,7 @@
   "scripts": {
     "build": "cf build",
     "dev": "cf dev",
-    "typecheck": "tsc --noEmit",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.node.json",
     "slice": "node src/harness/slice.ts",
     "headmove": "node src/harness/head-move.ts",
     "verify": "node src/cli/verify.ts",

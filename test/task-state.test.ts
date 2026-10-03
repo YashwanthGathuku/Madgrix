@@ -36,6 +36,7 @@ import type {
 	ContenderRecord,
 	EvaluationBundle,
 	QueuePushEvent,
+	QuarantineTrigger,
 	ReferenceReport,
 	TaskRecord,
 	VerifierCommitment,
@@ -165,7 +166,7 @@ async function makeOperator() {
 	};
 }
 
-function makeRecheck(trigger: "tool_status_fabrication", passed: boolean, detail: string): QuarantineRecheck {
+function makeRecheck(trigger: QuarantineTrigger, passed: boolean, detail: string): QuarantineRecheck {
 	return { trigger, passed, detail, checked_at: "2026-10-01T19:00:00Z" };
 }
 

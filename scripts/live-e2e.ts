@@ -50,6 +50,7 @@ import {
 	generateKeyPairSync,
 	randomBytes,
 	sign as cryptoSign,
+	type KeyObject,
 } from "node:crypto";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
@@ -154,7 +155,7 @@ interface VerifierIdentity {
 	nonce: string;
 	publicKeyDerHex: string;
 	keyid: string;
-	privateKey: ReturnType<typeof generateKeyPairSync>["privateKey"];
+	privateKey: KeyObject;
 }
 
 function makeVerifier(id: string, aspect: string): VerifierIdentity {
@@ -288,7 +289,9 @@ try {
 		const context = await requestJson(`${baseUrl}/tasks/${encodeURIComponent(taskId)}/context`, {
 			token: agentToken,
 		});
-		const byId = new Map((context.contenders ?? []).map((x: any) => [x.contender_id, x]));
+		const byId = new Map<string, { latest_commit?: string | null }>(
+			(context.contenders ?? []).map((x: { contender_id: string; latest_commit?: string | null }) => [x.contender_id, x]),
+		);
 		const allObserved = candidates.every((c) => byId.get(c.contender_id)?.latest_commit === c.candidate_sha);
 		if (allObserved) break;
 		if (Date.now() >= deadline) {
