@@ -35,6 +35,7 @@ jobs:
           node --check scripts/run-contenders.mjs
           node --check scripts/evaluate-candidate.ts
           node --check scripts/live-e2e.ts
+          node --check scripts/adapters/claude-code-tool-log.mjs
           bash -n container/promote.sh
           bash -n container/copy-baseline.sh
       - name: Unit and integration tests

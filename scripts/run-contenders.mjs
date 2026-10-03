@@ -19,7 +19,8 @@
  * The agent command writes its tool-status log to .madgrix/tool-status.jsonl
  * in the workspace (specs/amendments/tool-status-v1.md); it is committed with
  * the agent's other changes. Without it the candidate fails valid_tool_states
- * and provenance_complete.
+ * and provenance_complete. For Claude Code, scripts/adapters/
+ * claude-code-tool-log.mjs writes it from `--output-format stream-json`.
  *
  * Optional:
  *   MADGRIX_AGENT_IDS=agent-a,agent-b,agent-c   (default)

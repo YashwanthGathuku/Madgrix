@@ -716,6 +716,64 @@ describe("process environment boundaries of the live-run scripts", () => {
 		}
 	});
 
+	it("a Claude Code agent piped through the tool-status adapter passes valid_tool_states and provenance_complete", async () => {
+		// A fake `claude` stands in for `claude -p ... --output-format stream-json
+		// --verbose`: it makes the change and prints the message shapes Claude
+		// Code 2.1.42 emits. No model is called.
+		const dumpDir = await mkdtemp(path.join(fx.dumps, "claude-"));
+		const binDir = path.join(dumpDir, "bin");
+		await mkdir(binDir);
+		const stream = [
+			{ type: "system", subtype: "init", session_id: "s", tools: ["Write"], model: "claude-fake-model-1", claude_code_version: "2.1.42", uuid: "u0" },
+			{ type: "assistant", message: { role: "assistant", content: [{ type: "tool_use", id: "toolu_1", name: "Write", input: { file_path: "CANDIDATE.txt" } }] }, parent_tool_use_id: null, session_id: "s", uuid: "u1" },
+			{ type: "user", message: { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_1", content: "ok" }] }, parent_tool_use_id: null, session_id: "s", uuid: "u2" },
+			{ type: "result", subtype: "success", is_error: false, num_turns: 1, session_id: "s" },
+		];
+		await writeFile(
+			path.join(binDir, "claude"),
+			`#!/bin/sh\necho "candidate from $MADGRIX_AGENT_ID" > CANDIDATE.txt\ncat <<'JSON'\n${stream.map((m) => JSON.stringify(m)).join("\n")}\nJSON\n`,
+		);
+		await chmod(path.join(binDir, "claude"), 0o755);
+		const adapter = path.join(REPO_ROOT, "scripts", "adapters", "claude-code-tool-log.mjs");
+		const taskId = `task_${"h".repeat(24)}`;
+		const resultPath = path.join(dumpDir, "contenders.json");
+		const contenders = await runScript(
+			"scripts/run-contenders.mjs",
+			operatorEnv({
+				PATH: `${binDir}${path.delimiter}${process.env.PATH ?? ""}`,
+				MADGRIX_BASE_URL: fx.mock.url,
+				MADGRIX_TASK_ID: taskId,
+				MADGRIX_AGENT_IDS: "agent-a,agent-b",
+				MADGRIX_AGENT_SECRETS: JSON.stringify(fx.mock.enroll(taskId, ["agent-a", "agent-b"])),
+				MADGRIX_AGENT_COMMAND: `set -o pipefail; claude -p "fix it" --output-format stream-json --verbose | node ${shq(adapter)} > /dev/null`,
+				MADGRIX_CLAIM_PATHS: CLAIM_PATHS,
+				MADGRIX_RESULT_PATH: resultPath,
+			}),
+		);
+		assert.equal(contenders.code, 0, `run-contenders failed:\n${contenders.stderr}`);
+		const candidate = JSON.parse(await readFile(resultPath, "utf8")).candidates[0];
+		const evaluationPath = path.join(dumpDir, "evaluation.json");
+		const evaluation = await runScript(
+			"scripts/evaluate-candidate.ts",
+			operatorEnv({
+				MADGRIX_BASE_URL: fx.mock.url,
+				MADGRIX_TASK_ID: taskId,
+				MADGRIX_CONTENDER_ID: candidate.contender_id,
+				MADGRIX_CANDIDATE_SHA: candidate.candidate_sha,
+				MADGRIX_HIDDEN_TEST_COMMAND: "true",
+				MADGRIX_RESULT_PATH: evaluationPath,
+			}),
+		);
+		assert.equal(evaluation.code, 0, `evaluate-candidate failed:\n${evaluation.stderr}`);
+		const result = JSON.parse(await readFile(evaluationPath, "utf8"));
+		assert.deepEqual(result.tool_status, { actions: 1, errors: [] });
+		assert.equal(result.bundle.admission.valid_tool_states, true);
+		assert.equal(result.bundle.admission.provenance_complete, true);
+		assert.equal(result.provenance.model, "claude-fake-model-1");
+		assert.equal(result.provenance.harness, "claude-code/2.1.42");
+		assert.equal(result.provenance.agent_id, candidate.agent_id);
+	});
+
 	it("evaluate-candidate.ts: hidden/regression/semantic/static/security commands run with minimalEnv() only", async () => {
 		const dumpDir = await mkdtemp(path.join(fx.dumps, "evaluate-"));
 		const taskId = `task_${"d".repeat(24)}`;

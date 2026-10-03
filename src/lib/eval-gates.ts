@@ -272,8 +272,8 @@ export interface ToolStatusCheck {
 	errors: string[];
 }
 
-/** Model and harness identifiers: `claude-x-1`, `org/model@2`, `aider/0.86.0`, ... */
-const IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9._:@/+-]{0,127}$/;
+/** Model and harness identifiers: `claude-x-1`, `org/model@2`, `aider/0.86.0`, `model[1m]`, ... */
+const IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9._:@/+[\]-]{0,127}$/;
 const TOOL_STATUS = /^(?:OK|FAILED\([a-z][a-z0-9_.-]{0,63}\))$/;
 const MAX_ACTION_LENGTH = 200;
 const MAX_ERRORS = 20;

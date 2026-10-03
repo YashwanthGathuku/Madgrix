@@ -53,7 +53,7 @@ line, separated by `\n`. The final newline is optional and blank lines are inval
 |---|---|
 | `format` | exactly `madgrix-tool-status/v1` |
 | `task_id`, `contender_id`, `agent_id`, `baseline_commit` | the values of `MADGRIX_TASK_ID`, `MADGRIX_CONTENDER_ID`, `MADGRIX_AGENT_ID` and `MADGRIX_BASELINE_SHA`, which `run-contenders.mjs` gives the agent command |
-| `model` | the model id the agent used; matches `^[A-Za-z0-9][A-Za-z0-9._:@/+-]{0,127}$` |
+| `model` | the model id the agent used; matches `^[A-Za-z0-9][A-Za-z0-9._:@/+[\]-]{0,127}$` (brackets admit context suffixes such as `[1m]`) |
 | `harness` | the agent harness and its version; same pattern |
 
 **Lines 2…n, one action record per tool action, in order:**
@@ -101,6 +101,26 @@ fails the binding.
 The evaluator's result JSON reports `tool_status: { actions, errors }` and
 `provenance: { agent_id, model, harness, evaluator_harness_version }`. The bundle
 schema is unchanged.
+
+## Claude Code adapter
+
+`scripts/adapters/claude-code-tool-log.mjs` writes this log for Claude Code. It reads
+the JSON-lines output of `claude -p ... --output-format stream-json --verbose` and
+passes it through unchanged. The session record's `model` and `harness`
+(`claude-code/<version>`) come from the stream's `system`/`init` event. There is one
+action record per `tool_use`, in order: `OK`, `FAILED(tool_error)` when its
+`tool_result` has `is_error`, or `FAILED(no_result)` when no result arrived. Only
+tool names are logged, never inputs or outputs.
+
+```
+MADGRIX_AGENT_COMMAND='set -o pipefail; claude -p "$(cat /srv/task.md)" --output-format stream-json --verbose --permission-mode acceptEdits | node /srv/madgrix/scripts/adapters/claude-code-tool-log.mjs'
+MADGRIX_AGENT_ENV_ALLOWLIST=ANTHROPIC_API_KEY
+```
+
+The message shapes were read from the installed package
+(`@anthropic-ai/claude-code` 2.1.42, `cli.js`). The tests drive the adapter with
+transcripts of those shapes and a stand-in `claude`; no live Claude Code run was
+made.
 
 ## Not claimed
 

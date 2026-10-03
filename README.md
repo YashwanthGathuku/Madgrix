@@ -148,7 +148,7 @@ High-level prerequisites:
 1. Deploy the Worker with the `ARTIFACTS`, `TASK_AUTHORITY`, promotion-container, Workflow, Queue, and four secret bindings (three service tokens and `AUTHORITY_SIGNING_KEY`) declared in `cloudflare.config.ts`, and commit the matching `keys/authority.pub` (`keys/README.md`).
 2. Configure Artifact push events from the competition namespace into `madgrix-events`.
 3. Have a baseline Artifact repository and exact baseline commit.
-4. Provide a real coding-agent command that writes its tool-status log (`specs/amendments/tool-status-v1.md`), the claim scope (`MADGRIX_CLAIM_PATHS`; `"**"` is refused), and independent evaluation commands.
+4. Provide a real coding-agent command that writes its tool-status log (`specs/amendments/tool-status-v1.md`; for Claude Code, pipe `claude -p ... --output-format stream-json --verbose` through `scripts/adapters/claude-code-tool-log.mjs`), the claim scope (`MADGRIX_CLAIM_PATHS`; `"**"` is refused), and independent evaluation commands.
 
 Then run:
 
