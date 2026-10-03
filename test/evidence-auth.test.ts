@@ -183,6 +183,21 @@ describe("evidence submission authorization", () => {
 		assert.equal(second.state.evaluations["csha1"].bundle_hash, v2.bundle_hash);
 	});
 
+	it("a malformed evaluation_config_sha256 → rejected; a well-formed one is recorded", async () => {
+		const ctx = makeCtx();
+		for (const bad of ["", "abc", "E".repeat(64), "g".repeat(64), 7]) {
+			const bundle = await makeBundle({ evaluation_config_sha256: bad as never });
+			await assert.rejects(
+				submitEvaluation(observedAuthority(), bundle, caller("evaluation_domain"), ctx),
+				/evaluation_config_sha256/,
+				JSON.stringify(bad),
+			);
+		}
+		const good = await makeBundle({ evaluation_config_sha256: "0a".repeat(32) });
+		const { outcome } = await submitEvaluation(observedAuthority(), good, caller("evaluation_domain"), ctx);
+		assert.equal(outcome, "RECORDED");
+	});
+
 	it("bundle for a different task → rejected", async () => {
 		const ctx = makeCtx();
 		const state = observedAuthority();

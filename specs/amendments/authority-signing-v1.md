@@ -71,7 +71,8 @@ are NOT edited.
 
    The test-result configuration digest is the evaluation bundle hash, because
    the authority holds the content-addressed evaluation record, not the
-   evaluator's command lines.
+   evaluator's command lines. (Superseded where the evaluation carries
+   `evaluation_config_sha256`: `evaluation-config-digest-v1.md`.)
 
    Without the key, finalize answers 503 and consumes nothing. A retry returns
    the stored bundle. `GET /tasks/:id/bundle[?permit_id=]` (CONTROL token)

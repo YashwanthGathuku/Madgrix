@@ -22,6 +22,8 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { canonicalJson, sha256Hex } from "../src/lib/canonical.ts";
+
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const TASK_ID = `task_${"e".repeat(24)}`;
 const TASK_HASH = "a".repeat(64);
@@ -333,6 +335,40 @@ describe("evaluate-candidate.ts: tool-status log gates", () => {
 		assert.equal(result.bundle.admission.exact_baseline, true);
 		assert.equal(result.bundle.admission.scope_compliance, true);
 		assert.equal(result.bundle.admission.no_eval_tampering, true);
+	});
+});
+
+describe("evaluate-candidate.ts: the bundle commits to the evaluation configuration (spec 1 §7)", () => {
+	it("evaluation_config_sha256 is the digest of the commands, test globs, hidden tests and evaluator, and tracks the hidden tests", async () => {
+		const id = "config";
+		const candidate = await makeCandidate(
+			id,
+			{ "src/sum.js": FIXED_SUM, ".madgrix/tool-status.jsonl": toolLog(id, `agent-${id}`) },
+			["src/**"],
+		);
+		const hiddenA = await mkdtemp(path.join(fx.root, "hidden-a-"));
+		const hiddenB = await mkdtemp(path.join(fx.root, "hidden-b-"));
+		await writeFiles(hiddenA, { "hidden/h.test.js": "require('node:assert').strictEqual(1, 1);\n" });
+		await writeFiles(hiddenB, { "hidden/h.test.js": "require('node:assert').strictEqual(2, 2);\n" });
+		const env = { MADGRIX_TEST_GLOBS: "**/*.check.js", MADGRIX_STATIC_COMMAND: "true" };
+		const a = await evaluate(candidate, { ...env, MADGRIX_HIDDEN_TESTS_DIR: hiddenA });
+		const b = await evaluate(candidate, { ...env, MADGRIX_HIDDEN_TESTS_DIR: hiddenB });
+		for (const run of [a, b]) assert.equal(run.code, 0, `evaluate-candidate failed:\n${run.stderr}`);
+
+		const config = a.result.evaluation_config;
+		assert.match(a.result.bundle.evaluation_config_sha256, /^[0-9a-f]{64}$/);
+		assert.equal(a.result.bundle.evaluation_config_sha256, await sha256Hex(canonicalJson(config)));
+		assert.equal(config.commands.hidden, NPM_TEST);
+		assert.equal(config.commands.regression, NPM_TEST);
+		assert.equal(config.commands.static, "true");
+		assert.equal(config.commands.semantic, null);
+		assert.ok(config.test_globs.includes("**/*.check.js") && config.test_globs.includes("**/test/**"));
+		assert.match(config.hidden_tests_sha256, /^[0-9a-f]{64}$/);
+		assert.notEqual(
+			b.result.bundle.evaluation_config_sha256,
+			a.result.bundle.evaluation_config_sha256,
+			"different hidden tests, different configuration digest",
+		);
 	});
 });
 

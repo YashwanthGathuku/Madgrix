@@ -29,6 +29,7 @@ import {
 } from "../src/lib/task-state.ts";
 import { SELECTOR_POLICY_VERSION, type AuthorityState, type EvaluationBundle } from "../src/lib/types.ts";
 import { parseTrustedKey, verifyWithTrustedKey } from "../src/cli/verify.ts";
+import { TEST_RESULT_PREDICATE_TYPE } from "../src/lib/attestation.ts";
 
 const WORKERS_STUB = `data:text/javascript,${encodeURIComponent("export class WorkflowEntrypoint {}")}`;
 registerHooks({
@@ -44,6 +45,8 @@ const TASK_ID = "task_bundle_route";
 const CANDIDATE = "c0ffee0000000000000000000000000000000001";
 const HEAD = "5eed000000000000000000000000000000000002";
 const BASELINE = "ba5e000000000000000000000000000000000003";
+/** The evaluator's configuration digest the stored evaluation carries. */
+const EVALUATION_CONFIG_SHA256 = "e7a1".repeat(16);
 
 async function seededState(ctx: Ctx) {
 	const task_hash = await sha256Hex("bundle-route task");
@@ -108,6 +111,7 @@ async function seededState(ctx: Ctx) {
 		security_policy: { passed: true, findings: [] as string[] },
 		evaluated_at: ctx.now(),
 		tainted: false,
+		evaluation_config_sha256: EVALUATION_CONFIG_SHA256,
 	};
 	const evaluation: EvaluationBundle = { ...rest, bundle_hash: await sha256Hex(canonicalJson(rest)) };
 	state = (await submitEvaluation(state, evaluation, { zone: "evaluation_domain" }, ctx)).state;
@@ -229,6 +233,15 @@ describe("TaskAuthority signs the ship record at /promotion/finalize", () => {
 		assert.deepEqual(served.body, fx.bundle);
 		assert.deepEqual((await getBundle(TOKENS.control)).body, fx.bundle, "default: the latest promotion");
 		assert.equal((await getBundle(TOKENS.agent)).status, 401, "control plane only");
+
+		const testResult = fx.bundle.statements
+			.map((envelope: { payload: string }) => JSON.parse(envelope.payload))
+			.find((statement: { predicateType: string }) => statement.predicateType === TEST_RESULT_PREDICATE_TYPE);
+		assert.equal(
+			testResult?.predicate.configuration.digest.sha256,
+			EVALUATION_CONFIG_SHA256,
+			"the signed test result names the evaluation's configuration digest",
+		);
 
 		const verified = await verifyWithTrustedKey(fx.bundle, fx.pinnedKeyDerHex);
 		assert.equal(verified.verified, true, JSON.stringify(verified.lines));

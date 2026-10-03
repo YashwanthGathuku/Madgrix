@@ -549,6 +549,11 @@ export async function submitEvaluation(
 	}
 	if (bundle.task_hash !== state.task.task_hash)
 		throw new Error("evaluation rejected: task_hash mismatch");
+	if (
+		bundle.evaluation_config_sha256 !== undefined &&
+		(typeof bundle.evaluation_config_sha256 !== "string" || !/^[0-9a-f]{64}$/.test(bundle.evaluation_config_sha256))
+	)
+		throw new Error("evaluation rejected: evaluation_config_sha256 is not a SHA-256 hex digest");
 	const contender = Object.hasOwn(state.contenders, bundle.contender_id)
 		? state.contenders[bundle.contender_id]
 		: undefined;
@@ -1097,9 +1102,9 @@ export async function recordPromotionBundle(
 		await buildTestResultStatement({
 			treeSha256: tree,
 			candidateCommit,
-			// The authority holds the content-addressed evaluation record, not
-			// the evaluator's command lines.
-			testConfigDigest: evaluation.bundle_hash,
+			// The evaluation domain's configuration digest. A bundle without one
+			// (slice harness, older records) falls back to its own hash.
+			testConfigDigest: evaluation.evaluation_config_sha256 ?? evaluation.bundle_hash,
 			result: evaluation.hidden_oracle.passed && evaluation.regressions.passed ? "PASS" : "FAIL",
 		}),
 		await buildVerificationResultStatement({

@@ -187,6 +187,15 @@ export interface EvaluationBundle {
 	evaluated_at: string;
 	/** Set true when the contender is quarantined (spec 3 §7). */
 	tainted: boolean;
+	/**
+	 * SHA-256 (64 lowercase hex) of the evaluation domain's canonical
+	 * configuration: the commands, test globs, hidden-test digest, evaluator
+	 * version and runtime it evaluated under (spec 1 §7: all evaluation inputs
+	 * MUST be hashed into the bundle; specs/amendments/evaluation-config-digest-v1.md).
+	 * scripts/evaluate-candidate.ts always sets it. Bundles from the in-process
+	 * slice harness, and bundles recorded before this field existed, lack it.
+	 */
+	evaluation_config_sha256?: string;
 }
 
 /* ------------------------------------------------------------------ */

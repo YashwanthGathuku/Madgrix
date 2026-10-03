@@ -35,6 +35,11 @@
  * to a path matched by a test glob, or to a path outside its claim scope
  * fails no_eval_tampering.
  *
+ * Configuration digest (specs/amendments/evaluation-config-digest-v1.md):
+ * before any candidate is fetched, the commands, test globs, a digest of the
+ * hidden tests, the evaluator version and the runtime are hashed into the
+ * bundle as evaluation_config_sha256.
+ *
  * Tool-status log (specs/amendments/tool-status-v1.md): valid_tool_states
  * and provenance_complete come from the agent's .madgrix/tool-status.jsonl
  * in the candidate tree. The model id is the log's; no environment variable
@@ -51,7 +56,7 @@
  */
 
 import { createHash } from "node:crypto";
-import { cp, lstat, mkdir, mkdtemp, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { cp, lstat, mkdir, mkdtemp, readdir, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
@@ -256,13 +261,34 @@ async function materialize(repoDir: string, runDir: string, files: RunFile[]): P
 	}
 }
 
-/** Relative paths of the files under the hidden-tests directory. */
+/**
+ * Relative paths of the files under the hidden-tests directory, sorted,
+ * following symlinks as the copy into the run directory does.
+ */
 async function hiddenTestPaths(): Promise<string[]> {
 	if (hiddenTestsDir === undefined) return [];
-	const entries = await readdir(hiddenTestsDir, { recursive: true, withFileTypes: true });
-	return entries
-		.filter((e) => !e.isDirectory())
-		.map((e) => path.relative(hiddenTestsDir, path.join(e.parentPath, e.name)).split(path.sep).join("/"));
+	const root = hiddenTestsDir;
+	const files: string[] = [];
+	const walk = async (rel: string): Promise<void> => {
+		for (const name of await readdir(path.join(root, rel))) {
+			const child = rel === "" ? name : `${rel}/${name}`;
+			if ((await stat(path.join(root, child))).isDirectory()) await walk(child);
+			else files.push(child);
+		}
+	};
+	await walk("");
+	return files.sort();
+}
+
+/** SHA-256 over the hidden tests: each file's relative path with its content digest. */
+async function hiddenTestsDigest(): Promise<string | null> {
+	if (hiddenTestsDir === undefined) return null;
+	const entries: Array<[string, string]> = [];
+	for (const rel of await hiddenTestPaths()) {
+		const content = await readFile(path.join(hiddenTestsDir, rel));
+		entries.push([rel, createHash("sha256").update(content).digest("hex")]);
+	}
+	return sha256Hex(canonicalJson(entries));
 }
 
 function suiteResult(command: string, result: { passed: boolean; detail: string }) {
@@ -272,6 +298,24 @@ function suiteResult(command: string, result: { passed: boolean; detail: string 
 		failed: result.passed ? [] : [`${command}: ${result.detail || "failed"}`],
 	};
 }
+
+// Everything this evaluation runs under, fixed before any candidate is
+// fetched (spec 3 §4.3). Its digest goes into the bundle (spec 1 §7).
+const evaluationConfig = {
+	format: "madgrix-evaluation-config/v1",
+	commands: {
+		hidden: hiddenCommand,
+		regression: regressionCommand ?? null,
+		semantic: semanticCommand ?? null,
+		static: staticCommand ?? null,
+		security: securityCommand ?? null,
+	},
+	test_globs: testGlobs,
+	hidden_tests_sha256: await hiddenTestsDigest(),
+	evaluator: harnessVersion,
+	runtime: { node: process.version, platform: process.platform, arch: process.arch },
+};
+const evaluationConfigSha256 = await sha256Hex(canonicalJson(evaluationConfig));
 
 const creds = await postJson(
 	`${baseUrl}/tasks/${encodeURIComponent(taskId)}/evaluator-credentials`,
@@ -367,6 +411,7 @@ try {
 		},
 		evaluated_at,
 		tainted: false,
+		evaluation_config_sha256: evaluationConfigSha256,
 	};
 	const bundle_hash = await sha256Hex(canonicalJson(withoutHash));
 	const bundle = { ...withoutHash, bundle_hash };
@@ -380,6 +425,7 @@ try {
 		bundle_hash,
 		changed_files: changed,
 		bundle,
+		evaluation_config: evaluationConfig,
 		tool_status: { actions: toolStatus.actions, errors: toolStatus.errors },
 		provenance: {
 			agent_id: toolStatus.session?.agent_id ?? null,
