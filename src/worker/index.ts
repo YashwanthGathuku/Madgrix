@@ -1264,11 +1264,13 @@ export class PromotionWorkflow extends WorkflowEntrypoint<Env, PromotionWorkflow
 					body: JSON.stringify({ permit_id: p.permit_id }),
 				}),
 			);
-			const body = await res.json();
+			const body = await res.text();
 			// 5xx means an infrastructure/transient failure: let Workflows retry.
 			if (res.status >= 500) {
-				throw new Error(`promotion transient failure: HTTP ${res.status} ${JSON.stringify(body)}`);
+				throw new Error(`promotion transient failure: HTTP ${res.status} ${body}`);
 			}
+			// A step result must be Rpc.Serializable: the JSON text is, a parsed
+			// `unknown` is not.
 			return { status: res.status, body };
 		});
 	}

@@ -26,6 +26,10 @@ jobs:
         run: npm run typecheck
       - name: Cloudflare build
         run: npm run build
+      # cf build writes .cloudflare/types (the Workers runtime types), which
+      # tsconfig.json includes; the first typecheck ran before they existed.
+      - name: Typecheck against generated Cloudflare runtime types
+        run: npm run typecheck
       - name: Validate live-run scripts
         run: |
           node --check scripts/run-contenders.mjs
