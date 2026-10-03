@@ -133,9 +133,9 @@ npm run bench
 Expected test summary at the current competition-critical branch:
 
 ```
-tests 159
-suites 41
-pass 159
+tests 164
+suites 43
+pass 164
 fail 0
 ```
 

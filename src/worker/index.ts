@@ -752,11 +752,11 @@ export async function handleEvaluatorCredentials(env: Env, taskId: string, reque
 
 /**
  * POST /tasks/:id/evidence — accept an evaluation bundle from the
- * evaluation domain and record it in the task authority.
- * SKELETON: currently accepts + records. Production MUST authenticate the
- * caller as the evaluation domain (spec 3 §2) before recording — evidence
- * is only admissible from the evaluation domain and committed verifiers
- * (spec 3 §6, attack 6).
+ * evaluation domain and record it in the task authority. The caller must
+ * present EVALUATION_SERVICE_TOKEN (spec 3 §2): evidence is only admissible
+ * from the evaluation domain (spec 3 §6, attack 6). The authority's answer
+ * passes through: 422 for a bundle it rejects, 409 for a replacement of a
+ * labeled candidate's evidence (specs/amendments/evidence-integrity-v1.md).
  */
 export async function handleEvidence(env: Env, taskId: string, request: Request): Promise<Response> {
 	if (!(await requireEvaluationDomain(request, env))) {
