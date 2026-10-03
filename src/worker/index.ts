@@ -65,7 +65,7 @@ import type {
 } from "../lib/types.ts";
 import { SELECTOR_POLICY_VERSION } from "../lib/types.ts";
 import type { Effect } from "../lib/task-state.ts";
-import { resolveAgentBySecret, taskHashFor } from "../lib/task-state.ts";
+import { AGENT_ID_PATTERN, resolveAgentBySecret, taskHashFor } from "../lib/task-state.ts";
 import { computePermitId, TaskAuthority } from "../do/TaskAuthority.ts";
 import { PromotionContainer } from "../do/PromotionContainer.ts";
 
@@ -420,6 +420,14 @@ export async function handleCreateTask(env: Env, request: Request): Promise<Resp
 	if (typeof baseline_commit !== "string" || baseline_commit === "") {
 		return json({ error: "baseline_commit_required" }, 400);
 	}
+	const agent_ids = parsed.body["agent_ids"];
+	if (!Array.isArray(agent_ids) || agent_ids.length === 0) return json({ error: "agent_ids_required" }, 400);
+	if (
+		!agent_ids.every((id): id is string => typeof id === "string" && AGENT_ID_PATTERN.test(id)) ||
+		new Set(agent_ids).size !== agent_ids.length
+	) {
+		return json({ error: "invalid_agent_ids", detail: "distinct ids matching [A-Za-z0-9][A-Za-z0-9._-]{0,63}" }, 400);
+	}
 
 	const port = productionPort(env);
 	let baselineRepo: ArtifactsRepo;
@@ -461,17 +469,29 @@ export async function handleCreateTask(env: Env, request: Request): Promise<Resp
 	// DO validates key material (fail closed on garbage).
 	const verifier_keys = parsed.body["verifier_keys"];
 	const operator_keys = parsed.body["operator_keys"];
+	// Each agent gets its own secret here, from the control plane, so no
+	// holder of the shared agent token can claim an agent id first
+	// (specs/amendments/agent-enrollment-v1.md). The authority stores only
+	// the hashes; the plaintexts are returned once, in this response.
+	const agent_secrets: Record<string, string> = {};
+	const agent_enrollment: Record<string, string> = {};
+	for (const agent of agent_ids) {
+		agent_secrets[agent] = randomHex(32);
+		agent_enrollment[agent] = await sha256Hex(agent_secrets[agent]);
+	}
 	const res = await doRpc(taskStub(env, task_id), "/init", {
-		body: { task, verifier_keys, operator_keys },
+		body: { task, verifier_keys, operator_keys, agent_enrollment },
 	});
 	if (!res.ok) return json({ error: "authority_init_failed", detail: res.body }, 502);
-	return json({ task_id, task_hash, frozen_at }, 201);
+	return json({ task_id, task_hash, frozen_at, agent_secrets }, 201);
 }
 
 /**
  * Per-agent secret header. Every agent shares AGENT_SERVICE_TOKEN; this
- * secret, returned once by an agent's first /claim, says WHICH agent is
- * calling (specs/amendments/contender-agent-binding.md).
+ * secret says WHICH agent is calling. POST /tasks issues one per enrolled
+ * agent (specs/amendments/agent-enrollment-v1.md); a task initialized
+ * without enrollment hands it out on the agent's first /claim
+ * (specs/amendments/contender-agent-binding.md).
  */
 const AGENT_SECRET_HEADER = "x-madgrix-agent-secret";
 
@@ -482,9 +502,11 @@ function publicClaim(claim: WorkClaim): Omit<WorkClaim, "agent_secret_sha256"> {
 }
 
 /**
- * POST /tasks/:id/claim — forward a WorkClaim to the task authority. An
- * agent's first claim returns its secret once (`agent_secret`); a later
- * claim for the same agent must send it in X-Madgrix-Agent-Secret.
+ * POST /tasks/:id/claim — forward a WorkClaim to the task authority. Every
+ * claim sends the agent's secret in X-Madgrix-Agent-Secret: the one POST
+ * /tasks issued for that agent (an agent the task did not enroll gets 403).
+ * On a task initialized without enrollment, the agent's first claim instead
+ * returns a secret once (`agent_secret`).
  */
 export async function handleClaim(env: Env, taskId: string, request: Request): Promise<Response> {
 	if (!(await requireAgentOrControl(request, env))) return json({ error: "agent_auth_required" }, 401);

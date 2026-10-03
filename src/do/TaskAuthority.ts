@@ -36,6 +36,7 @@ import {
 	attemptPromotion,
 	commitVerifier,
 	createAuthority,
+	enrollAgents,
 	ingestQueueEvent,
 	issuePermit,
 	recordPromotionBundle,
@@ -167,6 +168,9 @@ export class TaskAuthority {
 			const body = parsed.body as {
 				verifier_keys?: { verifier_id: string; public_key_der_hex: string }[];
 				operator_keys?: { public_key_der_hex: string }[];
+				// Agent id → SHA-256 of its secret (agent-enrollment-v1). The
+				// plaintext secrets never reach the authority.
+				agent_enrollment?: Record<string, string>;
 			};
 			const ctx = await productionCtx();
 			return this.doState.storage.transaction(async () => {
@@ -180,6 +184,13 @@ export class TaskAuthority {
 					state = await registerOperatorKeys(state, body.operator_keys ?? [], ctx);
 				} catch (err) {
 					return json({ error: "key_registration_failed", detail: (err as Error).message }, 400);
+				}
+				if (body.agent_enrollment !== undefined) {
+					try {
+						state = await enrollAgents(state, body.agent_enrollment, ctx);
+					} catch (err) {
+						return json({ error: "agent_enrollment_failed", detail: (err as Error).message }, 400);
+					}
 				}
 				await this.doState.storage.put(STATE_KEY, state);
 				return json({ task_id: task.task_id, task_hash: task.task_hash, initialized: true });

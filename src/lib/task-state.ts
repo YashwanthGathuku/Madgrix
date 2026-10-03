@@ -341,12 +341,38 @@ export async function ingestQueueEvent(
  * the caller did not present that secret. The edge maps this to 403.
  */
 export class AgentSecretError extends Error {
-	readonly code: "agent_secret_required" | "agent_secret_invalid";
-	constructor(code: "agent_secret_required" | "agent_secret_invalid", message: string) {
+	readonly code: "agent_secret_required" | "agent_secret_invalid" | "agent_not_enrolled";
+	constructor(code: "agent_secret_required" | "agent_secret_invalid" | "agent_not_enrolled", message: string) {
 		super(message);
 		this.name = "AgentSecretError";
 		this.code = code;
 	}
+}
+
+/** Agent ids the control plane may enroll. */
+export const AGENT_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+
+/**
+ * Record the agents the control plane enrolled at task creation, each by
+ * the SHA-256 of the secret it was issued (specs/amendments/agent-enrollment-v1.md).
+ * Once only, and before any claim.
+ */
+export async function enrollAgents(
+	state: AuthorityState,
+	enrollment: Record<string, string>,
+	ctx: Ctx,
+): Promise<AuthorityState> {
+	if (state.agent_enrollment !== undefined) throw new Error("enrollAgents: agents are already enrolled");
+	if (state.claims.length > 0) throw new Error("enrollAgents: claims exist; enrollment must precede them");
+	const ids = Object.keys(enrollment);
+	if (ids.length === 0) throw new Error("enrollAgents: at least one agent is required");
+	for (const id of ids) {
+		if (!AGENT_ID_PATTERN.test(id)) throw new Error(`enrollAgents: invalid agent id ${JSON.stringify(id)}`);
+		if (typeof enrollment[id] !== "string" || !/^[0-9a-f]{64}$/.test(enrollment[id])) {
+			throw new Error(`enrollAgents: agent ${id} needs a SHA-256 hex digest`);
+		}
+	}
+	return appendLedger({ ...state, agent_enrollment: { ...enrollment } }, "agents_enrolled", { agent_ids: ids.sort() }, ctx);
 }
 
 /** String equality without an early exit (for secret hashes). */
@@ -367,6 +393,11 @@ function constantTimeEqual(a: string, b: string): boolean {
  * SHA-256(secret) on the claim and returns the plaintext once as
  * `agent_secret`. A later claim naming the same agent must present that
  * secret (AgentSecretError otherwise); it gets the same hash and no secret.
+ *
+ * Enrolled tasks (specs/amendments/agent-enrollment-v1.md): the control
+ * plane issued each agent its secret at task creation. Only enrolled agents
+ * may claim (agent_not_enrolled), every claim, the first included, must
+ * present the agent's own secret, and nothing is minted.
  *
  * Throws on validation failure — registration rejection is not a state.
  */
@@ -392,9 +423,17 @@ export async function registerClaim(
 		throw new Error(
 			`claim rejected: baseline mismatch (claim ${input.baseline} != frozen ${state.task.baseline_commit})`,
 		);
-	const boundHash = state.claims.find(
-		(c) => c.agent === input.agent && typeof c.agent_secret_sha256 === "string",
-	)?.agent_secret_sha256;
+	const enrolled = state.agent_enrollment;
+	const boundHash =
+		enrolled !== undefined
+			? Object.hasOwn(enrolled, input.agent)
+				? enrolled[input.agent]
+				: undefined
+			: state.claims.find((c) => c.agent === input.agent && typeof c.agent_secret_sha256 === "string")
+					?.agent_secret_sha256;
+	if (enrolled !== undefined && boundHash === undefined) {
+		throw new AgentSecretError("agent_not_enrolled", `claim rejected: agent ${input.agent} is not enrolled in this task`);
+	}
 	let agent_secret: string | null = null;
 	let agent_secret_sha256: string;
 	if (boundHash !== undefined) {

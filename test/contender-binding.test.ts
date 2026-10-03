@@ -28,7 +28,7 @@ import { TaskAuthority } from "../src/do/TaskAuthority.ts";
 import { canonicalJson, sha256Hex } from "../src/lib/canonical.ts";
 import { FakeArtifacts } from "../src/lib/fake-artifacts.ts";
 import { quarantineContender, type Ctx } from "../src/lib/task-state.ts";
-import type { AuthorityState } from "../src/lib/types.ts";
+import { SELECTOR_POLICY_VERSION, type AuthorityState, type TaskRecord } from "../src/lib/types.ts";
 
 const WORKERS_STUB = `data:text/javascript,${encodeURIComponent("export class WorkflowEntrypoint {}")}`;
 registerHooks({
@@ -84,6 +84,8 @@ interface Harness {
 	taskId: string;
 	taskHash: string;
 	baseline: string;
+	/** Agent id → the secret POST /tasks issued it (agent-enrollment-v1). */
+	secrets: Record<string, string>;
 }
 
 interface Reply {
@@ -134,10 +136,50 @@ async function makeHarness(): Promise<Harness> {
 	});
 	const created = await call({ env }, "POST", "/tasks", {
 		token: TOKENS.control,
-		body: { intent: "bind contenders to agents", baseline_repo: "baseline", baseline_commit: baseline },
+		body: {
+			intent: "bind contenders to agents",
+			baseline_repo: "baseline",
+			baseline_commit: baseline,
+			agent_ids: ["agent-a", "agent-b", "agent-c"],
+		},
 	});
 	assert.equal(created.status, 201, `task creation failed: ${JSON.stringify(created.body)}`);
-	return { fake, env, taskId: created.body.task_id, taskHash: created.body.task_hash, baseline };
+	return {
+		fake,
+		env,
+		taskId: created.body.task_id,
+		taskHash: created.body.task_hash,
+		baseline,
+		secrets: created.body.agent_secrets,
+	};
+}
+
+/**
+ * A task the authority initialized without enrollment, as before
+ * agent-enrollment-v1: an agent's first claim mints its secret.
+ */
+async function makeLegacyHarness(): Promise<Harness> {
+	const h = await makeHarness();
+	const task: TaskRecord = {
+		task_id: "task_legacy_unenrolled",
+		task_hash: await sha256Hex("a task initialized without enrollment"),
+		intent: "bind contenders to agents",
+		baseline_repo: "baseline",
+		baseline_commit: h.baseline,
+		behavior_contract: "",
+		policy_version: SELECTOR_POLICY_VERSION,
+		frozen_at: "2026-10-02T09:00:00Z",
+	};
+	const legacy = { ...h, taskId: task.task_id, taskHash: task.task_hash, secrets: {} };
+	const init = await authority(legacy).fetch(
+		new Request("https://task-authority/init", {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ task }),
+		}),
+	);
+	assert.equal(init.status, 200);
+	return legacy;
 }
 
 function claimInput(h: Harness, agent: string) {
@@ -197,9 +239,9 @@ const testCtx: Ctx = {
 describe("contender binding: one agent cannot take over another agent's contender", () => {
 	it("agent B naming agent A gets 403 and no token; A's record is byte-identical", async () => {
 		const h = await makeHarness();
-		const claimA = await claim(h, "agent-a");
+		const claimA = await claim(h, "agent-a", h.secrets["agent-a"]);
 		const contenderA = await contender(h, {
-			secret: claimA.body.agent_secret,
+			secret: h.secrets["agent-a"],
 			agent_id: "agent-a",
 			claim_work_id: claimA.body.work_id,
 		});
@@ -208,8 +250,8 @@ describe("contender binding: one agent cannot take over another agent's contende
 		const recordBefore = await storedRecord(h, contenderA.body.contender_id);
 		const tokensBefore = await forkTokens(h, contenderA.body.fork_repo);
 
-		const claimB = await claim(h, "agent-b");
-		const attack = await contender(h, { secret: claimB.body.agent_secret, agent_id: "agent-a" });
+		await claim(h, "agent-b", h.secrets["agent-b"]);
+		const attack = await contender(h, { secret: h.secrets["agent-b"], agent_id: "agent-a" });
 
 		assert.equal(typeof attack.body.token, "undefined", "B must not receive a write token for A's fork");
 		assert.equal(attack.status, 403);
@@ -217,8 +259,8 @@ describe("contender binding: one agent cannot take over another agent's contende
 		assert.equal(await forkTokens(h, contenderA.body.fork_repo), tokensBefore, "no token minted on A's fork");
 	});
 
-	it("/claim returns a 32-byte hex agent secret once; the authority keeps only its SHA-256", async () => {
-		const h = await makeHarness();
+	it("on a task initialized without enrollment, /claim returns a 32-byte hex secret once; only its SHA-256 is kept", async () => {
+		const h = await makeLegacyHarness();
 		const first = await claim(h, "agent-a");
 		assert.equal(first.status, 200);
 		assert.match(String(first.body.agent_secret), /^[0-9a-f]{64}$/);
@@ -253,18 +295,18 @@ describe("contender binding: one agent cannot take over another agent's contende
 
 	it("/contenders requires X-Madgrix-Agent-Secret and derives the agent from the matching claim", async () => {
 		const h = await makeHarness();
-		const a = await claim(h, "agent-a");
-		const b = await claim(h, "agent-b");
+		const a = await claim(h, "agent-a", h.secrets["agent-a"]);
+		const b = await claim(h, "agent-b", h.secrets["agent-b"]);
 
 		const missing = await contender(h, { agent_id: "agent-a", claim_work_id: a.body.work_id });
 		assert.equal(missing.status, 401, "no agent secret");
 		const unknown = await contender(h, { secret: "0".repeat(64), agent_id: "agent-a" });
 		assert.equal(unknown.status, 403, "secret matches no claim");
-		const crossClaim = await contender(h, { secret: b.body.agent_secret, claim_work_id: a.body.work_id });
+		const crossClaim = await contender(h, { secret: h.secrets["agent-b"], claim_work_id: a.body.work_id });
 		assert.equal(crossClaim.status, 403, "B cannot bind A's claim");
 		for (const refused of [missing, unknown, crossClaim]) assert.equal(typeof refused.body.token, "undefined");
 
-		const derived = await contender(h, { secret: b.body.agent_secret, claim_work_id: b.body.work_id });
+		const derived = await contender(h, { secret: h.secrets["agent-b"], claim_work_id: b.body.work_id });
 		assert.equal(derived.status, 201);
 		const state = await authorityState(h);
 		assert.deepEqual(
@@ -276,14 +318,14 @@ describe("contender binding: one agent cannot take over another agent's contende
 
 	it("an existing contender is returned unchanged with 200 and no new token", async () => {
 		const h = await makeHarness();
-		const a = await claim(h, "agent-a");
-		const first = await contender(h, { secret: a.body.agent_secret, agent_id: "agent-a" });
+		await claim(h, "agent-a", h.secrets["agent-a"]);
+		const first = await contender(h, { secret: h.secrets["agent-a"], agent_id: "agent-a" });
 		assert.equal(first.status, 201);
 		const id: string = first.body.contender_id;
 		const recordBefore = await storedRecord(h, id);
 		const tokensBefore = await forkTokens(h, first.body.fork_repo);
 
-		const retry = await contender(h, { secret: a.body.agent_secret, agent_id: "agent-a" });
+		const retry = await contender(h, { secret: h.secrets["agent-a"], agent_id: "agent-a" });
 		assert.equal(retry.status, 200);
 		assert.equal(retry.body.contender_id, id);
 		assert.equal(typeof retry.body.token, "undefined", "a retry mints no second token");
@@ -308,8 +350,8 @@ describe("contender binding: one agent cannot take over another agent's contende
 
 	it("every minted token id is on the contender and quarantine revokes all of them", async () => {
 		const h = await makeHarness();
-		const a = await claim(h, "agent-a");
-		const created = await contender(h, { secret: a.body.agent_secret, agent_id: "agent-a" });
+		await claim(h, "agent-a", h.secrets["agent-a"]);
+		const created = await contender(h, { secret: h.secrets["agent-a"], agent_id: "agent-a" });
 		const state = await authorityState(h);
 		const record = state.contenders[created.body.contender_id];
 		assert.deepEqual(record.token_ids, [record.token_id], "the minted write token is recorded");
@@ -349,8 +391,8 @@ describe("contender binding: one agent cannot take over another agent's contende
 
 describe("tamper quarantine at the evidence route", () => {
 	async function contenderWithPush(h: Harness, sha: string) {
-		const a = await claim(h, "agent-a");
-		const created = await contender(h, { secret: a.body.agent_secret, agent_id: "agent-a" });
+		await claim(h, "agent-a", h.secrets["agent-a"]);
+		const created = await contender(h, { secret: h.secrets["agent-a"], agent_id: "agent-a" });
 		assert.equal(created.status, 201);
 		const event = { namespace: "default", repo: created.body.fork_repo, ref: "refs/heads/main", before: h.baseline, after: sha };
 		const pushed = await authority(h).fetch(
@@ -421,5 +463,63 @@ describe("tamper quarantine at the evidence route", () => {
 		assert.equal(res.status, 200, JSON.stringify(res.body));
 		assert.equal(res.body.quarantined, false);
 		assert.equal((await authorityState(h)).quarantine[c.contender_id], undefined);
+	});
+});
+
+describe("agent enrollment (specs/amendments/agent-enrollment-v1.md)", () => {
+	async function enrolledHarness(agentIds: string[]) {
+		const h = await makeHarness();
+		const created = await call(h, "POST", "/tasks", {
+			token: TOKENS.control,
+			body: { intent: "enroll agents", baseline_repo: "baseline", baseline_commit: h.baseline, agent_ids: agentIds },
+		});
+		return { ...h, created, taskId: created.body.task_id, taskHash: created.body.task_hash };
+	}
+
+	it("POST /tasks requires agent_ids and returns one 32-byte hex secret per agent, once; the authority keeps only SHA-256", async () => {
+		const h = await makeHarness();
+		const missing = await call(h, "POST", "/tasks", {
+			token: TOKENS.control,
+			body: { intent: "no agents named", baseline_repo: "baseline", baseline_commit: h.baseline },
+		});
+		assert.equal(missing.status, 400);
+		assert.equal(missing.body.error, "agent_ids_required");
+
+		const e = await enrolledHarness(["agent-a", "agent-b"]);
+		assert.equal(e.created.status, 201);
+		const secrets: Record<string, string> = e.created.body.agent_secrets;
+		assert.deepEqual(Object.keys(secrets ?? {}).sort(), ["agent-a", "agent-b"]);
+		for (const secret of Object.values(secrets)) assert.match(secret, /^[0-9a-f]{64}$/);
+		const state = await authorityState(e);
+		assert.deepEqual(state.agent_enrollment, {
+			"agent-a": sha256(secrets["agent-a"]),
+			"agent-b": sha256(secrets["agent-b"]),
+		});
+		for (const secret of Object.values(secrets)) {
+			assert.ok(!JSON.stringify(state).includes(secret), "no plaintext secret is stored");
+		}
+	});
+
+	it("an agent's first claim needs its own secret: a squatter gets 403 and the real agent still claims", async () => {
+		const e = await enrolledHarness(["agent-a", "agent-b"]);
+		const secrets: Record<string, string> = e.created.body.agent_secrets ?? {};
+		for (const presented of [undefined, secrets["agent-b"], "0".repeat(64)]) {
+			const squat = await claim(e, "agent-a", presented);
+			assert.equal(squat.status, 403, `claim as agent-a with ${presented === undefined ? "no" : "a wrong"} secret`);
+			assert.equal(squat.body.agent_secret, undefined);
+		}
+		const real = await claim(e, "agent-a", secrets["agent-a"]);
+		assert.equal(real.status, 200, JSON.stringify(real.body));
+		assert.equal(real.body.agent_secret, undefined, "enrolled agents are never handed a minted secret");
+		const created = await contender(e, { secret: secrets["agent-a"], claim_work_id: real.body.work_id });
+		assert.equal(created.status, 201);
+		assert.equal((await authorityState(e)).contenders[created.body.contender_id].agent_id, "agent-a");
+	});
+
+	it("an agent id the control plane did not enroll cannot claim", async () => {
+		const e = await enrolledHarness(["agent-a"]);
+		const res = await claim(e, "agent-z", e.created.body.agent_secrets?.["agent-a"]);
+		assert.equal(res.status, 403);
+		assert.equal(res.body.error, "agent_not_enrolled");
 	});
 });

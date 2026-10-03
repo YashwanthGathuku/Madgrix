@@ -12,6 +12,7 @@ import {
 	commitVerifier,
 	createAuthority,
 	defaultCtx,
+	enrollAgents,
 	escalateToOperator,
 	ingestQueueEvent,
 	issuePermit,
@@ -239,6 +240,44 @@ describe("registerClaim", () => {
 		}, ctx);
 		assert.equal(r2.reports.length, 1);
 		assert.equal(r2.reports[0].risk, "RED");
+	});
+
+	it("enrolled task: only enrolled agents, each with its own secret, may claim; nothing is minted", async () => {
+		const ctx = makeCtx();
+		const secretA = "a1".repeat(32);
+		let state = await enrollAgents(stateWithContender(ctx), { "contender-1": await sha256Hex(secretA) }, ctx);
+		const input = {
+			agent: "contender-1",
+			task: TASK_HASH,
+			baseline: BASELINE,
+			intent: { behavior: ["x"] },
+			scope: { paths: ["src/**"], symbols: [] },
+			contracts: { reads: [], modifies: [] },
+			interfaces: [],
+			schema_changes: [],
+			expected_tests: [],
+			lease: { claimed_at: "2026-10-01T18:00:00Z", expires_at: "2026-10-01T20:00:00Z" },
+		};
+		await assert.rejects(registerClaim(state, input, ctx), /requires its secret/);
+		await assert.rejects(registerClaim(state, input, ctx, "b2".repeat(32)), /does not match/);
+		await assert.rejects(registerClaim(state, { ...input, agent: "contender-9" }, ctx, secretA), /not enrolled/);
+		const r = await registerClaim(state, input, ctx, secretA);
+		assert.equal(r.agent_secret, null, "no secret is minted for an enrolled agent");
+		assert.equal(r.claim.agent_secret_sha256, await sha256Hex(secretA));
+		state = r.state;
+		await assert.rejects(enrollAgents(state, { "contender-2": await sha256Hex("x") }, ctx), /already enrolled/);
+	});
+
+	it("enrollAgents validates ids and digests and must precede every claim", async () => {
+		const ctx = makeCtx();
+		const digest = "c3".repeat(32);
+		for (const [label, enrollment] of [
+			["no agents", {}],
+			["bad id", { "agent a": digest }],
+			["bad digest", { "agent-a": "nope" }],
+		] as const) {
+			await assert.rejects(enrollAgents(stateWithContender(ctx), enrollment, ctx), /enrollAgents/, label);
+		}
 	});
 
 	it("rejects empty scope.paths", async () => {

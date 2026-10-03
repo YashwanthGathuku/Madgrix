@@ -43,7 +43,7 @@ Control plane
 Runtime identities are also separated:
 
 - `AGENT_SERVICE_TOKEN` — WorkClaim/context/contender operations.
-- Per-agent secret — returned once by an agent's first `/claim`; `/contenders` requires it in `X-Madgrix-Agent-Secret` and derives the agent from it, so a contender's write token is minted once, to the agent whose claim holds the secret.
+- Per-agent secret — issued once per enrolled agent by `POST /tasks`; every `/claim` and `/contenders` call presents it in `X-Madgrix-Agent-Secret`, and `/contenders` derives the agent from it, so a contender's write token is minted once, to that agent.
 - `EVALUATION_SERVICE_TOKEN` — read-only evaluator credentials and evidence submission.
 - `CONTROL_SERVICE_TOKEN` — task freeze, verifier protocol, verdict, and promotion.
 - Artifacts repo tokens are short-lived and scoped to one repository and one access level.
@@ -164,9 +164,9 @@ Provider-specific coding agents are deliberately not hardcoded. `MADGRIX_AGENT_C
 
 | Method | Route | Identity | Purpose |
 |---|---|---|---|
-| POST | `/tasks` | CONTROL | Freeze task + verifier/operator keys |
+| POST | `/tasks` | CONTROL | Freeze task + verifier/operator keys; enroll `agent_ids`, returning each agent's secret once |
 | GET | `/tasks/:id/context` | AGENT/CONTROL | Frozen task, claims, contender summaries |
-| POST | `/tasks/:id/claim` | AGENT/CONTROL (+ agent secret after the agent's first claim) | Register WorkClaim + conflict findings; the first claim returns the agent secret once |
+| POST | `/tasks/:id/claim` | AGENT/CONTROL + `X-Madgrix-Agent-Secret` | Register an enrolled agent's WorkClaim + conflict findings |
 | POST | `/tasks/:id/contenders` | AGENT/CONTROL + `X-Madgrix-Agent-Secret` | Create the calling agent's contender repo + scoped write token (once per contender) |
 | POST | `/tasks/:id/evaluator-credentials` | EVALUATION | Mint short-lived read-only candidate credential |
 | POST | `/tasks/:id/evidence` | EVALUATION | Submit content-addressed evaluation bundle for the contender's latest observed commit; a replacement bundle is refused (409) once the candidate is labeled |

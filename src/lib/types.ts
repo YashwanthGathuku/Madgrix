@@ -398,6 +398,14 @@ export interface AuthorityState {
 	 * Absent until the task's first promotion.
 	 */
 	promotion_bundles?: Record<string, import("./attestation.ts").PromotionBundle>;
+	/**
+	 * Agent id → SHA-256 of the secret the control plane issued that agent at
+	 * task creation (specs/amendments/agent-enrollment-v1.md). When present,
+	 * only these agents may claim, and every claim, the first included, must
+	 * present the agent's secret. Absent on tasks initialized without
+	 * enrollment, whose first claim mints the secret instead.
+	 */
+	agent_enrollment?: Record<string, string>;
 }
 
 /** Queue push event (spec 5 §3). NOTE: event_key is derived from content,

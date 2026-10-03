@@ -403,6 +403,29 @@ describe("claim scope: no default \"**\" claim", () => {
 		}
 	});
 
+	it("run-contenders.mjs refuses missing or incomplete MADGRIX_AGENT_SECRETS before any Worker call", async () => {
+		const secret = "5".repeat(64);
+		for (const secrets of [
+			undefined,
+			"not json",
+			JSON.stringify({ "agent-a": secret }),
+			JSON.stringify({ "agent-a": secret, "agent-b": "short" }),
+			JSON.stringify([secret, secret]),
+		]) {
+			const before = fx.requests;
+			const run = await runNode("scripts/run-contenders.mjs", {
+				...base(),
+				MADGRIX_AGENT_IDS: "agent-a,agent-b",
+				MADGRIX_CLAIM_PATHS: "src/**",
+				...(secrets === undefined ? {} : { MADGRIX_AGENT_SECRETS: secrets }),
+			});
+			assert.equal(run.code, 2, `${secrets}: ${run.stderr}`);
+			assert.match(run.stderr, /MADGRIX_AGENT_SECRETS has no secret for/);
+			assert.ok(!run.stderr.includes(secret), "a refusal never echoes a secret");
+			assert.equal(fx.requests, before, "refused before any Worker call");
+		}
+	});
+
 	it("live-e2e.ts requires MADGRIX_CLAIM_PATHS (or a template) and no longer requires MADGRIX_MODEL_NAME", async () => {
 		const before = fx.requests;
 		const live = await runNode("scripts/live-e2e.ts", {

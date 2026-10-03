@@ -85,7 +85,7 @@ The amendment recording this is `specs/amendments/process-env-boundaries.md`.
 | Process | Started by | Service token it receives | Other variables beyond `minimalEnv()` |
 |---|---|---|---|
 | `live-e2e.ts` | operator | all three (it orchestrates every zone) | operator's environment |
-| `run-contenders.mjs` | `live-e2e.ts` | AGENT only | runner settings, allowlisted variables |
+| `run-contenders.mjs` | `live-e2e.ts` | AGENT only | runner settings, allowlisted variables, `MADGRIX_AGENT_SECRETS` (each agent's enrollment secret) |
 | coding-agent command | `run-contenders.mjs` | **none** | `MADGRIX_AGENT_ID`, `MADGRIX_CONTENDER_ID`, `MADGRIX_TASK_ID`, `MADGRIX_BASELINE_SHA`, `MADGRIX_WORKSPACE`, allowlisted variables |
 | `evaluate-candidate.ts` | `live-e2e.ts` | EVALUATION only | evaluation settings and commands |
 | hidden, regression, semantic, static, security commands | `evaluate-candidate.ts` | **none** | none |

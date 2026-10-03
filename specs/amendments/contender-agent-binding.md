@@ -94,6 +94,8 @@ token for agent A's fork, and all five tests failed.
   claimed yet and so bind that id to its own secret. The real agent's first
   claim then fails with 403: it fails closed rather than sharing a fork.
   Per-agent transport credentials would remove this, and are out of scope here.
+  (Closed for tasks the Worker creates: the control plane now issues each agent
+  its secret at task creation, `agent-enrollment-v1.md`.)
 - **Fork-creation token.** The token that fork/create returns is plaintext-only
   (no id). The Worker revokes it immediately at fork time; it is not in
   `token_ids`.

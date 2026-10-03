@@ -10,6 +10,11 @@
  *     repo-relative globs ("**" is refused: an unbounded claim is not
  *     admissible, spec 2 §7). Or MADGRIX_CLAIM_TEMPLATE, a JSON claim body
  *     whose own scope.paths is used instead.
+ *   MADGRIX_AGENT_SECRETS='{"agent-a":"<64 hex>",...}'   the agent_secrets
+ *     POST /tasks returned, one per agent id (specs/amendments/
+ *     agent-enrollment-v1.md). The runner presents each agent's secret on
+ *     its /claim and /contenders requests and never passes it to the agent
+ *     command.
  *
  * The agent command writes its tool-status log to .madgrix/tool-status.jsonl
  * in the workspace (specs/amendments/tool-status-v1.md); it is committed with
@@ -93,6 +98,25 @@ if (!Array.isArray(scopePaths) || scopePaths.length === 0) {
 }
 if (scopePaths.includes("**")) {
 	console.error('Claim scope "**" matches every path; unbounded claims are not admissible (spec 2 §7). Name the paths the task may change.');
+	process.exit(2);
+}
+/** @type {Record<string, unknown>} */
+let agentSecrets = {};
+try {
+	const parsed = JSON.parse(process.env.MADGRIX_AGENT_SECRETS ?? "");
+	if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) agentSecrets = parsed;
+} catch {
+	// reported below, without echoing the value
+}
+const unenrolled = agentIds.filter((id) => {
+	const secret = Object.hasOwn(agentSecrets, id) ? agentSecrets[id] : undefined;
+	return typeof secret !== "string" || !/^[0-9a-f]{64}$/.test(secret);
+});
+if (unenrolled.length) {
+	console.error(
+		`MADGRIX_AGENT_SECRETS has no secret for ${unenrolled.join(", ")}: pass the agent_secrets ` +
+			"POST /tasks returned (specs/amendments/agent-enrollment-v1.md).",
+	);
 	process.exit(2);
 }
 
@@ -204,16 +228,13 @@ const runOne = async (agentId) => {
 			expires_at: new Date(now.getTime() + 60 * 60 * 1000).toISOString(),
 		},
 	};
-	const claimRes = await postJson(`${taskUrl}/claim`, { claim: claimInput });
+	// The secret the control plane issued agentId. It proves to /claim and
+	// /contenders which agent is calling, and is never logged, written to
+	// disk or put in the agent command's environment.
+	const agentSecret = /** @type {string} */ (agentSecrets[agentId]);
+	const claimRes = await postJson(`${taskUrl}/claim`, { claim: claimInput }, { "x-madgrix-agent-secret": agentSecret });
 	const workId = claimRes.work_id;
 	if (typeof workId !== "string") throw new Error(`claim registration returned no work_id for ${agentId}`);
-	// Proves to /contenders that this runner registered agentId's claim. Held
-	// only in this variable: never logged, written to disk or put in the
-	// agent command's environment.
-	const agentSecret = claimRes.agent_secret;
-	if (typeof agentSecret !== "string" || !/^[0-9a-f]{64}$/.test(agentSecret)) {
-		throw new Error(`claim registration returned no agent secret for ${agentId}`);
-	}
 
 	const contender = await postJson(
 		`${taskUrl}/contenders`,

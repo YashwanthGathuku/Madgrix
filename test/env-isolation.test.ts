@@ -186,8 +186,14 @@ async function readDumps(dir: string, pattern: RegExp): Promise<Array<{ file: st
  * The dump holds no credential-named variable except `ownZone`'s service
  * token, and no other credential value under any name.
  */
-function assertCredentials(label: string, dump: Dump, ownZone?: Zone, extraSecrets: string[] = []): void {
-	const own = ownZone ? [ZONE_TOKEN_VARS[ownZone]] : [];
+function assertCredentials(
+	label: string,
+	dump: Dump,
+	ownZone?: Zone,
+	extraSecrets: string[] = [],
+	alsoAllowed: string[] = [],
+): void {
+	const own = [...(ownZone ? [ZONE_TOKEN_VARS[ownZone]] : []), ...alsoAllowed].sort();
 	assert.deepEqual(
 		[...dump.vars.keys()].filter((name) => CREDENTIAL_NAME.test(name)).sort(),
 		own,
@@ -249,6 +255,8 @@ interface Mock {
 	requests: Array<{ route: string; zone: Zone | null }>;
 	issuedCredentials: string[];
 	createContender(taskId: string, agentId: string): Contender;
+	/** Enroll agents in a task as POST /tasks does; returns their secrets. */
+	enroll(taskId: string, agentIds: string[]): Record<string, string>;
 	close(): Promise<void>;
 }
 
@@ -343,8 +351,23 @@ async function startMock(): Promise<Mock> {
 	const taskHashes = new Map<string, string>();
 	const requests: Mock["requests"] = [];
 	const issuedCredentials: string[] = [];
-	/** SHA-256(agent secret) -> agent, as the authority binds it at /claim. */
+	/** SHA-256(agent secret) -> agent, as the authority enrolls it at task creation. */
 	const agentSecrets = new Map<string, string>();
+	/** task id -> agent -> SHA-256(agent secret). */
+	const enrollment = new Map<string, Map<string, string>>();
+	const sha256 = (s: string) => createHash("sha256").update(s).digest("hex");
+	const enroll = (taskId: string, agentIds: string[]): Record<string, string> => {
+		const secrets: Record<string, string> = {};
+		const hashes = new Map<string, string>();
+		for (const agent of agentIds) {
+			secrets[agent] = randomBytes(32).toString("hex");
+			hashes.set(agent, sha256(secrets[agent]));
+			agentSecrets.set(sha256(secrets[agent]), agent);
+			issuedCredentials.push(secrets[agent]);
+		}
+		enrollment.set(taskId, hashes);
+		return secrets;
+	};
 	let seq = 0;
 	let winner = "";
 	let promotion: MockPromotion | null = null;
@@ -386,7 +409,10 @@ async function startMock(): Promise<Mock> {
 				case "POST /tasks": {
 					const id = `task_${randomBytes(12).toString("hex")}`;
 					taskHashes.set(id, randomBytes(32).toString("hex"));
-					return send(200, { task_id: id, task_hash: taskHashes.get(id) });
+					if (!Array.isArray(body.agent_ids) || body.agent_ids.length === 0) {
+						return send(400, { error: "agent_ids_required" });
+					}
+					return send(200, { task_id: id, task_hash: taskHashes.get(id), agent_secrets: enroll(id, body.agent_ids) });
 				}
 				case "GET context":
 					return send(200, {
@@ -402,10 +428,14 @@ async function startMock(): Promise<Mock> {
 						claims: [],
 					});
 				case "POST claim": {
-					const secret = randomBytes(32).toString("hex");
-					agentSecrets.set(createHash("sha256").update(secret).digest("hex"), body.claim?.agent);
-					issuedCredentials.push(secret);
-					return send(200, { work_id: `work-${++seq}`, conflicts: [], agent_secret: secret });
+					// Every claim presents the secret the agent was enrolled with.
+					const presented = req.headers["x-madgrix-agent-secret"];
+					const enrolled = enrollment.get(taskId)?.get(body.claim?.agent);
+					if (enrolled === undefined) return send(403, { error: "agent_not_enrolled" });
+					if (typeof presented !== "string" || sha256(presented) !== enrolled) {
+						return send(403, { error: "agent_secret_invalid" });
+					}
+					return send(200, { work_id: `work-${++seq}`, conflicts: [] });
 				}
 				case "POST contenders": {
 					const presented = req.headers["x-madgrix-agent-secret"];
@@ -462,6 +492,7 @@ async function startMock(): Promise<Mock> {
 		requests,
 		issuedCredentials,
 		createContender,
+		enroll,
 		close: () =>
 			new Promise<void>((resolve) => {
 				server.closeAllConnections();
@@ -509,6 +540,7 @@ describe("process environment boundaries of the live-run scripts", () => {
 				MADGRIX_BASE_URL: fx.mock.url,
 				MADGRIX_TASK_ID: taskId,
 				MADGRIX_AGENT_IDS: "agent-a,agent-b",
+				MADGRIX_AGENT_SECRETS: JSON.stringify(fx.mock.enroll(taskId, ["agent-a", "agent-b"])),
 				MADGRIX_AGENT_COMMAND: agentCommand(dumpDir),
 				MADGRIX_CLAIM_PATHS: CLAIM_PATHS,
 				MADGRIX_RESULT_PATH: resultPath,
@@ -544,6 +576,7 @@ describe("process environment boundaries of the live-run scripts", () => {
 				MADGRIX_BASE_URL: fx.mock.url,
 				MADGRIX_TASK_ID: `task_${"b".repeat(24)}`,
 				MADGRIX_AGENT_IDS: "agent-a,agent-b",
+				MADGRIX_AGENT_SECRETS: JSON.stringify(fx.mock.enroll(`task_${"b".repeat(24)}`, ["agent-a", "agent-b"])),
 				MADGRIX_AGENT_COMMAND: agentCommand(dumpDir),
 				MADGRIX_CLAIM_PATHS: CLAIM_PATHS,
 				MADGRIX_AGENT_ENV_ALLOWLIST: ` ${MODEL_KEY.name} ,UNSET_BY_OPERATOR`,
@@ -634,6 +667,7 @@ describe("process environment boundaries of the live-run scripts", () => {
 				MADGRIX_BASE_URL: fx.mock.url,
 				MADGRIX_TASK_ID: taskId,
 				MADGRIX_AGENT_IDS: "agent-a,agent-b",
+				MADGRIX_AGENT_SECRETS: JSON.stringify(fx.mock.enroll(taskId, ["agent-a", "agent-b"])),
 				MADGRIX_AGENT_COMMAND: agentCommand(dumpDir),
 				MADGRIX_CLAIM_PATHS: CLAIM_PATHS,
 				MADGRIX_RESULT_PATH: resultPath,
@@ -775,13 +809,15 @@ describe("process environment boundaries of the live-run scripts", () => {
 		assert.equal(verifier.length, 1, "one offline-verify process");
 
 		for (const { file, dump } of runner) {
-			assertCredentials(file, dump, "agent");
+			// The runner holds the agents' enrollment secrets; their agent commands never do.
+			assertCredentials(file, dump, "agent", [], ["MADGRIX_AGENT_SECRETS"]);
 			assertOnly(file, dump, [
 				"MADGRIX_BASE_URL",
 				"MADGRIX_TASK_ID",
 				"MADGRIX_AGENT_SERVICE_TOKEN",
 				"MADGRIX_AGENT_COMMAND",
 				"MADGRIX_AGENT_IDS",
+				"MADGRIX_AGENT_SECRETS",
 				"MADGRIX_AGENT_ENV_ALLOWLIST",
 				"MADGRIX_CLAIM_PATHS",
 				"MADGRIX_RESULT_PATH",

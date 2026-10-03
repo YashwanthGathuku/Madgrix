@@ -24,7 +24,8 @@
  *
  * Optional:
  *   MADGRIX_DESTINATION_REPO       default baseline repo
- *   MADGRIX_AGENT_IDS              default agent-a,agent-b,agent-c
+ *   MADGRIX_AGENT_IDS              default agent-a,agent-b,agent-c; enrolled at
+ *                                  task creation, each with its own secret
  *   MADGRIX_EVENT_TIMEOUT_MS       default 60000
  *   MADGRIX_BUNDLE_PATH            default .madgrix-live/promotion.bundle
  *   MADGRIX_CLAIM_TEMPLATE         passed through to contender runner
@@ -76,6 +77,10 @@ const intent = env.MADGRIX_INTENT;
 const behaviorContract = env.MADGRIX_BEHAVIOR_CONTRACT;
 const agentCommand = env.MADGRIX_AGENT_COMMAND;
 const hiddenCommand = env.MADGRIX_HIDDEN_TEST_COMMAND;
+const agentIds = (env.MADGRIX_AGENT_IDS ?? "agent-a,agent-b,agent-c")
+	.split(",")
+	.map((s) => s.trim())
+	.filter(Boolean);
 const eventTimeoutMs = Number(env.MADGRIX_EVENT_TIMEOUT_MS ?? "60000");
 const bundlePath = path.resolve(env.MADGRIX_BUNDLE_PATH ?? ".madgrix-live/promotion.bundle");
 
@@ -215,10 +220,17 @@ const created = await requestJson(`${baseUrl}/tasks`, {
 			verifier_id: v.id,
 			public_key_der_hex: v.publicKeyDerHex,
 		})),
+		// One secret per agent, issued to the control plane only
+		// (specs/amendments/agent-enrollment-v1.md).
+		agent_ids: agentIds,
 	},
 });
 const taskId = created.task_id as string;
 const taskHash = created.task_hash as string;
+const agentSecrets = created.agent_secrets as Record<string, string> | undefined;
+if (!agentSecrets || !agentIds.every((id) => typeof agentSecrets[id] === "string")) {
+	throw new Error("task creation returned no secret for some enrolled agent");
+}
 if (!taskId || !taskHash) throw new Error("task creation returned no task identity");
 
 console.error("[madgrix-live] 2/9 commit blind-verifier references before candidates exist");
@@ -258,7 +270,9 @@ try {
 			MADGRIX_TASK_ID: taskId,
 			MADGRIX_AGENT_SERVICE_TOKEN: agentToken,
 			MADGRIX_AGENT_COMMAND: agentCommand,
-			MADGRIX_AGENT_IDS: env.MADGRIX_AGENT_IDS,
+			MADGRIX_AGENT_IDS: agentIds.join(","),
+			// The runner presents each agent's secret; the agents never see them.
+			MADGRIX_AGENT_SECRETS: JSON.stringify(agentSecrets),
 			MADGRIX_AGENT_ENV_ALLOWLIST: env.MADGRIX_AGENT_ENV_ALLOWLIST,
 			MADGRIX_CLAIM_PATHS: env.MADGRIX_CLAIM_PATHS,
 			MADGRIX_CLAIM_TEMPLATE: env.MADGRIX_CLAIM_TEMPLATE,
