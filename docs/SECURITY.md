@@ -89,7 +89,8 @@ The amendment recording this is `specs/amendments/process-env-boundaries.md`.
 | coding-agent command | `run-contenders.mjs` | **none** | `MADGRIX_AGENT_ID`, `MADGRIX_CONTENDER_ID`, `MADGRIX_TASK_ID`, `MADGRIX_BASELINE_SHA`, `MADGRIX_WORKSPACE`, allowlisted variables |
 | `evaluate-candidate.ts` | `live-e2e.ts` | EVALUATION only | evaluation settings and commands |
 | hidden, regression, semantic, static, security commands | `evaluate-candidate.ts` | **none** | none |
-| `git` clone / commit / push / checkout | runner or evaluator | none (the Artifacts token travels in a per-invocation `-c http.extraHeader`) | none |
+| `git` clone / push | runner or evaluator | none | `GIT_CONFIG_COUNT`, `GIT_CONFIG_KEY_0`, `GIT_CONFIG_VALUE_0`: the Artifacts token as `http.extraHeader` |
+| other `git` commands | runner or evaluator | none | none |
 | `src/cli/verify.ts` | `live-e2e.ts` | none | none |
 
 - **No login shell.** The agent command and the five evaluation commands run under
@@ -110,6 +111,11 @@ The amendment recording this is `specs/amendments/process-env-boundaries.md`.
   (`http.proxy`, `http.sslCAInfo`). Because `SSH_AUTH_SOCK` is not passed, a global
   `commit.gpgsign` that signs through an SSH agent cannot reach that agent when the
   runner makes the contender commit.
+- **Artifacts tokens stay off git's command line.** The runner's clone and push and
+  the evaluator's clone receive the token as `http.extraHeader` in their environment
+  (`GIT_CONFIG_*`), never as `-c` on the command line. Another local user can read a
+  process's command line, but not its environment. A process running as the same
+  user still can (below).
 
 `test/env-isolation.test.ts` runs the three scripts against a local HTTP mock of the
 Worker and local bare Git repos (no network). The operator environment it supplies
@@ -121,7 +127,9 @@ name, and nothing beyond `minimalEnv()` plus their explicit extras. It also asse
 that, in a full `live-e2e.ts` run, the contender runner received only the AGENT token,
 each evaluator only the EVALUATION token, and the offline verifier none (observed
 through a `node` shim on `PATH`), and that the agent never saw an evaluation command.
-Finally, it asserts that an allowlist naming a zone or Cloudflare credential is refused.
+Finally, it asserts that an allowlist naming a zone or Cloudflare credential is refused,
+and, through a `git` shim, that no git command line carries an Artifacts token while
+every clone and push still receives one in its environment.
 Before this change the same test failed. In a `live-e2e.ts` run, the agent command
 received all three service tokens, the Cloudflare/GitHub/signing variables, and
 `MADGRIX_HIDDEN_TEST_COMMAND` along with the other four evaluation commands. The
@@ -136,9 +144,6 @@ What this boundary does **not** do:
   which holds all three tokens. Against an adversarial agent, the boundary is the
   separate sandbox per contender required by spec 3 §2–§3, or at least a separate OS
   user or container on the operator host.
-- **Artifacts tokens on git's command line** (`-c http.extraHeader=...`) are visible to
-  other local processes while that `git` process runs. This section does not change
-  that.
 
 ## Evidence integrity and the evaluation run directory
 

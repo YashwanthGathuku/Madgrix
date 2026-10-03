@@ -87,3 +87,21 @@ export function pickEnv(names) {
 	}
 	return picked;
 }
+
+/**
+ * minimalEnv() for a git process that authenticates to Artifacts: the bearer
+ * token travels as `http.extraHeader` through git's environment
+ * (GIT_CONFIG_COUNT/KEY/VALUE, git >= 2.31), not through `-c` on its command
+ * line. Another local user can read a process's argv (/proc/<pid>/cmdline);
+ * only the same user can read its environment.
+ *
+ * @param {string} token
+ * @returns {Record<string, string>}
+ */
+export function gitAuthEnv(token) {
+	return minimalEnv({
+		GIT_CONFIG_COUNT: "1",
+		GIT_CONFIG_KEY_0: "http.extraHeader",
+		GIT_CONFIG_VALUE_0: `Authorization: Bearer ${token}`,
+	});
+}

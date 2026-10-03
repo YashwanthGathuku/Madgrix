@@ -609,6 +609,79 @@ describe("process environment boundaries of the live-run scripts", () => {
 		assert.deepEqual(await readdir(dumpDir), [], "no agent command ran");
 	});
 
+	it("Artifacts tokens reach git through its environment, never its command line", async () => {
+		// A `git` shim first on PATH records the argv and environment of every
+		// git process the runner and the evaluator start. Another local user
+		// can read a process's argv (/proc/<pid>/cmdline); its environment only
+		// the same user can.
+		const dumpDir = await mkdtemp(path.join(fx.dumps, "git-"));
+		const shimDir = path.join(dumpDir, "bin");
+		await mkdir(shimDir);
+		const realGit = execFileSync("sh", ["-c", "command -v git"], { encoding: "utf8" }).trim();
+		await writeFile(
+			path.join(shimDir, "git"),
+			`#!/bin/sh\nd=${shq(dumpDir)}/call.$$\nmkdir -p "$d"\nfor a in "$@"; do printf '%s\\n' "$a"; done > "$d/argv"\nenv > "$d/env"\nexec ${shq(realGit)} "$@"\n`,
+		);
+		await chmod(path.join(shimDir, "git"), 0o755);
+		const withShim = { PATH: `${shimDir}${path.delimiter}${process.env.PATH ?? ""}` };
+
+		const taskId = `task_${"g".repeat(24)}`;
+		const resultPath = path.join(dumpDir, "contenders.json");
+		const contenders = await runScript(
+			"scripts/run-contenders.mjs",
+			operatorEnv({
+				...withShim,
+				MADGRIX_BASE_URL: fx.mock.url,
+				MADGRIX_TASK_ID: taskId,
+				MADGRIX_AGENT_IDS: "agent-a,agent-b",
+				MADGRIX_AGENT_COMMAND: agentCommand(dumpDir),
+				MADGRIX_CLAIM_PATHS: CLAIM_PATHS,
+				MADGRIX_RESULT_PATH: resultPath,
+			}),
+		);
+		assert.equal(contenders.code, 0, `run-contenders failed:\n${contenders.stderr}`);
+		const candidate = JSON.parse(await readFile(resultPath, "utf8")).candidates[0];
+		const evaluation = await runScript(
+			"scripts/evaluate-candidate.ts",
+			operatorEnv({
+				...withShim,
+				MADGRIX_BASE_URL: fx.mock.url,
+				MADGRIX_TASK_ID: taskId,
+				MADGRIX_CONTENDER_ID: candidate.contender_id,
+				MADGRIX_CANDIDATE_SHA: candidate.candidate_sha,
+				MADGRIX_HIDDEN_TEST_COMMAND: "true",
+			}),
+		);
+		assert.equal(evaluation.code, 0, `evaluate-candidate failed:\n${evaluation.stderr}`);
+
+		const calls = await Promise.all(
+			(await readdir(dumpDir)).filter((f) => f.startsWith("call.")).map(async (f) => ({
+				argv: (await readFile(path.join(dumpDir, f, "argv"), "utf8")).split("\n").filter(Boolean),
+				env: (await readDump(path.join(dumpDir, f, "env"))).vars,
+			})),
+		);
+		const tokens = fx.mock.issuedCredentials.filter((c) => c.startsWith("fake-fork-"));
+		assert.deepEqual(
+			calls.flatMap(({ argv }) => argv.filter((arg) => tokens.some((token) => arg.includes(token)))),
+			[],
+			"no git argument carries an Artifacts token",
+		);
+		const authenticated = (env: Map<string, string>) =>
+			Array.from({ length: Number(env.get("GIT_CONFIG_COUNT") ?? 0) }, (_, i) => i).some(
+				(i) =>
+					env.get(`GIT_CONFIG_KEY_${i}`) === "http.extraHeader" &&
+					tokens.some((token) => env.get(`GIT_CONFIG_VALUE_${i}`) === `Authorization: Bearer ${token}`),
+			);
+		const network = calls.filter(({ argv }) => argv.includes("clone") || argv.includes("push"));
+		assert.equal(network.length, 5, "two clones and two pushes by the runner, one clone by the evaluator");
+		for (const { argv, env } of network) {
+			assert.ok(authenticated(env), `git ${argv.join(" ")}: the token reaches git as http.extraHeader in its environment`);
+		}
+		for (const { argv, env } of calls.filter((call) => !network.includes(call))) {
+			assert.ok(!authenticated(env), `git ${argv.join(" ")}: no token for a local git command`);
+		}
+	});
+
 	it("evaluate-candidate.ts: hidden/regression/semantic/static/security commands run with minimalEnv() only", async () => {
 		const dumpDir = await mkdtemp(path.join(fx.dumps, "evaluate-"));
 		const taskId = `task_${"d".repeat(24)}`;

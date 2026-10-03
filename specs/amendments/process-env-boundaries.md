@@ -103,9 +103,11 @@ This is an environment boundary, not an OS boundary. The agent and evaluation
 commands still run as the operator's OS user with the operator's `HOME`. They can
 read files there, and a same-user process can generally read another process's
 `/proc/<pid>/environ`. The §2–§3 boundary against an adversarial contender remains
-a separate sandbox per contender. Artifacts tokens passed to `git` via
-`-c http.extraHeader` are visible on that process's command line while it runs; this
-amendment does not change that.
+a separate sandbox per contender. Artifacts tokens no longer appear on any `git`
+command line (2026-10-03): the live-run scripts pass them as `http.extraHeader`
+through that git process's environment (`GIT_CONFIG_COUNT`/`KEY_0`/`VALUE_0`), which
+other OS users cannot read. The promotion container's own scripts still use
+`-c http.extraHeader` inside that container.
 
 Implementation notes: `scripts/lib/child-env.mjs`, `scripts/live-e2e.ts`,
 `scripts/run-contenders.mjs`, `scripts/evaluate-candidate.ts`; regression test

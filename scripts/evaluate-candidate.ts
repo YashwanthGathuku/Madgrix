@@ -68,7 +68,7 @@ import {
 	type RunFile,
 	type TreeEntry,
 } from "../src/lib/eval-gates.ts";
-import { minimalEnv } from "./lib/child-env.mjs";
+import { gitAuthEnv, minimalEnv } from "./lib/child-env.mjs";
 
 const baseUrl = process.env.MADGRIX_BASE_URL?.replace(/\/$/, "");
 const taskId = process.env.MADGRIX_TASK_ID;
@@ -291,13 +291,11 @@ const dir = await mkdtemp(path.join(os.tmpdir(), "madgrix-eval-"));
 // Outside the candidate checkout: the commands run here, never in `dir`.
 const runDir = await mkdtemp(path.join(os.tmpdir(), "madgrix-run-"));
 try {
-	const authHeader = `Authorization: Bearer ${creds.token}`;
 	await new Promise<void>((resolve, reject) => {
-		const child = spawn(
-			"git",
-			["-c", `http.extraHeader=${authHeader}`, "clone", "--quiet", "--no-checkout", creds.remote, dir],
-			{ env: minimalEnv(), stdio: "inherit" },
-		);
+		const child = spawn("git", ["clone", "--quiet", "--no-checkout", creds.remote, dir], {
+			env: gitAuthEnv(creds.token),
+			stdio: "inherit",
+		});
 		child.on("error", reject);
 		child.on("exit", (code) => (code === 0 ? resolve() : reject(new Error(`git clone failed: ${code}`))));
 	});

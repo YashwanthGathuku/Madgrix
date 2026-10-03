@@ -25,7 +25,8 @@
  *
  * The command is intentionally provider-neutral. Examples can point at Codex,
  * Claude Code, Aider, or an internal AOS launcher. The runner never writes
- * Artifacts tokens into .git/config or command-line remote URLs.
+ * Artifacts tokens into .git/config, remote URLs or a git command line: git
+ * receives them through its environment (gitAuthEnv).
  *
  * The agent command runs under `bash -c` (not a login shell, so profile files
  * are not re-read) with minimalEnv() plus MADGRIX_AGENT_ID,
@@ -39,7 +40,7 @@ import os from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
 
-import { minimalEnv, parseAgentEnvAllowlist, pickEnv } from "./lib/child-env.mjs";
+import { gitAuthEnv, minimalEnv, parseAgentEnvAllowlist, pickEnv } from "./lib/child-env.mjs";
 
 const baseUrl = process.env.MADGRIX_BASE_URL?.replace(/\/$/, "");
 const taskId = process.env.MADGRIX_TASK_ID;
@@ -225,9 +226,8 @@ const runOne = async (agentId) => {
 	}
 
 	const dir = await mkdtemp(path.join(workRoot, `madgrix-${agentId.replace(/[^A-Za-z0-9._-]/g, "_")}-`));
-	const auth = `Authorization: Bearer ${token}`;
 	try {
-		await run("git", ["-c", `http.extraHeader=${auth}`, "clone", "--quiet", "--single-branch", "--branch", "main", remote, dir]);
+		await run("git", ["clone", "--quiet", "--single-branch", "--branch", "main", remote, dir], { env: gitAuthEnv(token) });
 		const baseline = await capture("git", ["rev-parse", "HEAD"], { cwd: dir });
 
 		// No service token and no other operator credential: only the agent's
@@ -255,7 +255,7 @@ const runOne = async (agentId) => {
 		if (candidateSha === baseline) {
 			throw new Error(`${agentId} produced no candidate change`);
 		}
-		await run("git", ["-c", `http.extraHeader=${auth}`, "push", "--quiet", "origin", "HEAD:refs/heads/main"], { cwd: dir });
+		await run("git", ["push", "--quiet", "origin", "HEAD:refs/heads/main"], { cwd: dir, env: gitAuthEnv(token) });
 		console.error(`[madgrix] ${agentId} pushed ${candidateSha.slice(0, 12)}`);
 		return {
 			agent_id: agentId,
@@ -270,7 +270,7 @@ const runOne = async (agentId) => {
 	} finally {
 		// The server-side contender token has a short TTL and is separately
 		// revocable by quarantine. Locally, ensure no credential survives in
-		// a remote URL/config; clone used only an ephemeral extraHeader.
+		// a remote URL/config; clone and push got it only in their environment.
 		if (!keep) await rm(dir, { recursive: true, force: true });
 	}
 };
