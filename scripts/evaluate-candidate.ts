@@ -412,6 +412,8 @@ try {
 		evaluated_at,
 		tainted: false,
 		evaluation_config_sha256: evaluationConfigSha256,
+		// Non-empty: the authority quarantines the contender (tamper-quarantine-v1).
+		eval_file_changes: gates.evalFileChanges,
 	};
 	const bundle_hash = await sha256Hex(canonicalJson(withoutHash));
 	const bundle = { ...withoutHash, bundle_hash };

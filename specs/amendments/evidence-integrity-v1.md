@@ -177,8 +177,9 @@ amendment file only; spec files are NOT edited. The tool-status log behind
 - An unbounded scope fails `scope_compliance` but is not reported as tampering.
   Claims stored with `"**"` before this change stay stored and fail
   `scope_compliance` at evaluation.
-- The evaluator reports tampering; it does not quarantine. Spec 1 §12
-  "REJECT + QUARANTINE" still needs a control-plane action.
+- The evaluator reports tampering and does not quarantine. The authority
+  quarantines on a changed evaluation file, and only on that
+  (`tamper-quarantine-v1.md`).
 - Until a SHA has a label, a re-evaluation still replaces its evidence (by design,
   for re-evaluation against a new head). Only evidence that verifiers can see under
   a label is final.

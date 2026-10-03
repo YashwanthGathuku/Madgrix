@@ -16,6 +16,7 @@ import {
 	TOOL_STATUS_LOG_PATH,
 	changedPaths,
 	checkToolStatusLog,
+	evalFileChanges,
 	composeRunTree,
 	evaluatorGates,
 	globToRegExp,
@@ -136,6 +137,16 @@ describe("tamper and scope findings", () => {
 		const findings = tamperFindings(changed, scope, DEFAULT_TEST_GLOBS);
 		assert.ok(findings.includes("test material changed: test/sum.test.js"));
 		assert.ok(findings.includes("test material changed: test/helper.js"));
+	});
+
+	it("evalFileChanges lists changed runner configuration and test material only (what the authority quarantines on)", () => {
+		assert.deepEqual(
+			evalFileChanges(
+				["docs/notes.md", "package.json", "src/a.js", "src/__mocks__/db.js", TOOL_STATUS_LOG_PATH, "../x.test.js"],
+				DEFAULT_TEST_GLOBS,
+			),
+			["package.json", "src/__mocks__/db.js"],
+		);
 	});
 
 	it("unsafe tree paths are tampering", () => {
@@ -266,6 +277,7 @@ describe("evaluatorGates", () => {
 	it("an in-scope source change with a bound tool log passes all five gates", () => {
 		assert.deepEqual(evaluatorGates(input), {
 			findings: [],
+			evalFileChanges: [],
 			admission: {
 				exact_baseline: true,
 				scope_compliance: true,

@@ -268,6 +268,7 @@ describe("evaluate-candidate.ts: tamper gate and baseline runner configuration",
 			`findings: ${JSON.stringify(result.bundle.security_policy.findings)}`,
 		);
 		assert.equal(result.bundle.security_policy.passed, false);
+		assert.deepEqual(result.bundle.eval_file_changes, ["package.json"], "the authority quarantines on this list");
 	});
 
 	it("the hidden and regression commands run the BASELINE's package.json, not the candidate's", async () => {
@@ -297,6 +298,7 @@ describe("evaluate-candidate.ts: tamper gate and baseline runner configuration",
 		);
 		assert.equal(result.bundle.admission.no_eval_tampering, false);
 		assert.ok(result.bundle.security_policy.findings.includes("test material changed: test/sum.test.js"));
+		assert.deepEqual(result.bundle.eval_file_changes, ["test/sum.test.js"]);
 		const runDir = (await readFile(pwdFile, "utf8")).trim();
 		await assert.rejects(stat(runDir), "the run directory is removed after the evaluation");
 	});
@@ -321,6 +323,7 @@ describe("evaluate-candidate.ts: tool-status log gates", () => {
 		});
 		assert.equal(result.bundle.hidden_oracle.passed, true);
 		assert.deepEqual(result.bundle.security_policy.findings, []);
+		assert.deepEqual(result.bundle.eval_file_changes, []);
 		assert.equal(result.provenance.model, "test-model-7");
 		assert.equal(result.provenance.harness, "test-harness/1.0");
 		assert.equal(result.provenance.agent_id, `agent-${id}`);

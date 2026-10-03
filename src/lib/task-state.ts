@@ -525,6 +525,16 @@ export type SubmitEvaluationOutcome = "RECORDED" | "ACK_DUP" | "REPLACEMENT_REJE
  * stands and the attempt is recorded as an `evidence_replacement_rejected`
  * ledger entry, which the caller persists.
  *
+ * Tamper quarantine (specs/amendments/tamper-quarantine-v1.md): a RECORDED
+ * bundle whose eval_file_changes names any changed evaluation file (runner
+ * configuration or test material) is mechanical evidence of an
+ * evaluation-file modification attempt (spec 1 §6, §9.5). The contender is
+ * quarantined in the same transition (trigger eval_file_modification,
+ * evidence = the bundle hash) unless it is already QUARANTINED or REVOKED,
+ * and the quarantine's effects are returned for the caller to execute.
+ * Other tampering findings (paths outside the claim scope, unsafe paths)
+ * fail the gate without quarantine (spec 3 §6 attack 5: REJECT).
+ *
  * Rejects bundles for a different task.
  */
 export async function submitEvaluation(
@@ -532,7 +542,7 @@ export async function submitEvaluation(
 	bundle: EvaluationBundle,
 	caller: CallerIdentity,
 	ctx: Ctx,
-): Promise<{ state: AuthorityState; outcome: SubmitEvaluationOutcome }> {
+): Promise<{ state: AuthorityState; outcome: SubmitEvaluationOutcome; effects: Effect[] }> {
 	const zone = caller?.zone ?? "unknown";
 	if (!EVIDENCE_SUBMITTER_ZONES.has(zone)) {
 		if (zone === "contender") {
@@ -554,6 +564,15 @@ export async function submitEvaluation(
 		(typeof bundle.evaluation_config_sha256 !== "string" || !/^[0-9a-f]{64}$/.test(bundle.evaluation_config_sha256))
 	)
 		throw new Error("evaluation rejected: evaluation_config_sha256 is not a SHA-256 hex digest");
+	const evalFileChanges = bundle.eval_file_changes;
+	if (evalFileChanges !== undefined) {
+		if (!Array.isArray(evalFileChanges) || !evalFileChanges.every((p) => typeof p === "string" && p !== ""))
+			throw new Error("evaluation rejected: eval_file_changes must be a list of paths");
+		if (evalFileChanges.length > 0 && bundle.admission?.no_eval_tampering !== false)
+			throw new Error(
+				"evaluation rejected: eval_file_changes names changed evaluation files but admission.no_eval_tampering is not false",
+			);
+	}
 	const contender = Object.hasOwn(state.contenders, bundle.contender_id)
 		? state.contenders[bundle.contender_id]
 		: undefined;
@@ -567,7 +586,7 @@ export async function submitEvaluation(
 	const existing = state.evaluations[bundle.candidate_sha];
 	if (existing && existing.bundle_hash === bundle.bundle_hash) {
 		// Idempotent retry of the same evaluation: converge, don't duplicate.
-		return { state, outcome: "ACK_DUP" };
+		return { state, outcome: "ACK_DUP", effects: [] };
 	}
 	if (existing && Object.values(state.candidate_labels).includes(bundle.candidate_sha)) {
 		// Verifiers can see this candidate under its label: its evidence is
@@ -584,7 +603,7 @@ export async function submitEvaluation(
 			},
 			ctx,
 		);
-		return { state: rejected, outcome: "REPLACEMENT_REJECTED" };
+		return { state: rejected, outcome: "REPLACEMENT_REJECTED", effects: [] };
 	}
 	const s2: AuthorityState = {
 		...state,
@@ -602,7 +621,12 @@ export async function submitEvaluation(
 		},
 		ctx,
 	);
-	return { state: s3, outcome: "RECORDED" };
+	const sanction = state.quarantine[bundle.contender_id]?.status;
+	if ((evalFileChanges?.length ?? 0) > 0 && sanction !== "QUARANTINED" && sanction !== "REVOKED") {
+		const q = await quarantineContender(s3, bundle.contender_id, "eval_file_modification", bundle.bundle_hash, ctx);
+		return { state: q.state, outcome: "RECORDED", effects: q.effects };
+	}
+	return { state: s3, outcome: "RECORDED", effects: [] };
 }
 
 /* ------------------------------------------------------------------ */

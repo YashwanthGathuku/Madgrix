@@ -210,6 +210,73 @@ describe("evidence submission authorization", () => {
 	});
 });
 
+describe("tamper quarantine (specs/amendments/tamper-quarantine-v1.md)", () => {
+	const tampered = {
+		exact_baseline: true,
+		scope_compliance: true,
+		valid_tool_states: true,
+		no_eval_tampering: false,
+		provenance_complete: true,
+	};
+
+	it("a recorded bundle that names changed evaluation files quarantines the contender and returns its effects", async () => {
+		const ctx = makeCtx();
+		const bundle = await makeBundle({ admission: tampered, eval_file_changes: ["package.json", "test/sum.test.js"] });
+		const r = await submitEvaluation(observedAuthority(), bundle, caller("evaluation_domain"), ctx);
+		assert.equal(r.outcome, "RECORDED");
+		const record = r.state.quarantine["contender-1"];
+		assert.equal(record?.status, "QUARANTINED");
+		assert.equal(record?.trigger, "eval_file_modification");
+		assert.equal(record?.evidence_hash, bundle.bundle_hash, "the bundle is the mechanical evidence");
+		assert.equal(r.state.evaluations["csha1"].tainted, true);
+		assert.deepEqual(
+			r.effects.map((e) => (e.kind === "revoke_token" ? `${e.kind}:${e.token_id}` : e.kind)),
+			["revoke_token:tok-1", "cancel_workflow", "notify"],
+		);
+		assert.deepEqual(
+			r.state.ledger.slice(-2).map((e) => e.kind),
+			["evaluation_submitted", "contender_quarantined"],
+		);
+	});
+
+	it("tampering through out-of-scope paths alone fails the gate but does not quarantine", async () => {
+		const ctx = makeCtx();
+		const bundle = await makeBundle({ admission: { ...tampered, scope_compliance: false }, eval_file_changes: [] });
+		const r = await submitEvaluation(observedAuthority(), bundle, caller("evaluation_domain"), ctx);
+		assert.equal(r.outcome, "RECORDED");
+		assert.equal(r.state.quarantine["contender-1"], undefined);
+		assert.deepEqual(r.effects, []);
+	});
+
+	it("a contender already in quarantine is not quarantined again", async () => {
+		const ctx = makeCtx();
+		const first = await makeBundle({ admission: tampered, eval_file_changes: ["package.json"] });
+		const r1 = await submitEvaluation(observedAuthority(), first, caller("evaluation_domain"), ctx);
+		const second = await makeBundle({ admission: tampered, eval_file_changes: ["jest.config.js"] });
+		const r2 = await submitEvaluation(r1.state, second, caller("evaluation_domain"), ctx);
+		assert.equal(r2.outcome, "RECORDED");
+		assert.deepEqual(r2.effects, []);
+		assert.equal(r2.state.quarantine["contender-1"]?.evidence_hash, first.bundle_hash, "the first evidence stands");
+	});
+
+	it("eval_file_changes must be a list of paths and agree with no_eval_tampering", async () => {
+		const ctx = makeCtx();
+		for (const [label, overrides] of [
+			["not a list", { admission: tampered, eval_file_changes: "package.json" }],
+			["empty path", { admission: tampered, eval_file_changes: [""] }],
+			["not a string", { admission: tampered, eval_file_changes: [7] }],
+			["changes but no tampering", { eval_file_changes: ["package.json"] }],
+		] as const) {
+			const bundle = await makeBundle(overrides as never);
+			await assert.rejects(
+				submitEvaluation(observedAuthority(), bundle, caller("evaluation_domain"), ctx),
+				/eval_file_changes/,
+				label,
+			);
+		}
+	});
+});
+
 describe("evidence binding: latest observed commit, no replacement after labels", () => {
 	it("(b) a bundle whose candidate_sha is not the contender's latest observed commit → rejected", async () => {
 		const ctx = makeCtx();

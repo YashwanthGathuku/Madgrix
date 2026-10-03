@@ -13,6 +13,10 @@
  * The Worker's only Workers-runtime import, `cloudflare:workers`, is mapped
  * to a stub with module.registerHooks before the Worker module loads.
  *
+ * The last suite drives the same harness through /evidence: evidence naming
+ * changed evaluation files quarantines the contender and revokes its fork
+ * tokens (specs/amendments/tamper-quarantine-v1.md).
+ *
  * node --test test/contender-binding.test.ts
  */
 import { describe, it } from "node:test";
@@ -21,7 +25,7 @@ import { createHash } from "node:crypto";
 import { registerHooks } from "node:module";
 
 import { TaskAuthority } from "../src/do/TaskAuthority.ts";
-import { sha256Hex } from "../src/lib/canonical.ts";
+import { canonicalJson, sha256Hex } from "../src/lib/canonical.ts";
 import { FakeArtifacts } from "../src/lib/fake-artifacts.ts";
 import { quarantineContender, type Ctx } from "../src/lib/task-state.ts";
 import type { AuthorityState } from "../src/lib/types.ts";
@@ -340,5 +344,82 @@ describe("contender binding: one agent cannot take over another agent's contende
 			[],
 			"no write token on the fork survives quarantine",
 		);
+	});
+});
+
+describe("tamper quarantine at the evidence route", () => {
+	async function contenderWithPush(h: Harness, sha: string) {
+		const a = await claim(h, "agent-a");
+		const created = await contender(h, { secret: a.body.agent_secret, agent_id: "agent-a" });
+		assert.equal(created.status, 201);
+		const event = { namespace: "default", repo: created.body.fork_repo, ref: "refs/heads/main", before: h.baseline, after: sha };
+		const pushed = await authority(h).fetch(
+			new Request("https://task-authority/event", {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({ event }),
+			}),
+		);
+		assert.equal(pushed.status, 200);
+		return created.body as { contender_id: string; fork_repo: string };
+	}
+
+	async function evidence(h: Harness, contenderId: string, sha: string, evalFileChanges: string[]) {
+		const rest = {
+			candidate_sha: sha,
+			tree_sha256: await sha256Hex(`tree of ${sha}`),
+			contender_id: contenderId,
+			task_hash: h.taskHash,
+			admission: {
+				exact_baseline: true,
+				scope_compliance: true,
+				valid_tool_states: true,
+				no_eval_tampering: evalFileChanges.length === 0,
+				provenance_complete: true,
+			},
+			hidden_oracle: { passed: true, total: 1, failed: [] as string[] },
+			regressions: { passed: true, total: 1, failed: [] as string[] },
+			static_analysis: { passed: true, findings: [] as string[] },
+			semantic_checks: { passed: true, total: 1, failed: [] as string[] },
+			security_policy: { passed: evalFileChanges.length === 0, findings: [] as string[] },
+			evaluated_at: "2026-10-03T09:00:00Z",
+			tainted: false,
+			eval_file_changes: evalFileChanges,
+		};
+		const bundle = { ...rest, bundle_hash: await sha256Hex(canonicalJson(rest)) };
+		return call(h, "POST", `/tasks/${h.taskId}/evidence`, { token: TOKENS.evaluation, body: { bundle } });
+	}
+
+	it("evidence naming changed evaluation files quarantines the contender and revokes every fork token", async () => {
+		const h = await makeHarness();
+		const sha = "ca11ed0000000000000000000000000000000001";
+		const c = await contenderWithPush(h, sha);
+		const fork = await h.fake.get(c.fork_repo);
+		assert.ok((await fork.listTokens()).some((t) => t.state === "active"), "the contender holds a live write token");
+
+		const res = await evidence(h, c.contender_id, sha, ["package.json"]);
+		assert.equal(res.status, 200, JSON.stringify(res.body));
+		assert.equal(res.body.quarantined, true);
+		assert.equal(res.body.effects, undefined, "effects are executed by the Worker, not returned to the evaluator");
+
+		const state = await authorityState(h);
+		assert.equal(state.quarantine[c.contender_id]?.status, "QUARANTINED");
+		assert.equal(state.quarantine[c.contender_id]?.trigger, "eval_file_modification");
+		assert.equal(state.contenders[c.contender_id].status, "quarantined");
+		assert.deepEqual(
+			(await fork.listTokens()).filter((t) => t.state === "active"),
+			[],
+			"no write token on the fork survives",
+		);
+	});
+
+	it("evidence without changed evaluation files quarantines nothing", async () => {
+		const h = await makeHarness();
+		const sha = "ca11ed0000000000000000000000000000000002";
+		const c = await contenderWithPush(h, sha);
+		const res = await evidence(h, c.contender_id, sha, []);
+		assert.equal(res.status, 200, JSON.stringify(res.body));
+		assert.equal(res.body.quarantined, false);
+		assert.equal((await authorityState(h)).quarantine[c.contender_id], undefined);
 	});
 });

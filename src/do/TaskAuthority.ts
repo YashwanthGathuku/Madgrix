@@ -297,7 +297,7 @@ export class TaskAuthority {
 				const state = await this.loadState();
 				if (state === null) return json({ error: "not_initialized" }, 404);
 				try {
-					const { state: next, outcome } = await submitEvaluation(state, body.bundle!, caller, ctx);
+					const { state: next, outcome, effects } = await submitEvaluation(state, body.bundle!, caller, ctx);
 					if (outcome === "ACK_DUP")
 						return json({ recorded: true, candidate_sha: body.bundle!.candidate_sha, outcome: "ACK_DUP" });
 					await this.doState.storage.put(STATE_KEY, next);
@@ -312,7 +312,14 @@ export class TaskAuthority {
 							409,
 						);
 					}
-					return json({ recorded: true, candidate_sha: body.bundle!.candidate_sha });
+					// A tamper quarantine's effects (token revocation, ...) are
+					// RETURNED for the Worker to execute, as /event's are.
+					return json({
+						recorded: true,
+						candidate_sha: body.bundle!.candidate_sha,
+						quarantined: effects.length > 0,
+						effects,
+					});
 				} catch (err) {
 					return json({ error: "evidence_rejected", detail: (err as Error).message }, 422);
 				}

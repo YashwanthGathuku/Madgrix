@@ -196,6 +196,15 @@ export interface EvaluationBundle {
 	 * slice harness, and bundles recorded before this field existed, lack it.
 	 */
 	evaluation_config_sha256?: string;
+	/**
+	 * The evaluation files the candidate changed: runner configuration and
+	 * test material, as the evaluator classifies them
+	 * (specs/amendments/evidence-integrity-v1.md). A non-empty list is an
+	 * "evaluation-file modification attempt" (spec 1 §9.5), so recording the
+	 * bundle quarantines the contender (specs/amendments/tamper-quarantine-v1.md).
+	 * scripts/evaluate-candidate.ts always sets it.
+	 */
+	eval_file_changes?: string[];
 }
 
 /* ------------------------------------------------------------------ */

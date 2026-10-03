@@ -185,6 +185,21 @@ export function tamperFindings(
 	return findings;
 }
 
+/**
+ * The changed evaluation files: runner configuration and test material.
+ * The tool-status log and unsafe paths are not evaluation files. A non-empty
+ * list makes the authority quarantine the contender
+ * (specs/amendments/tamper-quarantine-v1.md).
+ */
+export function evalFileChanges(changed: readonly string[], testGlobs: readonly string[]): string[] {
+	return changed.filter(
+		(path) =>
+			path !== TOOL_STATUS_LOG_PATH &&
+			isSafeTreePath(path) &&
+			(isRunnerConfigPath(path) || isTestPath(path, testGlobs)),
+	);
+}
+
 /** Every changed path (but the tool-status log) lies inside a bounded claim scope. */
 export function scopeCompliant(changed: readonly string[], scope: readonly string[] | null): boolean {
 	if (scopeProblem(scope) !== null) return false;
@@ -353,8 +368,15 @@ export interface EvaluatorGateInput {
 	forkLineage: { parent_repo?: unknown; parent_commit?: unknown } | null | undefined;
 }
 
-/** The five admission gates (spec 1 §6) as the evaluator measures them, with its tamper findings. */
-export function evaluatorGates(input: EvaluatorGateInput): { admission: AdmissionGates; findings: string[] } {
+/**
+ * The five admission gates (spec 1 §6) as the evaluator measures them, its
+ * tamper findings, and the changed evaluation files among them.
+ */
+export function evaluatorGates(input: EvaluatorGateInput): {
+	admission: AdmissionGates;
+	findings: string[];
+	evalFileChanges: string[];
+} {
 	const findings = input.baselineAvailable
 		? tamperFindings(input.changed, input.scope, input.testGlobs)
 		: [`baseline commit ${input.baselineCommit} is not in the candidate repository`];
@@ -366,6 +388,7 @@ export function evaluatorGates(input: EvaluatorGateInput): { admission: Admissio
 		lineage.parent_commit === input.baselineCommit;
 	return {
 		findings,
+		evalFileChanges: input.baselineAvailable ? evalFileChanges(input.changed, input.testGlobs) : [],
 		admission: {
 			exact_baseline: input.baselineAvailable && input.descendsFromBaseline,
 			scope_compliance: input.baselineAvailable && scopeCompliant(input.changed, input.scope),

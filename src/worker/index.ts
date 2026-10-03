@@ -757,6 +757,9 @@ export async function handleEvaluatorCredentials(env: Env, taskId: string, reque
  * from the evaluation domain (spec 3 §6, attack 6). The authority's answer
  * passes through: 422 for a bundle it rejects, 409 for a replacement of a
  * labeled candidate's evidence (specs/amendments/evidence-integrity-v1.md).
+ * When the bundle names changed evaluation files the authority quarantines
+ * the contender, and this route executes the effects: every fork token is
+ * revoked (specs/amendments/tamper-quarantine-v1.md).
  */
 export async function handleEvidence(env: Env, taskId: string, request: Request): Promise<Response> {
 	if (!(await requireEvaluationDomain(request, env))) {
@@ -772,7 +775,11 @@ export async function handleEvidence(env: Env, taskId: string, request: Request)
 	// authentication. The caller cannot self-assert its zone in JSON.
 	const caller = { zone: "evaluation_domain" as const };
 	const res = await doRpc(taskStub(env, taskId), "/evidence", { body: { bundle, caller } });
-	return json(res.body, res.status);
+	// A tamper quarantine's effects run here (spec 5 §3: the DO returns
+	// effects, this layer executes them) and are not echoed to the evaluator.
+	const { effects, ...body } = (res.body ?? {}) as { effects?: Effect[] } & Record<string, unknown>;
+	if (Array.isArray(effects) && effects.length > 0) await executeEffects(productionPort(env), effects);
+	return json(body, res.status);
 }
 
 /**
