@@ -4,7 +4,7 @@
  */
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { after, describe, it } from "node:test";
@@ -82,6 +82,33 @@ describe("fork crew", () => {
 		);
 		assert.equal(git(repo, ["show", `${result.sha}:src/api/handler.js`]).includes("api"), true);
 		assert.equal(git(repo, ["show", `${result.sha}:src/ui/view.js`]).includes("ui"), true);
+	});
+
+
+	it("applies both edits when changed lines in one file do not overlap", () => {
+		const repo = initFork();
+		mkdirSync(path.join(repo, "src"), { recursive: true });
+		writeFileSync(path.join(repo, "src/shared.js"), "alpha\nbeta\ngamma\ndelta\n");
+		git(repo, ["add", "src/shared.js"]);
+		git(repo, ["commit", "--quiet", "-m", "shared baseline"]);
+		const crew = loadForkCrew();
+		for (const sub of crew.subs) sub.paths = ["src/shared.js"];
+		crew.subs[0].command =
+			"python3 -c \"from pathlib import Path; p=Path('src/shared.js'); p.write_text(p.read_text().replace('alpha', 'api-alpha', 1))\"";
+		crew.subs[1].command =
+			"python3 -c \"from pathlib import Path; p=Path('src/shared.js'); p.write_text(p.read_text().replace('delta', 'ui-delta', 1))\"";
+		const result = runCrewOnFork(repo, crew);
+		assert.deepEqual(result.overlap, []);
+		assert.equal(result.resolution, "combined");
+		const shared = git(repo, ["show", `${result.sha}:src/shared.js`]);
+		assert.equal(shared, "api-alpha\nbeta\ngamma\nui-delta");
+		assert.doesNotMatch(shared, /<<<<<<<|=======|>>>>>>>/);
+		const record = JSON.parse(git(repo, ["show", `${result.sha}:.madgrix/subagent-intents.json`]));
+		assert.equal(record.resolution, "combined");
+		assert.deepEqual(
+			record.claims.map((claim: { id: string; intent: string }) => `${claim.id}:${claim.intent}`),
+			crew.subs.map((sub) => `${sub.id}:${sub.intent}`),
+		);
 	});
 
 	it("keeps both intents when sub-agents touch the same file", () => {

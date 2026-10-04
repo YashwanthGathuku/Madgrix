@@ -12,7 +12,8 @@
  */
 
 import { spawnSync } from "node:child_process";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -191,6 +192,64 @@ function porcelainPaths(status) {
 	return files;
 }
 
+
+/**
+ * Text of a blob, or empty when the path does not exist at that commit.
+ * @param {string} repo
+ * @param {string} sha
+ * @param {string} file
+ */
+function blobText(repo, sha, file) {
+	const exists = git(repo, ["cat-file", "-e", `${sha}:${file}`], { allowFailure: true });
+	if (exists.status !== 0) return "";
+	return git(repo, ["show", `${sha}:${file}`]).stdout;
+}
+
+/**
+ * Three-way merge of each version against the baseline. Returns the combined
+ * text when changed lines do not overlap, or null when they do.
+ * @param {string} repo
+ * @param {string} baseline
+ * @param {string} file
+ * @param {Array<{ sha: string }>} group
+ * @returns {string | null}
+ */
+function mergeDisjointEdits(repo, baseline, file, group) {
+	const base = blobText(repo, baseline, file);
+	let merged = blobText(repo, group[0].sha, file);
+	for (let i = 1; i < group.length; i += 1) {
+		const next = blobText(repo, group[i].sha, file);
+		const step = threeWayMerge(base, merged, next);
+		if (!step.clean) return null;
+		merged = step.text;
+	}
+	return merged;
+}
+
+/**
+ * @param {string} base
+ * @param {string} ours
+ * @param {string} theirs
+ */
+function threeWayMerge(base, ours, theirs) {
+	const dir = mkdtempSync(path.join(os.tmpdir(), "madgrix-merge-"));
+	try {
+		writeFileSync(path.join(dir, "base"), base);
+		writeFileSync(path.join(dir, "ours"), ours);
+		writeFileSync(path.join(dir, "theirs"), theirs);
+		const result = spawnSync("git", ["merge-file", "-p", "ours", "base", "theirs"], {
+			cwd: dir,
+			encoding: "utf8",
+		});
+		if (result.error || (result.status ?? 1) < 0) {
+			throw new Error("git merge-file failed");
+		}
+		return { clean: result.status === 0, text: result.stdout ?? "" };
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+}
+
 /**
  * @param {{ id: string, intent: string, text: string }[]} parts
  */
@@ -230,17 +289,23 @@ export function combineSubagentBranches(repo, baseline, commits) {
 	/** @type {string[]} */
 	const overlap = [];
 	for (const [file, group] of owners) {
+		mkdirSync(path.dirname(path.join(repo, file)), { recursive: true });
 		if (group.length === 1) {
 			git(repo, ["checkout", group[0].sha, "--", file]);
+			continue;
+		}
+		const merged = mergeDisjointEdits(repo, baseline, file, group);
+		if (merged !== null) {
+			writeFileSync(path.join(repo, file), merged);
+			git(repo, ["add", "--", file]);
 			continue;
 		}
 		overlap.push(file);
 		const parts = group.map((owner) => ({
 			id: owner.id,
 			intent: owner.intent,
-			text: git(repo, ["show", `${owner.sha}:${file}`]).stdout,
+			text: blobText(repo, owner.sha, file),
 		}));
-		mkdirSync(path.dirname(path.join(repo, file)), { recursive: true });
 		writeFileSync(path.join(repo, file), conflictText(parts));
 		git(repo, ["add", "--", file]);
 	}
