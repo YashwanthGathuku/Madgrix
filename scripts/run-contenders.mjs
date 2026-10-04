@@ -56,22 +56,11 @@ const baseUrl = process.env.MADGRIX_BASE_URL?.replace(/\/$/, "");
 const taskId = process.env.MADGRIX_TASK_ID;
 const agentCommand = process.env.MADGRIX_AGENT_COMMAND;
 const agentServiceToken = process.env.MADGRIX_AGENT_SERVICE_TOKEN;
-let agentIds;
-try {
-	agentIds = loadContenderIds();
-} catch (err) {
-	console.error(/** @type {Error} */ (err).message);
-	process.exit(2);
-}
 const keep = process.env.MADGRIX_KEEP_WORKSPACES === "1";
 const workRoot = process.env.MADGRIX_WORK_ROOT ?? os.tmpdir();
 
 if (!baseUrl || !taskId || !agentCommand || !agentServiceToken) {
 	console.error("Missing MADGRIX_BASE_URL, MADGRIX_TASK_ID, MADGRIX_AGENT_COMMAND, or MADGRIX_AGENT_SERVICE_TOKEN");
-	process.exit(2);
-}
-if (agentIds.length < 2) {
-	console.error("MADGRIX requires at least two concurrent agents. The roster is the Agentfleet manifest (configs/git4agents-contenders.yaml).");
 	process.exit(2);
 }
 /** @type {string[]} */
@@ -106,6 +95,17 @@ if (!Array.isArray(scopePaths) || scopePaths.length === 0) {
 }
 if (scopePaths.includes("**")) {
 	console.error('Claim scope "**" matches every path; unbounded claims are not admissible (spec 2 §7). Name the paths the task may change.');
+	process.exit(2);
+}
+let agentIds;
+try {
+	agentIds = loadContenderIds();
+} catch (err) {
+	console.error(/** @type {Error} */ (err).message);
+	process.exit(2);
+}
+if (agentIds.length < 2) {
+	console.error("MADGRIX requires at least two concurrent agents. The roster is the Agentfleet manifest (configs/git4agents-contenders.yaml).");
 	process.exit(2);
 }
 /** @type {Record<string, unknown>} */

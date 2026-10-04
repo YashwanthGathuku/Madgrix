@@ -71,6 +71,7 @@ import { createCommitment } from "../src/lib/verifiers.ts";
 import { verifierReportPayload } from "../src/lib/verifier-keys.ts";
 import { SELECTOR_POLICY_VERSION, type ReferenceReport } from "../src/lib/types.ts";
 import { loadContenderIds } from "./lib/agentfleet-slots.mjs";
+import { crewAgentIds, loadForkCrew } from "./lib/fork-crew.mjs";
 import { minimalEnv, parseAgentEnvAllowlist, pickEnv } from "./lib/child-env.mjs";
 
 const env = process.env;
@@ -85,19 +86,27 @@ const intent = env.MADGRIX_INTENT;
 const behaviorContract = env.MADGRIX_BEHAVIOR_CONTRACT;
 const agentCommand = env.MADGRIX_AGENT_COMMAND;
 const hiddenCommand = env.MADGRIX_HIDDEN_TEST_COMMAND;
-let agentIds: string[];
-try {
-	agentIds = loadContenderIds();
-} catch (err) {
-	console.error((err as Error).message);
-	process.exit(2);
-}
 const eventTimeoutMs = Number(env.MADGRIX_EVENT_TIMEOUT_MS ?? "60000");
 const promotionTimeoutMs = Number(env.MADGRIX_PROMOTION_TIMEOUT_MS ?? "900000");
 /** Between two polls of the promotion's status. */
 const PROMOTION_POLL_MS = 2000;
 const bundlePath = path.resolve(env.MADGRIX_BUNDLE_PATH ?? ".madgrix-live/promotion.bundle");
 
+if (!env.MADGRIX_CLAIM_PATHS && !env.MADGRIX_CLAIM_TEMPLATE) {
+	console.error("Missing required environment: MADGRIX_CLAIM_PATHS (or MADGRIX_CLAIM_TEMPLATE)");
+	process.exit(2);
+}
+let agentEnvAllowlist: string[];
+try {
+	agentEnvAllowlist = parseAgentEnvAllowlist(env.MADGRIX_AGENT_ENV_ALLOWLIST);
+} catch (err) {
+	console.error((err as Error).message);
+	process.exit(2);
+}
+// Unset MADGRIX_AGENT_IDS is the fork-crew demo: one parent fork, sub-agents
+// on that repo. An explicit roster keeps the sibling race the isolation tests
+// drive.
+const forkCrew = !env.MADGRIX_AGENT_IDS?.trim();
 const required: Record<string, unknown> = {
 	MADGRIX_BASE_URL: baseUrl,
 	MADGRIX_CONTROL_SERVICE_TOKEN: controlToken,
@@ -107,20 +116,17 @@ const required: Record<string, unknown> = {
 	MADGRIX_BASELINE_COMMIT: baselineCommit,
 	MADGRIX_INTENT: intent,
 	MADGRIX_BEHAVIOR_CONTRACT: behaviorContract,
-	MADGRIX_AGENT_COMMAND: agentCommand,
 	MADGRIX_HIDDEN_TEST_COMMAND: hiddenCommand,
+	...(forkCrew ? {} : { MADGRIX_AGENT_COMMAND: agentCommand }),
 };
 const missing = Object.entries(required).filter(([, v]) => typeof v !== "string" || v.length === 0);
-if (!env.MADGRIX_CLAIM_PATHS && !env.MADGRIX_CLAIM_TEMPLATE) {
-	missing.push(["MADGRIX_CLAIM_PATHS (or MADGRIX_CLAIM_TEMPLATE)", undefined]);
-}
 if (missing.length) {
 	console.error("Missing required environment:", missing.map(([k]) => k).join(", "));
 	process.exit(2);
 }
-let agentEnvAllowlist: string[];
+let agentIds: string[];
 try {
-	agentEnvAllowlist = parseAgentEnvAllowlist(env.MADGRIX_AGENT_ENV_ALLOWLIST);
+	agentIds = forkCrew ? crewAgentIds(loadForkCrew(env.MADGRIX_FORK_CREW_CONFIG)) : loadContenderIds();
 } catch (err) {
 	console.error((err as Error).message);
 	process.exit(2);
@@ -273,33 +279,44 @@ for (const v of verifiers) {
 
 const temp = await mkdtemp(path.join(os.tmpdir(), "madgrix-live-"));
 try {
-	console.error("[Git4agents] 3/9 launch real coding agents concurrently");
+	console.error(
+		forkCrew
+			? "[Git4agents] 3/9 parent forks once; sub-agents commit on that fork"
+			: "[Git4agents] 3/9 launch real coding agents concurrently",
+	);
 	const contenderResultPath = path.join(temp, "contenders.json");
 	// Agent zone: the AGENT token only. The runner forwards the allowlisted
 	// variables, and nothing else, to the agent command.
-	await run("node", ["scripts/run-contenders.mjs"], {
-		env: minimalEnv({
-			...pickEnv(agentEnvAllowlist),
-			MADGRIX_BASE_URL: baseUrl,
-			MADGRIX_TASK_ID: taskId,
-			MADGRIX_AGENT_SERVICE_TOKEN: agentToken,
-			MADGRIX_AGENT_COMMAND: agentCommand,
-			MADGRIX_AGENT_IDS: agentIds.join(","),
-			// The runner presents each agent's secret; the agents never see them.
-			MADGRIX_AGENT_SECRETS: JSON.stringify(agentSecrets),
-			MADGRIX_AGENT_ENV_ALLOWLIST: env.MADGRIX_AGENT_ENV_ALLOWLIST,
-			MADGRIX_CLAIM_PATHS: env.MADGRIX_CLAIM_PATHS,
-			MADGRIX_CLAIM_TEMPLATE: env.MADGRIX_CLAIM_TEMPLATE,
-			MADGRIX_KEEP_WORKSPACES: env.MADGRIX_KEEP_WORKSPACES,
-			MADGRIX_WORK_ROOT: env.MADGRIX_WORK_ROOT,
-			GIT_AUTHOR_NAME: env.GIT_AUTHOR_NAME,
-			GIT_AUTHOR_EMAIL: env.GIT_AUTHOR_EMAIL,
-			MADGRIX_RESULT_PATH: contenderResultPath,
-			// Per-repo Artifacts subscription. The API rejects a namespace-wide
-			// source, so the runner subscribes each contender repo before push.
-			MADGRIX_QUEUE_ID: env.MADGRIX_QUEUE_ID,
-			MADGRIX_ARTIFACTS_NAMESPACE: env.MADGRIX_ARTIFACTS_NAMESPACE,
-		}),
+	const childEnv = {
+		...pickEnv(agentEnvAllowlist),
+		MADGRIX_BASE_URL: baseUrl,
+		MADGRIX_TASK_ID: taskId,
+		MADGRIX_AGENT_SERVICE_TOKEN: agentToken,
+		MADGRIX_AGENT_SECRETS: JSON.stringify(agentSecrets),
+		MADGRIX_AGENT_ENV_ALLOWLIST: env.MADGRIX_AGENT_ENV_ALLOWLIST,
+		MADGRIX_CLAIM_PATHS: env.MADGRIX_CLAIM_PATHS,
+		MADGRIX_CLAIM_TEMPLATE: env.MADGRIX_CLAIM_TEMPLATE,
+		MADGRIX_KEEP_WORKSPACES: env.MADGRIX_KEEP_WORKSPACES,
+		MADGRIX_WORK_ROOT: env.MADGRIX_WORK_ROOT,
+		GIT_AUTHOR_NAME: env.GIT_AUTHOR_NAME,
+		GIT_AUTHOR_EMAIL: env.GIT_AUTHOR_EMAIL,
+		MADGRIX_RESULT_PATH: contenderResultPath,
+		MADGRIX_QUEUE_ID: env.MADGRIX_QUEUE_ID,
+		MADGRIX_ARTIFACTS_NAMESPACE: env.MADGRIX_ARTIFACTS_NAMESPACE,
+		MADGRIX_FLEET_BIN: env.MADGRIX_FLEET_BIN,
+		MADGRIX_FLEET_CONFIG: env.MADGRIX_FLEET_CONFIG,
+		MADGRIX_FORK_CREW_CONFIG: env.MADGRIX_FORK_CREW_CONFIG,
+	};
+	await run("node", [forkCrew ? "scripts/run-fork-crew.mjs" : "scripts/run-contenders.mjs"], {
+		env: minimalEnv(
+			forkCrew
+				? childEnv
+				: {
+						...childEnv,
+						MADGRIX_AGENT_COMMAND: agentCommand,
+						MADGRIX_AGENT_IDS: agentIds.join(","),
+					},
+		),
 	});
 	const contenderRun = JSON.parse(await readFile(contenderResultPath, "utf8"));
 	const candidates = contenderRun.candidates as Array<{
@@ -311,7 +328,12 @@ try {
 		candidate_sha: string;
 		baseline_sha: string;
 	}>;
-	if (!Array.isArray(candidates) || candidates.length < 2) {
+	if (forkCrew) {
+		const subs = contenderRun.subagent_commits as unknown[];
+		if (candidates.length !== 1 || !Array.isArray(subs) || subs.length < 2) {
+			throw new Error("fork crew did not produce one combined SHA from at least two sub-agent commits");
+		}
+	} else if (!Array.isArray(candidates) || candidates.length < 2) {
 		throw new Error("real contender run produced fewer than two candidates");
 	}
 

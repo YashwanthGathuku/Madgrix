@@ -20,6 +20,7 @@
     "bench": "node src/lib/benchmark.ts",
     "test": "node --test \"test/**/*.test.ts\"",
     "contenders": "node scripts/run-contenders.mjs",
+    "fork-crew": "node scripts/run-fork-crew.mjs",
     "evaluate": "node scripts/evaluate-candidate.ts",
     "live:e2e": "node scripts/live-e2e.ts"
   },

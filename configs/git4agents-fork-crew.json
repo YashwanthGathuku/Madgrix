@@ -1,0 +1,27 @@
+{
+  "parent": {
+    "id": "parent",
+    "role": "parent",
+    "intent": "Fork the baseline once and host sub-agents on that same repo."
+  },
+  "subs": [
+    {
+      "id": "sub-api",
+      "role": "api",
+      "intent": "Add the API handler without touching the UI.",
+      "paths": [
+        "src/api/**"
+      ],
+      "command": "mkdir -p src/api && printf '%s\\n' 'export function handler() { return \"api\"; }' > src/api/handler.js"
+    },
+    {
+      "id": "sub-ui",
+      "role": "ui",
+      "intent": "Add the UI view without touching the API.",
+      "paths": [
+        "src/ui/**"
+      ],
+      "command": "mkdir -p src/ui && printf '%s\\n' 'export function view() { return \"ui\"; }' > src/ui/view.js"
+    }
+  ]
+}
