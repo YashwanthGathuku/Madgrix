@@ -63,10 +63,11 @@ The production path now includes:
 - Authority-owned candidate anonymization.
 - Signed blind-verifier report validation.
 - Exact-state permits.
-- Trusted Cloudflare Container with Git for canonical promotion.
+- Trusted Cloudflare Container with Git for canonical promotion; each operation retries `exec` while the container starts, has 60 s, and destroys the container afterwards.
 - Bit-for-bit promotion of the **reviewed candidate commit SHA**.
 - HEAD-race protection through the permit plus Git fast-forward compare-and-swap.
-- Durable `PromotionWorkflow` retry wrapper.
+- `PromotionWorkflow`: one durable instance per permit (instance id = permit id), started by `POST /tasks/:id/promote` and polled at `GET /tasks/:id/promotions/:permit_id`.
+- JSON on every error path; a Durable Object's answer is parsed only when its content-type is JSON.
 - External real-agent runner.
 - Independent real-candidate evaluator.
 - Full live-infrastructure orchestrator: `npm run live:e2e`.
@@ -74,46 +75,90 @@ The production path now includes:
 
 ### What has actually been validated
 
-On GitHub Actions for the competition branch:
+Only what the runs below printed. Every Cloudflare service in them is a stand-in
+except where a line says otherwise.
 
-```
-npm run typecheck        PASS
-npm run build            PASS
-npm test                 110 tests / 27 suites / 0 failures
-npm run slice            SLICE OK
-npm run headmove         HEAD-MOVE OK
-npm run bench            26/26 adversarial trials; zero_tolerance_ok=true
-```
+- **GitHub Actions, base commit only.** [CI run 50](https://github.com/YashwanthGathuku/Madgrix/actions/runs/36954958830)
+  (push to `codex/competition-critical-paths`, commit `6a7ac47`, Node v24.21.0,
+  2026-10-02) passed every step of `.github/workflows/ci.yml` at that commit:
+  typecheck; `npm run build`, which bundled the Worker and built the
+  promotion-container image with Docker; `node --check` and `bash -n` on the live-run
+  scripts; `npm test` 110 tests / 27 suites / 0 failures; `SLICE OK`; `HEAD-MOVE OK`;
+  bench 26/26 adversarial trials, `zero_tolerance_ok=true`. No CI run exists for the
+  commits after it on this branch (CI runs on pushes to `main` and `codex/**` and on
+  pull requests).
+- **Local runs of this branch's tree** (2026-10-03): with Node v22.22.0,
+  `npm run typecheck` clean, `npm test` 281 tests / 87 suites / 0
+  failures, `SLICE OK`, `HEAD-MOVE OK`, bench 26/26 with `zero_tolerance_ok=true`; with
+  Node v24.21.0, the same steps in the order `.github/workflows/ci.yml` runs them,
+  including `npm run build` (Worker bundle and container image, built with a local
+  Docker daemon; the image was never started) and the typecheck against the generated
+  Cloudflare runtime types.
+- **What those tests run for real:** `container/promote.sh` and `container/rebase.sh`
+  against real git repositories (`test/promotion-fixtures.test.ts`); the Worker router,
+  the `TaskAuthority` and `PromotionContainer` Durable Object classes and the
+  `PromotionWorkflow` class, in Node. **What they stand in for:** Artifacts
+  (`FakeArtifacts`), Durable Object storage (in memory), the Container API (fakes,
+  `test/promotion-container.test.ts`), the Workflow binding
+  (`test/helpers/fake-workflow.ts`), and the deployed Worker that `scripts/live-e2e.ts`
+  talks to (a mock HTTP server, `test/env-isolation.test.ts`).
+- **Recorded manual run, not repeatable from this repository:** on 2026-10-01 the
+  Artifacts control plane was exercised with the `cf` CLI: repository creation, Git
+  push/clone with repo-scoped tokens, read/write scope enforcement, and token
+  revocation; the repository `fork()` endpoint returned `400 [10101]` for every
+  repository tried, which is why MADGRIX carries the baseline-copy fallback
+  (`docs/PRODUCTION_DEPLOYMENT.md`, status table).
 
-The Cloudflare build includes the Worker and trusted promotion-container image.
+### Known gaps
 
-Separately, real Cloudflare Artifacts validation has already demonstrated repository creation, Git push/clone, scoped read/write tokens, and token revocation. The beta repository `fork()` endpoint returned a Cloudflare server error during that validation, which is why MADGRIX carries the explicit baseline-copy fallback.
+- **Nothing has been deployed.** No code in this repository has run on Cloudflare
+  Workers, Durable Objects, Containers, Workflows or Queues, and `npm run live:e2e`
+  has never been run against a deployment. The proof step that remains is:
 
-### What is **not** claimed yet
+  ```
+  real deployed Worker
+  → real task
+  → 3 real agents
+  → 3 real Artifact repos
+  → real pushed events
+  → Queue
+  → TaskAuthority
+  → independent evaluation
+  → blind verifier reports
+  → Verdict Seam
+  → exact candidate promotion (PromotionWorkflow → promotion container)
+  → promotion.bundle
+  → VERIFIED
+  ```
 
-The new production path has **not yet been deployed and run end-to-end against the user's Cloudflare account** from this development environment. The remaining proof step is:
-
-```
-real deployed Worker
-→ real task
-→ 3 real agents
-→ 3 real Artifact repos
-→ real pushed events
-→ Queue
-→ TaskAuthority
-→ independent evaluation
-→ blind verifier reports
-→ Verdict Seam
-→ exact candidate promotion
-→ promotion.bundle
-→ VERIFIED
-```
-
-`npm run live:e2e` is written to execute exactly that path and fails if real Artifact push events do not arrive.
-
-The ordinary benchmark stratum remains synthetic harness validation, **not evidence** of real-world accuracy uplift. The real SWE-bench/SpecBench procedure is pre-registered in `docs/BENCHMARK_RUNBOOK.md`.
-
-Production Sigstore signing is also future hardening; the current competition verifier uses a long-lived Ed25519 authority key (`AUTHORITY_SIGNING_KEY`, public half pinned in `keys/authority.pub`) with the same DSSE envelope structure. No production key has been provisioned yet.
+  `npm run live:e2e` is written to execute exactly that path and fails if real
+  Artifact push events do not arrive.
+- **Workflows.** `PromotionWorkflow` has only run against a stand-in binding. The
+  platform's instance-id rules, retry timing, `restart()` of an errored instance and
+  `terminate()` of a running one are assumed from the runtime types, not observed.
+- **Containers.** The Container API calls (`start`, `exec`, `kill`, `destroy`) are
+  tested against fakes; the "not running" error text the retry matches
+  (`/not running/i`) is assumed. `container/copy-baseline.sh` is not run by any test
+  (`promote.sh` and `rebase.sh` are).
+- **Queue.** Deduplication and out-of-order handling are tested in memory; no real
+  at-least-once redelivery has been observed.
+- **Quarantine during a promotion.** Quarantine terminates the contender's pending
+  `PromotionWorkflow` instances, but a push already running in the container is not
+  undone: the destination can then hold a quarantined contender's commit with no
+  signed promotion bundle (finalize refuses it).
+- **Escalation can be overwritten.** A later verdict that ACCEPTs sets the task
+  status back to `verdict_reached` while an earlier escalation (a rebase conflict, for
+  instance) stays unresolved, so `issuePermit`'s escalation block no longer applies.
+- **Identities.** Evaluation-domain evidence is authenticated by a shared bearer
+  secret (`EVALUATION_SERVICE_TOKEN`), not mTLS. `GET /tasks/:id/ledger` and
+  `GET /tasks/:id/attestation/:permit_id/verify` require no token.
+- **Benchmark.** The ordinary benchmark stratum is synthetic harness validation,
+  **not evidence** of real-world accuracy uplift. The real SWE-bench/SpecBench
+  procedure is pre-registered in `docs/BENCHMARK_RUNBOOK.md`.
+- **Signing.** Production Sigstore signing is future hardening; the current verifier
+  uses a long-lived Ed25519 authority key (`AUTHORITY_SIGNING_KEY`, public half pinned
+  in `keys/authority.pub`) with the same DSSE envelope structure. No production key
+  has been provisioned.
 
 ## Local verification
 
@@ -130,12 +175,12 @@ npm run verify -- --trust-key .slice-output/authority.pub .slice-output/promotio
 npm run bench
 ```
 
-Expected test summary at the current competition-critical branch:
+Test summary of this branch's tree (local run, Node v22.22.0, 2026-10-03):
 
 ```
-tests 256
-suites 80
-pass 256
+tests 281
+suites 87
+pass 281
 fail 0
 ```
 
@@ -156,7 +201,7 @@ Then run:
 npm run live:e2e
 ```
 
-The orchestrator requires environment variables documented at the top of `scripts/live-e2e.ts`. It freezes verifier keys before candidate creation, launches three agents concurrently, waits for real push-event delivery, evaluates immutable candidate SHAs independently, runs the Verdict Seam, promotes the exact reviewed commit, fetches the promotion bundle the TaskAuthority signed (`GET /tasks/:id/bundle`), and verifies it offline against the pinned authority key (`MADGRIX_TRUST_KEY`, else `keys/authority.pub`).
+The orchestrator requires environment variables documented at the top of `scripts/live-e2e.ts`. It freezes verifier keys before candidate creation, launches three agents concurrently, waits for real push-event delivery, evaluates immutable candidate SHAs independently, runs the Verdict Seam, starts the promotion (`POST /tasks/:id/promote` → 202) and polls its Workflow instance until it is complete (`MADGRIX_PROMOTION_TIMEOUT_MS`, default 15 minutes), fetches the promotion bundle the TaskAuthority signed (`GET /tasks/:id/bundle`), and verifies it offline against the pinned authority key (`MADGRIX_TRUST_KEY`, else `keys/authority.pub`).
 
 Provider-specific coding agents are deliberately not hardcoded. `MADGRIX_AGENT_COMMAND` may invoke Codex, Claude Code, Aider, an AOS/Agent-Fleet runner, or another coding-agent command.
 
@@ -176,9 +221,12 @@ Provider-specific coding agents are deliberately not hardcoded. `MADGRIX_AGENT_C
 | POST | `/tasks/:id/verifiers/report` | CONTROL | Submit signed verifier report |
 | POST | `/tasks/:id/verdict` | CONTROL | Execute Verdict Seam and issue permit on ACCEPT (409 `REBASE_REQUIRED` when the destination moved past the winner's base) |
 | POST | `/tasks/:id/rebase` | CONTROL | Rebase a contender's latest commit onto the destination head; the new commit is pushed to its fork and must be evaluated again |
-| POST | `/tasks/:id/promote` | CONTROL | Exact-state canonical promotion |
+| POST | `/tasks/:id/promote` | CONTROL | Start the permit's `PromotionWorkflow` instance (instance id = permit id): 202 `{ instance_id, status, status_url }`; a repeated call reports the same instance, restarting it if it errored |
+| GET | `/tasks/:id/promotions/:permit_id` | CONTROL | The instance's status; once `complete`, the promotion's answer as `result` (`PROMOTED`, or a 409 refusal) |
 | GET | `/tasks/:id/bundle` | CONTROL | Promotion bundle the task authority signed at finalize |
-| GET | `/tasks/:id/ledger` | current route | Task ledger |
+| GET | `/tasks/:id/ledger` | none | Task ledger |
+
+Every answer is JSON: a request body that is not JSON is 415, an exception in a route is 500 `internal_error`, a Durable Object answer that is not JSON is 502 `upstream_not_json`, and a task authority that fails is 502 `task_authority_failed` (`specs/amendments/promotion-runtime-v1.md`).
 
 The task authority also exposes internal RPC transitions for queue ingestion, permit issuance, verdict execution, and post-write promotion finalization.
 
@@ -197,7 +245,7 @@ The trusted container:
 7. fast-forward pushes the **candidate SHA itself** to canonical `main`,
 8. lets the Durable Object consume the permit only after the canonical write is known to exist.
 
-A retry after a lost response finds the candidate already in canonical history, even under later commits, and reconciles as `ALREADY_WRITTEN`; it does not create a second change. The result names `BASE` (the permit-bound head) and `PARENT` (the candidate's own parent, read from git); the signed ship record carries both.
+The promotion runs as the permit's `PromotionWorkflow` instance. Its step retries a 5xx answer or an exception (five retries, exponential from 10 s); a 409 refusal completes the instance and leaves the permit unconsumed. A retry after a lost response finds the candidate already in canonical history, even under later commits, and reconciles as `ALREADY_WRITTEN`; it does not create a second change. The result names `BASE` (the permit-bound head) and `PARENT` (the candidate's own parent, read from git); the signed ship record carries both.
 
 If the destination moved after the verdict, the permit expires and the same commit gets no new permit at the new head (`REBASE_REQUIRED`): the task authority only binds a head the candidate is known to descend from. `container/rebase.sh` replays the candidate onto the new head and pushes the result to the contender's fork as a new commit; that commit is evaluated again before it can get a permit. Conflicts escalate to the operator-of-record with the conflicting paths as data (`specs/amendments/rebase-ancestry-v1.md`). `test/promotion-fixtures.test.ts` runs both scripts against real git repositories, on a fixture table the in-memory harnesses' model must also pass.
 

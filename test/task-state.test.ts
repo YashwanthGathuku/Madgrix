@@ -26,6 +26,7 @@ import {
 	submitVerifierReport,
 	taskHashFor,
 	type Ctx,
+	type Effect,
 	type QuarantineRecheck,
 	type SignedDetermination,
 } from "../src/lib/task-state.ts";
@@ -466,6 +467,15 @@ describe("permit + promotion", () => {
 		const r = await attemptPromotion(q.state, issued.permit.permit_id, BASELINE, "tree1", ctx);
 		assert.equal(r.outcome, "QUARANTINED_CANDIDATE");
 		assert.equal(r.state.permits[issued.permit.permit_id].consumed, false);
+		// The quarantine names the permit whose PromotionWorkflow instance it
+		// stops (specs/amendments/promotion-runtime-v1.md); a consumed permit
+		// has nothing left to stop.
+		const cancel = (effects: Effect[]) => effects.find((e) => e.kind === "cancel_workflow");
+		assert.deepEqual(cancel(q.effects), { kind: "cancel_workflow", contender_id: "contender-1", permit_ids: [issued.permit.permit_id] });
+		const consumed = structuredClone(issued.state);
+		consumed.permits[issued.permit.permit_id].consumed = true;
+		const q2 = await quarantineContender(consumed, "contender-1", "candidate_sha_substitution", "ev-hash", ctx);
+		assert.deepEqual(cancel(q2.effects), { kind: "cancel_workflow", contender_id: "contender-1", permit_ids: [] });
 	});
 
 	it("issuePermit requires an ACCEPT verdict for the winner", async () => {
@@ -493,7 +503,7 @@ describe("quarantine", () => {
 		assert.equal(qstate.evaluations["csha1"].tainted, true);
 		assert.deepEqual(effects, [
 			{ kind: "revoke_token", repo: "fork-1", token_id: "tok-1" },
-			{ kind: "cancel_workflow", contender_id: "contender-1" },
+			{ kind: "cancel_workflow", contender_id: "contender-1", permit_ids: [] },
 			{
 				kind: "notify",
 				to: ["operator-of-record"],

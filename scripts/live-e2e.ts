@@ -27,6 +27,8 @@
  *   MADGRIX_AGENT_IDS              default agent-a,agent-b,agent-c; enrolled at
  *                                  task creation, each with its own secret
  *   MADGRIX_EVENT_TIMEOUT_MS       default 60000
+ *   MADGRIX_PROMOTION_TIMEOUT_MS   how long to poll the promotion's Workflow
+ *                                  instance; default 900000 (15 minutes)
  *   MADGRIX_BUNDLE_PATH            default .madgrix-live/promotion.bundle
  *   MADGRIX_CLAIM_TEMPLATE         passed through to contender runner
  *   MADGRIX_AGENT_ENV_ALLOWLIST    variables passed through to the agent
@@ -82,6 +84,9 @@ const agentIds = (env.MADGRIX_AGENT_IDS ?? "agent-a,agent-b,agent-c")
 	.map((s) => s.trim())
 	.filter(Boolean);
 const eventTimeoutMs = Number(env.MADGRIX_EVENT_TIMEOUT_MS ?? "60000");
+const promotionTimeoutMs = Number(env.MADGRIX_PROMOTION_TIMEOUT_MS ?? "900000");
+/** Between two polls of the promotion's status. */
+const PROMOTION_POLL_MS = 2000;
 const bundlePath = path.resolve(env.MADGRIX_BUNDLE_PATH ?? ".madgrix-live/promotion.bundle");
 
 const required: Record<string, unknown> = {
@@ -430,12 +435,33 @@ try {
 	const winner = candidates[winnerIndex];
 
 	console.error("[madgrix-live] 8/9 promote the exact reviewed commit to canonical Artifacts state");
-	const promotion = await requestJson(`${baseUrl}/tasks/${encodeURIComponent(taskId)}/promote`, {
+	// POST /promote starts the permit's PromotionWorkflow instance (202); the
+	// promotion's answer is the instance's result once it is complete.
+	const started = await requestJson(`${baseUrl}/tasks/${encodeURIComponent(taskId)}/promote`, {
 		token: controlToken,
 		body: { permit_id: permit.permit_id },
 	});
-	if (promotion.outcome !== "PROMOTED" || promotion.promoted_sha !== winner.candidate_sha) {
-		throw new Error(`exact-state promotion failed: ${JSON.stringify(promotion)}`);
+	if (started.instance_id !== permit.permit_id || typeof started.status_url !== "string") {
+		throw new Error(`POST /promote did not start the permit's promotion: ${JSON.stringify(started)}`);
+	}
+	const promotionDeadline = Date.now() + promotionTimeoutMs;
+	let instance = started;
+	for (;;) {
+		instance = await requestJson(`${baseUrl}${started.status_url}`, { token: controlToken });
+		if (instance.status !== "queued" && instance.status !== "running" && instance.status !== "waiting") break;
+		if (Date.now() >= promotionDeadline) {
+			throw new Error(`promotion still ${instance.status} after ${promotionTimeoutMs} ms: ${JSON.stringify(instance)}`);
+		}
+		await sleep(PROMOTION_POLL_MS);
+	}
+	const promotion = instance.result?.body ?? {};
+	if (
+		instance.status !== "complete" ||
+		instance.result?.status !== 200 ||
+		promotion.outcome !== "PROMOTED" ||
+		promotion.promoted_sha !== winner.candidate_sha
+	) {
+		throw new Error(`exact-state promotion failed: ${JSON.stringify(instance)}`);
 	}
 
 	console.error("[madgrix-live] 9/9 fetch the authority-signed bundle and verify it offline");

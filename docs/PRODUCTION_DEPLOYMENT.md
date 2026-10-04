@@ -8,14 +8,14 @@ FROZEN-v1 — this document never overrides it).
 
 | Component | Cloudflare primitive | Role (per frozen spec 5) |
 |---|---|---|
-| Ingestion Worker (`seam`) | Worker (`src/worker/index.ts`, `fetch` + `queue` exports) | Receives Artifact lifecycle events from the Queue; derives `event_key`; forwards to the task's DO |
+| Ingestion Worker (`madgrix`) | Worker (`src/worker/index.ts`, `fetch` + `queue` exports) | Receives Artifact lifecycle events from the Queue; derives `event_key`; forwards to the task's DO |
 | Task authority | Durable Object, class `TaskAuthority`, **one instance per task id** (`env.TASK_AUTHORITY`, `idFromName(task_id)`) | Authoritative state machine: `event_key` dedupe, claims, contenders, evidence, permits, quarantine, ledger. Every transition inside a storage transaction; returns `Effect[]`, never executes side effects |
-| Event ingestion | Cloudflare Queue `seam-events` (at-least-once, unordered) | `triggers.queue({ name: "seam-events" })` in `cloudflare.config.ts` → Worker's `queue()` export → DO `/event` → `executeEffects` |
-| Orchestration | Workflows (`PromotionWorkflow` in `src/worker/index.ts`) | **SKELETON.** Step names are the idempotent operation ids (fork/evaluate/promote). Not registered in config; step bodies call route logic. Full wiring (WorkflowEntrypoint, workflow binding/export) is deferred to the protocol-layer completion |
+| Event ingestion | Cloudflare Queue `madgrix-events` (at-least-once, unordered) | `triggers.queue({ name: "madgrix-events" })` in `cloudflare.config.ts` → Worker's `queue()` export → DO `/event` → `executeEffects` |
+| Orchestration | Workflow `madgrix-promotion` (`PromotionWorkflow` in `src/worker/index.ts`; `exports.workflow` and the `PROMOTION_WORKFLOW` binding in `cloudflare.config.ts`) | `POST /tasks/:id/promote` creates one instance per permit, instance id = permit id (spec 5 §5); its one step runs the promotion and retries a 5xx or an exception (five retries, exponential from 10 s); `GET /tasks/:id/promotions/:permit_id` reports it. Only the promotion is a Workflow; fork and evaluation are not. Run only against a stand-in binding (`test/helpers/fake-workflow.ts`) |
 | Repository substrate | Artifacts binding (`env.ARTIFACTS`, namespace `default`) | Forks, tokens, git protocol. No merge API (spec 5 §7) |
-| Merge machinery | Sandbox + git (isolated sandbox holding destination HEAD + winning tree + merge-scoped token) | Performs the actual merge after verifying the exact-state permit. **Not implemented in this slice** — the `/promote` route performs all platform preconditions and stops before the canonical write |
+| Merge machinery | Container (`PromotionContainer` Durable Object, image `container/Dockerfile`) | `container/promote.sh` fast-forwards the destination to the reviewed commit after re-checking the permit-bound head and the tree digest; `container/rebase.sh` replays a candidate onto a moved head into the contender's fork; `container/copy-baseline.sh` seeds a fork when the fork endpoint fails. Each operation starts the container, retries `exec` while it is not running, has 60 s, and destroys the container afterwards (`specs/amendments/promotion-runtime-v1.md`). The scripts have run against local git repositories only |
 | Decision authority | This platform | What may be merged, and the proof (permit = `SHA256(task_hash ‖ baseline ‖ winning_tree ‖ eval_bundle ‖ policy ‖ expected_destination_head)`) |
-| Verdict seam / attestation | Protocol layer (sibling workstreams) | `/verdict` returns 501 here; full verdict + in-toto/DSSE/Sigstore attestation live in `src/lib/` and the sibling-owned protocol layer |
+| Verdict seam / attestation | Task authority (`/verdict`, `/promotion/finalize`) | `/verdict` runs the Verdict Seam in the TaskAuthority and issues the permit on ACCEPT; at finalize the TaskAuthority signs the promotion bundle (in-toto statements in DSSE envelopes, Ed25519, `specs/amendments/authority-signing-v1.md`). Sigstore is not implemented |
 
 Zone credentials (spec 3 §5), as implemented in `src/worker/index.ts`:
 contender = WRITE on its fork only, TTL ≤ 1h (`issueContenderCredentials`
@@ -26,10 +26,10 @@ rejects TTL > 3600); evaluator = READ per-evaluation; verifiers = none.
 No real secret values appear below. Nothing here has been deployed.
 
 ```bash
-cd seam
+# from the repository root
 
 # 1. Prereqs (account <CLOUDFLARE_ACCOUNT_ID> — see ../SETUP_STATUS.md)
-cf queues create seam-events            # queue must exist before deploy
+cf queues create madgrix-events         # queue must exist before deploy
 # cf artifacts namespaces ...           # namespace "default" already exists
 
 # 2. Typecheck + build (must be clean)
@@ -45,9 +45,11 @@ Bindings/secrets required at deploy time (all declared in `cloudflare.config.ts`
 | Name | Kind | Source | Notes |
 |---|---|---|---|
 | `ARTIFACTS` | Artifacts binding, namespace `default` | platform-managed | Local dev on a direct-egress machine uses `dev: { remote: true }` |
-| `TASK_AUTHORITY` | Durable Object binding → class `TaskAuthority` in this same Worker | declared via `exports.durableObject({ storage: "sqlite" })` + `bindings.durableObject({ worker: "seam", exportName: "TaskAuthority" })` | sqlite storage for transactional state |
+| `TASK_AUTHORITY` | Durable Object binding → class `TaskAuthority` in this same Worker | declared via `exports.durableObject({ storage: "sqlite" })` + `bindings.durableObject({ worker: "madgrix", exportName: "TaskAuthority" })` | sqlite storage for transactional state |
+| `PROMOTION_CONTAINER` | Durable Object binding → class `PromotionContainer`, with the `madgrix-promotion` container | `exports.durableObject({ storage: "sqlite", container })` + `bindings.durableObject({ worker: "madgrix", exportName: "PromotionContainer" })` | Runs `container/promote.sh`, `rebase.sh`, `copy-baseline.sh`; image built from `container/Dockerfile` |
+| `PROMOTION_WORKFLOW` | Workflow binding → class `PromotionWorkflow` | `exports.workflow({ name: "madgrix-promotion", ... })` + `bindings.workflow({ name: "madgrix-promotion", worker: "madgrix", exportName: "PromotionWorkflow" })` | One instance per permit (instance id = permit id) |
 | `AUTHORITY_SIGNING_KEY` | Worker secret (Ed25519 PKCS8, PEM or base64) | generated outside the repo (`keys/README.md`) | The TaskAuthority signs every promotion bundle with it at `/promotion/finalize`; without it finalize answers 503 and consumes nothing. Its public half is committed as `keys/authority.pub` and pinned by `src/cli/verify.ts` |
-| Queue trigger `seam-events` | Queue consumer | `triggers.queue(...)` in config; queue must pre-exist | `maxBatchSize: 10`, `maxBatchTimeout: 30`; add a dead-letter queue for poison messages (the `queue()` consumer throws on malformed bodies, which redelivers until the retry limit) |
+| Queue trigger `madgrix-events` | Queue consumer | `triggers.queue(...)` in config; queue must pre-exist | `maxBatchSize: 10`, `maxBatchTimeout: 30`; add a dead-letter queue for poison messages (the `queue()` consumer throws on malformed bodies, which redelivers until the retry limit) |
 
 Besides the three service tokens, the only key the Worker needs is
 `AUTHORITY_SIGNING_KEY` (`specs/amendments/authority-signing-v1.md`). Plaintext
@@ -81,6 +83,18 @@ Sigstore signing remains future hardening (spec 4 §6).
 | Evaluation-domain auth on `/evidence` | ⚠️ TODO in code | Currently accepts + records; production must authenticate the evaluation domain (spec 3 §2) before recording |
 | `cf deploy` to the account | ❌ not attempted | Per hard rules: no deploy from this machine without explicit instruction; first deploy belongs on a direct-egress machine |
 
+Update 2026-10-03 (`specs/amendments/promotion-runtime-v1.md`): the table above
+records 2026-10-01 and is out of date in these rows. "DO binding + export in config":
+the Worker is `madgrix` and the queue `madgrix-events` (this document named
+`seam`/`seam-events`, which `cloudflare.config.ts` does not use). "`PromotionWorkflow`
+real execution": the Workflow is now exported and bound (`PROMOTION_WORKFLOW`), and
+`POST /tasks/:id/promote` creates its instances; it has still never executed on the
+Workflows runtime, only against `test/helpers/fake-workflow.ts`. "Evaluation-domain
+auth on `/evidence`": the Worker requires `Authorization: Bearer
+<EVALUATION_SERVICE_TOKEN>` (a shared secret, not mTLS). The 501 `/verdict` rows describe
+the 2026-10-01 boot; `/verdict` now runs the Verdict Seam. The unit-suite count is
+2026-10-01's; README.md has the current one.
+
 Update 2026-10-03 (`specs/amendments/rebase-ancestry-v1.md`): the "Merge sandbox" row
 above is out of date. The canonical write is `container/promote.sh`, a fast-forward to
 the reviewed commit, and a moved destination is handled by `container/rebase.sh`; the
@@ -107,41 +121,25 @@ with that flag set, where the line did not appear.
 
 ## (d) Smoke test after first real deploy
 
-Run on a direct-egress machine, against the deployed Worker URL
-(`$BASE`). All Artifacts calls go through the remote binding.
+Not run: nothing has been deployed. Run on a direct-egress machine against the
+deployed Worker (`$BASE`); every route except the ledger and the permit check
+(`GET /tasks/:id/attestation/:permit_id/verify`) needs its zone's service token
+(`Authorization: Bearer ...`).
 
-```bash
-BASE=https://seam.<account>.workers.dev   # actual deployed URL
+1. `curl -s $BASE/nope` answers JSON 404 `{"error":"not_found",...}`, and a route
+   called without its token answers 401.
+2. `npm run live:e2e` (README, "Real competition run") with `MADGRIX_BASE_URL=$BASE`:
+   it creates a task, runs the contenders, evaluates the candidates, runs the blind
+   verifiers and the Verdict Seam, starts the promotion (`POST /tasks/:id/promote` →
+   202), polls `GET /tasks/:id/promotions/:permit_id` until the instance is
+   `complete`, and verifies the signed promotion bundle offline against the pinned
+   key. It fails if real Artifact push events do not reach the queue.
+3. Queue dedupe: publish the same push event twice to `madgrix-events`; the second
+   delivery must ACK without effect (the `event_key` appears once in
+   `GET /tasks/<task_id>/ledger`).
+4. DO isolation: an event for one task must not touch another task's DO.
 
-# 1. Router alive
-curl -s $BASE/nope | grep not_found
-
-# 2. Verdict seam is still protocol-layer (expect 501, not 500)
-curl -s -X POST $BASE/tasks/t0/verdict -o /dev/null -w '%{http_code}\n'   # 501
-
-# 3. Create a task against a real baseline repo (namespace "default")
-curl -s -X POST $BASE/tasks -H 'content-type: application/json' \
-  -d '{"intent":"smoke","baseline_repo":"starter-repo","baseline_commit":"<real-sha>"}'
-# expect 201 {"task_id":"task_...","task_hash":"...","frozen_at":"..."}
-
-# 4. Register a claim (expect work_id assigned by the authority)
-curl -s -X POST $BASE/tasks/<task_id>/claim -H 'content-type: application/json' \
-  -d '{"claim":{"agent":"smoke-agent","task":"<task_hash>","baseline":"<sha>", ...}}'
-# expect 200 {"recorded":true,"work_id":"W-...","conflicts":[]}
-
-# 5. Ledger shows the frozen task + claim
-curl -s $BASE/tasks/<task_id>/ledger | grep <task_id>
-
-# 6. Queue dedupe: publish the same push event twice to seam-events;
-#    the second delivery must ACK without effect (no duplicate ledger entries).
-#    Verify via the ledger (step 5) — event_key appears once.
-
-# 7. DO isolation: POST /tasks/<other>/claim with a duplicate event_key
-#    for the first task must not touch the second task's DO.
-```
-
-Pass criteria: steps 1–5 return the expected codes/shapes; step 6 shows
-exactly-once effect under duplicate delivery; step 7 shows per-task
-isolation. Any 500, any duplicate side effect, or any cross-task state leak
-is a deployment blocker — record it as a spec-5 amendment candidate, do not
-patch around it.
+Pass criteria: step 1 and 2 as described; step 3 shows exactly-once effect under
+duplicate delivery; step 4 shows per-task isolation. Any 500, any duplicate side
+effect, or any cross-task state leak is a deployment blocker — record it as a
+spec-5 amendment candidate, do not patch around it.

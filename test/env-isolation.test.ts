@@ -273,6 +273,7 @@ const ROUTE_ZONES: Record<string, Zone[]> = {
 	"POST verifiers/report": ["control"],
 	"POST verdict": ["control"],
 	"POST promote": ["control"],
+	"GET promotions": ["control"],
 	"GET bundle": ["control"],
 	"GET context": ["agent", "control"],
 	"POST claim": ["agent"],
@@ -380,6 +381,7 @@ async function startMock(): Promise<Mock> {
 	let seq = 0;
 	let winner = "";
 	let promotion: MockPromotion | null = null;
+	let promotionPolls = 0;
 
 	const createContender = (taskId: string, agentId: string): Contender => {
 		const id = `contender-${++seq}`;
@@ -404,7 +406,9 @@ async function startMock(): Promise<Mock> {
 			const { pathname } = new URL(req.url ?? "/", "http://mock.invalid");
 			const match = /^\/tasks\/([^/]+)\/(.+)$/.exec(pathname);
 			const taskId = match?.[1] ?? "";
-			const route = pathname === "/tasks" ? `${req.method} /tasks` : `${req.method} ${match?.[2]}`;
+			// GET /tasks/:id/promotions/:permit_id is one route, whatever the permit.
+			const action = match?.[2]?.startsWith("promotions/") ? "promotions" : match?.[2];
+			const route = pathname === "/tasks" ? `${req.method} /tasks` : `${req.method} ${action}`;
 			const zone =
 				(Object.keys(ZONE_TOKEN_VARS) as Zone[]).find(
 					(z) => req.headers.authorization === `Bearer ${OPERATOR_SECRETS[ZONE_TOKEN_VARS[z]]}`,
@@ -482,8 +486,25 @@ async function startMock(): Promise<Mock> {
 					promotion = await issueMockPermit(taskId, taskHash(taskId), chosen);
 					return send(200, { verdict: { state: "ACCEPT", winner_sha: winner }, permit: promotion.permit });
 				}
-				case "POST promote":
-					return send(200, { outcome: "PROMOTED", promoted_sha: winner });
+				case "POST promote": {
+					// The Worker starts the permit's PromotionWorkflow instance and
+					// answers 202; the instance runs before the first poll here.
+					if (!promotion || body.permit_id !== promotion.permit.permit_id) return send(404, { outcome: "UNKNOWN_PERMIT" });
+					promotionPolls = 0;
+					const status_url = `/tasks/${taskId}/promotions/${body.permit_id}`;
+					return send(202, { instance_id: body.permit_id, status: "queued", status_url });
+				}
+				case "GET promotions": {
+					if (!promotion) return send(404, { error: "promotion_not_started" });
+					const permit_id = promotion.permit.permit_id;
+					// The first poll finds the instance still running; the next one, complete.
+					if (promotionPolls++ === 0) return send(200, { instance_id: permit_id, status: "running" });
+					return send(200, {
+						instance_id: permit_id,
+						status: "complete",
+						result: { status: 200, body: { outcome: "PROMOTED", permit_id, promoted_sha: winner } },
+					});
+				}
 				case "GET bundle":
 					if (!promotion) return send(404, { error: "bundle_not_found" });
 					return send(200, await mockSignedBundle(taskId, promotion, winner));
@@ -865,6 +886,14 @@ describe("process environment boundaries of the live-run scripts", () => {
 		);
 		assert.equal(live.code, 0, `live-e2e failed:\n${live.stderr}`);
 		assert.match(live.stdout, /MADGRIX_LIVE_E2E_OK/);
+		// POST /promote answered 202; live-e2e polled the instance until it was complete.
+		assert.deepEqual(
+			fx.mock.requests.filter((r) => r.route === "GET promotions"),
+			[
+				{ route: "GET promotions", zone: "control" },
+				{ route: "GET promotions", zone: "control" },
+			],
+		);
 		// live-e2e verified the Worker's bundle against the pinned key, not the embedded one.
 		assert.match(live.stdout, /^authority key\.+ PINNED$/m);
 		assert.match(live.stdout, /^VERIFIED$/m);

@@ -70,9 +70,12 @@ component that can write canonical state, and it lives inside the control plane.
 8. **Permit.** On ACCEPT, the authority issues a single-use permit binding the exact
    task, baseline, winning tree SHA, evaluation bundle, policy version, and the
    expected destination head.
-9. **Promote.** The promotion service — the sole canonical writer — verifies the
-   permit, fast-forwards the canonical branch to the reviewed commit itself
-   (`container/promote.sh`), records the ship, and consumes the permit atomically.
+9. **Promote.** `POST /tasks/:id/promote` starts the permit's `PromotionWorkflow`
+   instance (instance id = permit id); its step is the promotion service — the sole
+   canonical writer — which verifies the permit, fast-forwards the canonical branch
+   to the reviewed commit itself (`container/promote.sh`), records the ship, and
+   consumes the permit atomically. The step retries a 5xx or an exception; a 409
+   refusal is final (`specs/amendments/promotion-runtime-v1.md`).
    A replayed permit returns `ALREADY_CONSUMED` (no-op ACK). If the destination HEAD
    moved after the verdict, the permit is EXPIRED, and the same commit gets no
    permit at the new head (`REBASE_REQUIRED`): the rebase service replays it onto
@@ -120,7 +123,7 @@ what white-box protects is evaluation *authority and persistence*).
 | Platform interface | `src/lib/artifacts-port.ts` | What production Artifacts must provide |
 | In-memory substrate | `src/lib/fake-artifacts.ts` | NOT production — repos, tokens, queue events in memory |
 | TaskAuthority DO | `src/do/TaskAuthority.ts` | Durable Object wrapper around the state machine |
-| Worker router | `src/worker/index.ts` | HTTP routes for tasks, claims, contenders, evidence, verdict, promote, ledger |
+| Worker router | `src/worker/index.ts` | HTTP routes for tasks, claims, contenders, evidence, verdict, promote, promotion status, ledger; the `PromotionWorkflow` |
 | Vertical slice | `src/harness/slice.ts` | The 12-stage end-to-end proof |
 | Offline verifier | `src/cli/verify.ts` | Verify-only Ed25519 signer over the pinned authority key; prints the 10-line transcript |
 | Benchmark harness | `src/lib/benchmark.ts` | Synthetic / harness-validation only — not evidence |

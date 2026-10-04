@@ -3,14 +3,18 @@
  *
  * # What this file is
  *
- * Production Cloudflare control-plane wiring for the competition path:
- * Artifacts, Queue ingestion, per-task Durable Object authority, independent
- * trust-zone identities, Verdict Seam execution, durable promotion Workflow,
- * and exact-state canonical Git promotion through the trusted container.
+ * The Cloudflare control plane: the HTTP routes, the Queue consumer, the
+ * PromotionWorkflow, and the adapter from the Artifacts binding to
+ * `ArtifactsPort`. cloudflare.config.ts wires it to Artifacts, the
+ * `madgrix-events` queue, the TaskAuthority and PromotionContainer Durable
+ * Objects, the `madgrix-promotion` Workflow and the three zone service tokens.
  *
- * The local deterministic slice still uses FakeArtifacts for repeatable tests;
- * scripts/live-e2e.ts is the real-infrastructure path and intentionally fails
- * unless real Artifacts push events reach Queue → TaskAuthority.
+ * Where it has run: the tests drive this module in Node with stand-ins
+ * (FakeArtifacts for the binding, in-memory Durable Object storage, a model of
+ * the promotion container's scripts, test/helpers/fake-workflow.ts for the
+ * Workflow binding). Nothing in this repository runs it on Cloudflare;
+ * scripts/live-e2e.ts is the real-infrastructure path and fails unless real
+ * Artifacts push events reach Queue → TaskAuthority.
  *
  * # Architecture (spec 5)
  *
@@ -25,8 +29,11 @@
  * - Zone credentials (spec 3 §5): `issueContenderCredentials` (WRITE, own
  *   fork only, ≤1h), `issueEvaluatorCredentials` (READ, per-evaluation),
  *   verifiers get NONE.
- * - The promotion service is the ONLY canonical writer (spec 3 §2). The
- *   `/promote` route performs the platform-owned preconditions (permit
+ * - The promotion service is the ONLY canonical writer (spec 3 §2).
+ *   POST /tasks/:id/promote starts the permit's PromotionWorkflow instance
+ *   (instance id = permit id, spec 5 §5) and answers 202; GET
+ *   /tasks/:id/promotions/:permit_id reports it. The instance's step runs
+ *   `runPromotion`, which performs the platform-owned preconditions (permit
  *   lookup, consumed check, quarantine check, permit-id recompute, evidence
  *   check) and mints five-minute repo-scoped tokens; the canonical write
  *   itself is container/promote.sh in the trusted promotion container, which
@@ -34,6 +41,8 @@
  *   specs/amendments/rebase-ancestry-v1.md). `/rebase` replays a candidate
  *   onto a moved destination head with container/rebase.sh and pushes the
  *   new commit to the contender's fork, never to the destination.
+ * - Every answer is JSON, and a Durable Object's answer is parsed only after
+ *   its content-type says it is JSON (specs/amendments/promotion-runtime-v1.md).
  *
  * No credentials in code or logs. No network calls from this module beyond
  * the platform's own RPCs. Plaintext tokens are returned once in a response
@@ -89,14 +98,61 @@ function json(data: unknown, status: number = 200): Response {
 	});
 }
 
+/** `application/json` or `application/*+json`, with or without parameters. */
+function isJsonContentType(value: string | null): boolean {
+	return value !== null && /^application\/(?:[\w.+-]+\+)?json\s*(?:;|$)/i.test(value.trim());
+}
+
+/**
+ * Every request body is JSON: a body sent as anything else is 415 before it
+ * is parsed, and a body that does not parse is 400
+ * (specs/amendments/promotion-runtime-v1.md).
+ */
 async function readJsonBody(
 	request: Request,
 ): Promise<{ ok: true; body: Record<string, unknown> } | { ok: false; response: Response }> {
+	if (!isJsonContentType(request.headers.get("content-type"))) {
+		return { ok: false, response: json({ error: "content_type_must_be_json" }, 415) };
+	}
 	try {
 		const body = (await request.json()) as Record<string, unknown>;
 		return { ok: true, body };
 	} catch {
 		return { ok: false, response: json({ error: "invalid_json" }, 400) };
+	}
+}
+
+/**
+ * A Durable Object answered something that is not JSON (the runtime's own
+ * error page, say). The router answers it as a 502 `upstream_not_json`.
+ */
+class UpstreamNotJsonError extends Error {
+	readonly upstream: string;
+	readonly upstreamStatus: number;
+	constructor(upstream: string, upstreamStatus: number) {
+		super(`upstream_not_json: ${upstream} answered HTTP ${upstreamStatus} without a JSON body`);
+		this.upstream = upstream;
+		this.upstreamStatus = upstreamStatus;
+	}
+}
+
+/**
+ * Read a Durable Object's answer. Its content-type is checked first: .json()
+ * is only called on a JSON answer; anything else throws UpstreamNotJsonError
+ * (as does a JSON answer that does not parse).
+ */
+async function readUpstreamJson(
+	res: Response,
+	upstream: "task_authority" | "promotion_container",
+): Promise<{ ok: boolean; status: number; body: unknown }> {
+	if (!isJsonContentType(res.headers.get("content-type"))) {
+		await res.body?.cancel().catch(() => undefined);
+		throw new UpstreamNotJsonError(upstream, res.status);
+	}
+	try {
+		return { ok: res.ok, status: res.status, body: await res.json() };
+	} catch {
+		throw new UpstreamNotJsonError(upstream, res.status);
 	}
 }
 
@@ -110,6 +166,7 @@ function promotionStub(env: Env, permitId: string): DoStub {
 	return ns.get(ns.idFromName(permitId));
 }
 
+/** An RPC to a task authority. Throws UpstreamNotJsonError if the answer is not JSON. */
 async function doRpc(
 	stub: DoStub,
 	path: string,
@@ -122,13 +179,42 @@ async function doRpc(
 			body: init?.body === undefined ? undefined : JSON.stringify(init.body),
 		}),
 	);
-	let body: unknown = null;
-	try {
-		body = await res.json();
-	} catch {
-		body = null;
-	}
-	return { ok: res.ok, status: res.status, body };
+	return readUpstreamJson(res, "task_authority");
+}
+
+/** A request to a promotion container. Throws UpstreamNotJsonError if the answer is not JSON. */
+async function containerRpc(
+	stub: DoStub,
+	path: string,
+	body: unknown,
+): Promise<{ ok: boolean; status: number; body: unknown }> {
+	const res = await stub.fetch(
+		new Request(`https://promotion${path}`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify(body),
+		}),
+	);
+	return readUpstreamJson(res, "promotion_container");
+}
+
+/** The task authority's state, or the answer for a request that cannot have it. */
+type TaskStateRead = { ok: true; state: AuthorityState } | { ok: false; status: number; body: Record<string, unknown> };
+
+/**
+ * Read the task authority's state. Only its 404 means there is no such task;
+ * any other failure (a storage outage is its JSON 500) is 502
+ * `task_authority_failed`, which the PromotionWorkflow step retries.
+ */
+async function readTaskState(env: Env, taskId: string): Promise<TaskStateRead> {
+	const res = await doRpc(taskStub(env, taskId), "/state", { method: "GET" });
+	if (res.ok) return { ok: true, state: res.body as AuthorityState };
+	if (res.status === 404) return { ok: false, status: 404, body: { error: "task_not_found", task_id: taskId } };
+	return {
+		ok: false,
+		status: 502,
+		body: { error: "task_authority_failed", task_id: taskId, upstream_status: res.status, detail: res.body },
+	};
 }
 
 /* ------------------------------------------------------------------ */
@@ -581,9 +667,9 @@ export async function handleCreateContender(
 		return json({ error: "invalid_claim_work_id" }, 400);
 	}
 
-	const stateRes = await doRpc(taskStub(env, taskId), "/state", { method: "GET" });
-	if (!stateRes.ok) return json({ error: "task_not_found", task_id: taskId }, 404);
-	const state = stateRes.body as AuthorityState;
+	const read = await readTaskState(env, taskId);
+	if (!read.ok) return json(read.body, read.status);
+	const state = read.state;
 	const identity = await resolveAgentBySecret(state, agentSecret, { sha256Hex });
 	if (identity === null) return json({ error: "agent_secret_invalid" }, 403);
 	const agent_id = identity.agent;
@@ -617,40 +703,56 @@ export async function handleCreateContender(
 	// server-side. forkIdempotent falls back to creating an empty repo; when
 	// that happens we reproduce fork semantics by copying the frozen baseline
 	// commit through the trusted Git container before issuing a contender
-	// credential.
-	if (created && viaImportFallback) {
-		if (initialTokenPlaintext === null) {
-			return json({ error: "fork_fallback_missing_write_token", fork_repo: forkName }, 502);
+	// credential. A fork that already exists but is still empty is such a
+	// repo whose copy did not finish (the container answered a retryable
+	// 503, say): this request copies again, with a fresh five-minute write
+	// token, so retrying the request is how a caller recovers. A head that
+	// cannot be read counts as empty: whether the binding's log() throws for
+	// an empty repository is not known, and copy-baseline.sh checks the
+	// destination itself (ALREADY_IMPORTED, or DESTINATION_NOT_EMPTY).
+	const unfinishedCopy = !created && (await repo.getHead().catch(() => null)) === null;
+	if ((created && viaImportFallback) || unfinishedCopy) {
+		let destinationToken: string;
+		let revokeDestinationToken: string;
+		if (created) {
+			if (initialTokenPlaintext === null) {
+				return json({ error: "fork_fallback_missing_write_token", fork_repo: forkName }, 502);
+			}
+			destinationToken = initialTokenPlaintext;
+			revokeDestinationToken = initialTokenPlaintext;
+		} else {
+			const minted = await repo.createToken("write", 300);
+			destinationToken = minted.plaintext;
+			revokeDestinationToken = minted.id;
 		}
 		const baseline = await port.get(state.task.baseline_repo);
 		const sourceToken = await baseline.createToken("read", 300);
 		try {
-			const copyRes = await promotionStub(env, `fork-${forkOpId}`).fetch(
-				new Request("https://promotion/copy-baseline", {
-					method: "POST",
-					headers: { "content-type": "application/json" },
-					body: JSON.stringify({
-						action: "copy_baseline",
-						op_id: forkOpId,
-						source_remote: baseline.remote,
-						source_token: sourceToken.plaintext,
-						source_commit: state.task.baseline_commit,
-						destination_remote: repo.remote,
-						destination_token: initialTokenPlaintext,
-					}),
-				}),
-			);
-			const copy = (await copyRes.json()) as { outcome?: string; head?: string; error?: string };
-			if (!copyRes.ok || (copy.outcome !== "IMPORTED" && copy.outcome !== "ALREADY_IMPORTED")) {
-				return json({ error: "fork_baseline_import_failed", detail: copy }, 502);
+			const copy = await containerRpc(promotionStub(env, `fork-${forkOpId}`), "/copy-baseline", {
+				action: "copy_baseline",
+				op_id: forkOpId,
+				source_remote: baseline.remote,
+				source_token: sourceToken.plaintext,
+				source_commit: state.task.baseline_commit,
+				destination_remote: repo.remote,
+				destination_token: destinationToken,
+			});
+			const result = copy.body as { outcome?: string; head?: string; error?: string; retryable?: boolean };
+			if (!copy.ok || (result.outcome !== "IMPORTED" && result.outcome !== "ALREADY_IMPORTED")) {
+				// A retryable container failure keeps its 503: retry this request.
+				const retryable = copy.status === 503 && result.retryable === true;
+				return json(
+					{ error: "fork_baseline_import_failed", retryable, detail: result },
+					retryable ? 503 : 502,
+				);
 			}
-			if (copy.head !== state.task.baseline_commit) {
-				return json({ error: "fork_baseline_head_mismatch", expected: state.task.baseline_commit, actual: copy.head }, 502);
+			if (result.head !== state.task.baseline_commit) {
+				return json({ error: "fork_baseline_head_mismatch", expected: state.task.baseline_commit, actual: result.head }, 502);
 			}
 		} finally {
 			await Promise.allSettled([
 				baseline.revokeToken(sourceToken.id),
-				repo.revokeToken(initialTokenPlaintext),
+				repo.revokeToken(revokeDestinationToken),
 			]);
 		}
 	} else if (created && initialTokenPlaintext !== null) {
@@ -714,9 +816,9 @@ export async function handleCreateContender(
 /** GET /tasks/:id/context — non-secret frozen task + work graph context. */
 export async function handleTaskContext(env: Env, taskId: string, request: Request): Promise<Response> {
 	if (!(await requireAgentOrControl(request, env))) return json({ error: "task_context_auth_required" }, 401);
-	const stateRes = await doRpc(taskStub(env, taskId), "/state", { method: "GET" });
-	if (!stateRes.ok) return json({ error: "task_not_found", task_id: taskId }, 404);
-	const state = stateRes.body as AuthorityState;
+	const read = await readTaskState(env, taskId);
+	if (!read.ok) return json(read.body, read.status);
+	const state = read.state;
 	return json({
 		task: state.task,
 		task_status: state.task_status,
@@ -747,9 +849,9 @@ export async function handleEvaluatorCredentials(env: Env, taskId: string, reque
 	if (typeof contender_id !== "string" || contender_id === "") {
 		return json({ error: "contender_id_required" }, 400);
 	}
-	const stateRes = await doRpc(taskStub(env, taskId), "/state", { method: "GET" });
-	if (!stateRes.ok) return json({ error: "task_not_found", task_id: taskId }, 404);
-	const state = stateRes.body as AuthorityState;
+	const read = await readTaskState(env, taskId);
+	if (!read.ok) return json(read.body, read.status);
+	const state = read.state;
 	const contender = state.contenders[contender_id];
 	if (!contender) return json({ error: "contender_not_found", contender_id }, 404);
 	if (state.quarantine[contender_id]?.status === "QUARANTINED") {
@@ -792,7 +894,9 @@ export async function handleEvaluatorCredentials(env: Env, taskId: string, reque
  * labeled candidate's evidence (specs/amendments/evidence-integrity-v1.md).
  * When the bundle names changed evaluation files the authority quarantines
  * the contender, and this route executes the effects: every fork token is
- * revoked (specs/amendments/tamper-quarantine-v1.md).
+ * revoked (specs/amendments/tamper-quarantine-v1.md) and the PromotionWorkflow
+ * instances of the contender's unconsumed permits are terminated
+ * (specs/amendments/promotion-runtime-v1.md).
  */
 export async function handleEvidence(env: Env, taskId: string, request: Request): Promise<Response> {
 	if (!(await requireEvaluationDomain(request, env))) {
@@ -811,7 +915,9 @@ export async function handleEvidence(env: Env, taskId: string, request: Request)
 	// A tamper quarantine's effects run here (spec 5 §3: the DO returns
 	// effects, this layer executes them) and are not echoed to the evaluator.
 	const { effects, ...body } = (res.body ?? {}) as { effects?: Effect[] } & Record<string, unknown>;
-	if (Array.isArray(effects) && effects.length > 0) await executeEffects(productionPort(env), effects);
+	if (Array.isArray(effects) && effects.length > 0) {
+		await executeEffects(productionPort(env), effects, env.PROMOTION_WORKFLOW);
+	}
 	return json(body, res.status);
 }
 
@@ -902,41 +1008,44 @@ export async function handleVerdict(env: Env, taskId: string, request: Request):
 	return json({ verdict, ...(pr.body as Record<string, unknown>) }, 200);
 }
 
-/**
- * POST /tasks/:id/promote — exact-state canonical promotion.
- * The Worker validates the permit/evidence, mints short-lived Git
- * capabilities, delegates the single canonical write to the trusted
- * promotion container (container/promote.sh: a fast-forward to the reviewed
- * commit), then atomically finalizes/consumes the permit. The container's
- * 409 answers are terminal and pass through as 409; git failures are 502.
- */
-export async function handlePromote(
-	env: Env,
-	taskId: string,
-	request: Request,
-): Promise<Response> {
-	if (!(await requireControlPlane(request, env))) return json({ error: "control_plane_auth_required" }, 401);
-	const parsed = await readJsonBody(request);
-	if (!parsed.ok) return parsed.response;
-	const permit_id = parsed.body["permit_id"];
-	if (typeof permit_id !== "string" || permit_id === "") {
-		return json({ error: "permit_id_required" }, 400);
-	}
+/** A permit id: the SHA-256 hex of its bound fields (computePermitId). */
+const PERMIT_ID_PATTERN = /^[0-9a-f]{64}$/;
 
-	const stateRes = await doRpc(taskStub(env, taskId), "/state", { method: "GET" });
-	if (!stateRes.ok) return json({ error: "task_not_found", task_id: taskId }, 404);
-	const state = stateRes.body as AuthorityState;
-	const permit = (state.permits as Record<string, PermitRecord>)[permit_id];
-	if (!permit) return json({ outcome: "UNKNOWN_PERMIT" satisfies PromotionOutcome, permit_id }, 404);
+/** An answer of the promotion operation, before it becomes a Response. */
+interface PromotionAnswer {
+	status: number;
+	body: Record<string, unknown>;
+}
+
+/**
+ * The exact-state canonical promotion of one permit; it runs in the permit's
+ * PromotionWorkflow step. It validates the permit and its evidence, mints
+ * short-lived Git capabilities, delegates the single canonical write to the
+ * trusted promotion container (container/promote.sh: a fast-forward to the
+ * reviewed commit), then has the task authority finalize/consume the permit.
+ *
+ * Answers: 200 PROMOTED or ALREADY_CONSUMED; 404 for an unknown task or
+ * permit; 409 for every terminal refusal (the container's included), which
+ * leaves the permit unconsumed; 502/503 for a failure the step retries (a
+ * git failure, a container that is not running or overran its deadline, a
+ * finalize that did not land). An exception (an Artifacts call that fails,
+ * an upstream that does not answer JSON) is thrown, and the step retries it.
+ */
+export async function runPromotion(env: Env, taskId: string, permit_id: string): Promise<PromotionAnswer> {
+	const read = await readTaskState(env, taskId);
+	if (!read.ok) return { status: read.status, body: read.body };
+	const state = read.state;
+	const permit = Object.hasOwn(state.permits, permit_id) ? (state.permits as Record<string, PermitRecord>)[permit_id] : undefined;
+	if (!permit) return { status: 404, body: { outcome: "UNKNOWN_PERMIT" satisfies PromotionOutcome, permit_id } };
 	if (permit.consumed) {
-		return json({ outcome: "ALREADY_CONSUMED" satisfies PromotionOutcome, permit_id }, 200);
+		return { status: 200, body: { outcome: "ALREADY_CONSUMED" satisfies PromotionOutcome, permit_id } };
 	}
 	const quarantine = state.quarantine[permit.contender_id];
 	if (quarantine?.status === "QUARANTINED") {
-		return json({ outcome: "QUARANTINED_CANDIDATE" satisfies PromotionOutcome, permit_id }, 409);
+		return { status: 409, body: { outcome: "QUARANTINED_CANDIDATE" satisfies PromotionOutcome, permit_id } };
 	}
 	const contender = state.contenders[permit.contender_id];
-	if (!contender) return json({ error: "winner_contender_not_found", permit_id }, 409);
+	if (!contender) return { status: 409, body: { error: "winner_contender_not_found", permit_id } };
 
 	const recomputed = await computePermitId({
 		task_hash: permit.task_hash,
@@ -946,23 +1055,29 @@ export async function handlePromote(
 		selector_policy_hash: permit.selector_policy_hash,
 		expected_destination_head: permit.expected_destination_head,
 	});
-	if (recomputed !== permit_id) return json({ error: "permit_id_invalid", permit_id }, 409);
+	if (recomputed !== permit_id) return { status: 409, body: { error: "permit_id_invalid", permit_id } };
 
 	const storedBundle = state.evaluations[permit.winner_candidate_sha];
 	if (!storedBundle || storedBundle.bundle_hash !== permit.evaluation_bundle_hash) {
-		return json({
-			outcome: "EVAL_BUNDLE_MISMATCH" satisfies PromotionOutcome,
-			permit_id,
-			permit_bundle_hash: permit.evaluation_bundle_hash,
-			stored_bundle_hash: storedBundle?.bundle_hash ?? null,
-		}, 409);
+		return {
+			status: 409,
+			body: {
+				outcome: "EVAL_BUNDLE_MISMATCH" satisfies PromotionOutcome,
+				permit_id,
+				permit_bundle_hash: permit.evaluation_bundle_hash,
+				stored_bundle_hash: storedBundle?.bundle_hash ?? null,
+			},
+		};
 	}
 
 	const port = productionPort(env);
 	const sourceRepo = await port.get(contender.fork_repo);
 	const candidate = await sourceRepo.readCommit(permit.winner_candidate_sha);
 	if (candidate === null) {
-		return json({ outcome: "TREE_MISMATCH" satisfies PromotionOutcome, permit_id, detail: "candidate commit missing from contender repo" }, 409);
+		return {
+			status: 409,
+			body: { outcome: "TREE_MISMATCH" satisfies PromotionOutcome, permit_id, detail: "candidate commit missing from contender repo" },
+		};
 	}
 	const destinationRepo = await port.get(permit.destination_repo);
 	// No head pre-check here: the container decides. A destination that moved
@@ -975,30 +1090,26 @@ export async function handlePromote(
 	const sourceToken = await sourceRepo.createToken("read", 300);
 	const destinationToken = await destinationRepo.createToken("write", 300);
 	try {
-		const promoRes = await promotionStub(env, permit_id).fetch(
-			new Request("https://promotion/run", {
-				method: "POST",
-				headers: { "content-type": "application/json" },
-				body: JSON.stringify({
-					permit_id,
-					source_remote: sourceRepo.remote,
-					source_token: sourceToken.plaintext,
-					candidate_sha: permit.winner_candidate_sha,
-					destination_remote: destinationRepo.remote,
-					destination_token: destinationToken.plaintext,
-					expected_destination_head: permit.expected_destination_head,
-					winning_tree_sha256: permit.winning_tree_sha256,
-					issued_at: permit.issued_at,
-				}),
-			}),
-		);
-		const promotion = (await promoRes.json()) as Partial<PromotionResult>;
+		const promoRes = await containerRpc(promotionStub(env, permit_id), "/run", {
+			permit_id,
+			source_remote: sourceRepo.remote,
+			source_token: sourceToken.plaintext,
+			candidate_sha: permit.winner_candidate_sha,
+			destination_remote: destinationRepo.remote,
+			destination_token: destinationToken.plaintext,
+			expected_destination_head: permit.expected_destination_head,
+			winning_tree_sha256: permit.winning_tree_sha256,
+			issued_at: permit.issued_at,
+		});
+		const promotion = promoRes.body as Partial<PromotionResult>;
 		if (!promoRes.ok) {
 			// The container answers 409 for every terminal refusal
 			// (EXPIRED_HEAD_MOVED, TREE_MISMATCH, PUSH_REJECTED,
-			// UNSUPPORTED_TREE_ENTRY, BASELINE_MISMATCH): the PromotionWorkflow
-			// does not retry those. Anything else is a git failure it may retry.
-			return json({ ...promotion, permit_id }, promoRes.status === 409 ? 409 : 502);
+			// UNSUPPORTED_TREE_ENTRY, BASELINE_MISMATCH): the step does not
+			// retry those. Its 503s (not running, deadline) stay 503; anything
+			// else is a git failure, 502. The step retries both.
+			const status = promoRes.status === 409 ? 409 : promoRes.status === 503 ? 503 : 502;
+			return { status, body: { ...promotion, permit_id } };
 		}
 		if (
 			(promotion.outcome !== "PROMOTED" && promotion.outcome !== "ALREADY_WRITTEN") ||
@@ -1007,7 +1118,7 @@ export async function handlePromote(
 			promotion.base !== permit.expected_destination_head ||
 			typeof promotion.parent !== "string"
 		) {
-			return json({ error: "promotion_container_invalid_result", permit_id, promotion }, 502);
+			return { status: 502, body: { error: "promotion_container_invalid_result", permit_id, promotion } };
 		}
 
 		// Consume the permit only AFTER the canonical write is known to exist.
@@ -1025,19 +1136,25 @@ export async function handlePromote(
 			},
 		});
 		if (!finalized.ok) {
-			return json({
-				error: "promotion_written_but_finalize_pending",
+			return {
+				status: 503,
+				body: {
+					error: "promotion_written_but_finalize_pending",
+					permit_id,
+					promoted_sha: promotion.promoted_sha,
+					detail: finalized.body,
+				},
+			};
+		}
+		return {
+			status: 200,
+			body: {
+				outcome: "PROMOTED" satisfies PromotionOutcome,
 				permit_id,
 				promoted_sha: promotion.promoted_sha,
-				detail: finalized.body,
-			}, 503);
-		}
-		return json({
-			outcome: "PROMOTED" satisfies PromotionOutcome,
-			permit_id,
-			promoted_sha: promotion.promoted_sha,
-			reconciled_existing_write: promotion.outcome === "ALREADY_WRITTEN",
-		});
+				reconciled_existing_write: promotion.outcome === "ALREADY_WRITTEN",
+			},
+		};
 	} finally {
 		// Revocation is best-effort but happens even when Git/evaluation fails.
 		await Promise.allSettled([
@@ -1045,6 +1162,122 @@ export async function handlePromote(
 			destinationRepo.revokeToken(destinationToken.id),
 		]);
 	}
+}
+
+/** Where a client polls a promotion. */
+function promotionStatusUrl(taskId: string, permitId: string): string {
+	return `/tasks/${taskId}/promotions/${permitId}`;
+}
+
+/**
+ * The permit's PromotionWorkflow instance, as the status route reports it:
+ * `result` is the promotion's answer once the instance is complete; `error`
+ * is the last failure of an errored instance.
+ */
+async function promotionInstanceStatus(instance: WorkflowInstanceHandle): Promise<Record<string, unknown>> {
+	const current = await instance.status();
+	const reported: Record<string, unknown> = { instance_id: instance.id, status: current.status };
+	const output = current.output as { status?: unknown; body?: unknown } | null | undefined;
+	if (current.status === "complete" && typeof output?.status === "number" && typeof output.body === "string") {
+		let body: unknown = output.body;
+		try {
+			body = JSON.parse(output.body);
+		} catch {
+			// Not the JSON text PromotionWorkflow.run returns: report it as is.
+		}
+		reported.result = { status: output.status, body };
+	}
+	if (current.error) reported.error = current.error;
+	return reported;
+}
+
+/**
+ * The permit named in a promotion request, if the task authority holds it.
+ * A malformed id is 400 and an unknown one 404; neither reaches the Workflow.
+ */
+async function lookUpPermit(
+	env: Env,
+	taskId: string,
+	permit_id: unknown,
+): Promise<{ ok: true; permit_id: string } | { ok: false; response: Response }> {
+	if (typeof permit_id !== "string" || permit_id === "") {
+		return { ok: false, response: json({ error: "permit_id_required" }, 400) };
+	}
+	if (!PERMIT_ID_PATTERN.test(permit_id)) {
+		return { ok: false, response: json({ error: "invalid_permit_id", permit_id }, 400) };
+	}
+	const read = await readTaskState(env, taskId);
+	if (!read.ok) return { ok: false, response: json(read.body, read.status) };
+	if (!Object.hasOwn(read.state.permits, permit_id)) {
+		return { ok: false, response: json({ outcome: "UNKNOWN_PERMIT" satisfies PromotionOutcome, permit_id }, 404) };
+	}
+	return { ok: true, permit_id };
+}
+
+/**
+ * POST /tasks/:id/promote — start the promotion of a permit. Body
+ * `{ permit_id }`; control plane only.
+ *
+ * The promotion runs in a PromotionWorkflow instance whose id is the permit
+ * id (spec 5 §5: the promote operation id is the permit id;
+ * specs/amendments/promotion-runtime-v1.md). The answer is 202
+ * `{ instance_id, status, status_url }`; GET status_url reports the
+ * instance and, once it is complete, the promotion's answer. A repeated
+ * request finds the permit's instance and reports it instead of starting a
+ * second one; an instance that errored (its retries ran out) is restarted.
+ * A permit the task authority does not hold is 404 and starts nothing.
+ */
+export async function handlePromote(
+	env: Env,
+	taskId: string,
+	request: Request,
+): Promise<Response> {
+	if (!(await requireControlPlane(request, env))) return json({ error: "control_plane_auth_required" }, 401);
+	const parsed = await readJsonBody(request);
+	if (!parsed.ok) return parsed.response;
+	const found = await lookUpPermit(env, taskId, parsed.body["permit_id"]);
+	if (!found.ok) return found.response;
+	const { permit_id } = found;
+
+	let instance: WorkflowInstanceHandle;
+	try {
+		instance = await env.PROMOTION_WORKFLOW.create({ id: permit_id, params: { task_id: taskId, permit_id } });
+	} catch (createError) {
+		// The id is taken: this permit's instance exists already.
+		try {
+			instance = await env.PROMOTION_WORKFLOW.get(permit_id);
+		} catch {
+			throw createError;
+		}
+		if ((await instance.status()).status === "errored") await instance.restart();
+	}
+	const { status } = await instance.status();
+	return json({ instance_id: instance.id, status, status_url: promotionStatusUrl(taskId, permit_id) }, 202);
+}
+
+/**
+ * GET /tasks/:id/promotions/:permit_id — the status of the permit's
+ * PromotionWorkflow instance (queued, running, complete, errored,
+ * terminated, ...). A complete instance carries the promotion's answer as
+ * `result: { status, body }`: 200 PROMOTED, or a terminal 4xx refusal.
+ * 404 `promotion_not_started` when the permit has no instance.
+ */
+export async function handlePromotionStatus(
+	env: Env,
+	taskId: string,
+	permitId: string,
+	request: Request,
+): Promise<Response> {
+	if (!(await requireControlPlane(request, env))) return json({ error: "control_plane_auth_required" }, 401);
+	const found = await lookUpPermit(env, taskId, permitId);
+	if (!found.ok) return found.response;
+	let instance: WorkflowInstanceHandle;
+	try {
+		instance = await env.PROMOTION_WORKFLOW.get(permitId);
+	} catch {
+		return json({ error: "promotion_not_started", permit_id: permitId }, 404);
+	}
+	return json(await promotionInstanceStatus(instance));
 }
 
 /**
@@ -1061,7 +1294,7 @@ export async function handlePromote(
  * evaluation domain evaluates it — and CONFLICT escalates the task with the
  * conflicting paths as data (409). The container's other refusals
  * (FORK_MOVED, PUSH_REJECTED, ALREADY_IN_DESTINATION) pass through as 409,
- * git failures as 502.
+ * its retryable 503s (not running, deadline) as 503, git failures as 502.
  */
 export async function handleRebase(env: Env, taskId: string, request: Request): Promise<Response> {
 	if (!(await requireControlPlane(request, env))) return json({ error: "control_plane_auth_required" }, 401);
@@ -1074,9 +1307,9 @@ export async function handleRebase(env: Env, taskId: string, request: Request): 
 		return json({ error: "destination_repo_required" }, 400);
 	}
 
-	const stateRes = await doRpc(taskStub(env, taskId), "/state", { method: "GET" });
-	if (!stateRes.ok) return json({ error: "task_not_found", task_id: taskId }, 404);
-	const state = stateRes.body as AuthorityState;
+	const read = await readTaskState(env, taskId);
+	if (!read.ok) return json(read.body, read.status);
+	const state = read.state;
 	const contender = Object.hasOwn(state.contenders, contender_id) ? state.contenders[contender_id] : undefined;
 	if (!contender) return json({ error: "contender_not_found", contender_id }, 404);
 	const sanction = state.quarantine[contender_id]?.status;
@@ -1096,23 +1329,17 @@ export async function handleRebase(env: Env, taskId: string, request: Request): 
 	const forkToken = await fork.createToken("write", 300);
 	const destinationToken = await destination.createToken("read", 300);
 	try {
-		const res = await promotionStub(env, `rebase-${opId}`).fetch(
-			new Request("https://promotion/rebase", {
-				method: "POST",
-				headers: { "content-type": "application/json" },
-				body: JSON.stringify({
-					action: "rebase",
-					op_id: opId,
-					fork_remote: fork.remote,
-					fork_token: forkToken.plaintext,
-					candidate_sha: candidate,
-					destination_remote: destination.remote,
-					destination_token: destinationToken.plaintext,
-					onto,
-				}),
-			}),
-		);
-		const result = (await res.json()) as Partial<RebaseResult>;
+		const res = await containerRpc(promotionStub(env, `rebase-${opId}`), "/rebase", {
+			action: "rebase",
+			op_id: opId,
+			fork_remote: fork.remote,
+			fork_token: forkToken.plaintext,
+			candidate_sha: candidate,
+			destination_remote: destination.remote,
+			destination_token: destinationToken.plaintext,
+			onto,
+		});
+		const result = res.body as Partial<RebaseResult>;
 		const where = { contender_id, candidate_sha: candidate, onto };
 		let report: RebaseReport;
 		if (res.ok && result.outcome === "REBASED" && typeof result.rebased_sha === "string" && result.rebased_sha !== candidate) {
@@ -1124,7 +1351,8 @@ export async function handleRebase(env: Env, taskId: string, request: Request): 
 		} else if (res.status === 409) {
 			return json({ ...result, ...where }, 409);
 		} else if (!res.ok) {
-			return json({ ...result, ...where }, 502);
+			// The container's 503s (not running, deadline) stay 503: retry the request.
+			return json({ ...result, ...where }, res.status === 503 ? 503 : 502);
 		} else {
 			return json({ error: "rebase_container_invalid_result", ...where, result }, 502);
 		}
@@ -1161,10 +1389,9 @@ export async function handlePromotionBundle(env: Env, taskId: string, request: R
 
 /** GET /tasks/:id/ledger — the task authority's append-only ledger. */
 export async function handleLedger(env: Env, taskId: string): Promise<Response> {
-	const res = await doRpc(taskStub(env, taskId), "/state", { method: "GET" });
-	if (!res.ok) return json({ error: "task_not_found", task_id: taskId }, 404);
-	const state = res.body as AuthorityState;
-	return json({ task_id: taskId, ledger: state.ledger });
+	const read = await readTaskState(env, taskId);
+	if (!read.ok) return json(read.body, read.status);
+	return json({ task_id: taskId, ledger: read.state.ledger });
 }
 
 /**
@@ -1178,9 +1405,9 @@ export async function handleVerifyAttestation(
 	taskId: string,
 	permitId: string,
 ): Promise<Response> {
-	const stateRes = await doRpc(taskStub(env, taskId), "/state", { method: "GET" });
-	if (!stateRes.ok) return json({ error: "task_not_found", task_id: taskId }, 404);
-	const state = stateRes.body as AuthorityState;
+	const read = await readTaskState(env, taskId);
+	if (!read.ok) return json(read.body, read.status);
+	const state = read.state;
 	const permit = (state.permits as Record<string, PermitRecord>)[permitId];
 	if (!permit) return json({ error: "unknown_permit", permit_id: permitId }, 404);
 
@@ -1220,11 +1447,16 @@ export async function handleVerifyAttestation(
 /* ------------------------------------------------------------------ */
 
 /**
- * Execute the effects returned by the task authority's /event RPC.
- * Called by the queue consumer (and, in production, by Workflow steps).
- * The DO itself never executes side effects (spec 5 §3).
+ * Execute the effects the task authority returns (spec 5 §3: the DO returns
+ * effects, it never executes them). Called by the queue consumer and the
+ * evidence route; `promotions` is the PromotionWorkflow binding a
+ * cancel_workflow effect stops instances of.
  */
-export async function executeEffects(port: ArtifactsPort, effects: Effect[]): Promise<void> {
+export async function executeEffects(
+	port: ArtifactsPort,
+	effects: Effect[],
+	promotions?: WorkflowBindingLike,
+): Promise<void> {
 	for (const effect of effects) {
 		switch (effect.kind) {
 			case "revoke_token": {
@@ -1238,16 +1470,36 @@ export async function executeEffects(port: ArtifactsPort, effects: Effect[]): Pr
 				break;
 			}
 			case "cancel_workflow": {
-				// SKELETON: Workflow instance cancellation belongs to the
-				// Workflow layer (workflow instance id → terminate). Logged
-				// here so a retry does not silently drop the intent.
-				console.warn(
-					`executeEffects: cancel_workflow skeleton — contender ${effect.contender_id}: no workflow runtime wired`,
-				);
+				// Quarantine stops the contender's pending promotions: each
+				// unconsumed permit's PromotionWorkflow instance (id = permit id)
+				// is terminated. A permit with no instance, or whose instance has
+				// already finished, has nothing to stop. A promotion that ran
+				// before the quarantine landed is refused by the authority's own
+				// quarantine check (QUARANTINED_CANDIDATE) at finalize.
+				if (!promotions) {
+					console.warn(
+						`executeEffects: cancel_workflow for contender ${effect.contender_id}: no PromotionWorkflow binding`,
+					);
+					break;
+				}
+				for (const permit_id of effect.permit_ids) {
+					let instance: WorkflowInstanceHandle;
+					try {
+						instance = await promotions.get(permit_id);
+					} catch {
+						continue;
+					}
+					try {
+						await instance.terminate();
+					} catch (err) {
+						console.warn(`executeEffects: cancel_workflow could not terminate promotion ${permit_id}:`, err);
+					}
+				}
 				break;
 			}
 			case "notify": {
-				// SKELETON: production routes to a notification channel.
+				// Notifications go to the Worker log; no notification channel is
+				// wired.
 				console.log(`[notify] to=${effect.to.join(",")}: ${effect.message}`);
 				break;
 			}
@@ -1270,7 +1522,25 @@ export async function executeEffects(port: ArtifactsPort, effects: Effect[]): Pr
 /* fetch router                                                        */
 /* ------------------------------------------------------------------ */
 
+/**
+ * Every answer is JSON (specs/amendments/promotion-runtime-v1.md): a Durable
+ * Object that answered something other than JSON is 502
+ * `upstream_not_json`, and any other exception a route throws is 500
+ * `internal_error`, with its detail logged rather than returned.
+ */
 export async function fetch(request: Request, env: Env): Promise<Response> {
+	try {
+		return await route(request, env);
+	} catch (err) {
+		if (err instanceof UpstreamNotJsonError) {
+			return json({ error: "upstream_not_json", upstream: err.upstream, upstream_status: err.upstreamStatus }, 502);
+		}
+		console.error(`madgrix: ${request.method} ${new URL(request.url).pathname} failed: ${(err as Error)?.message ?? err}`);
+		return json({ error: "internal_error" }, 500);
+	}
+}
+
+async function route(request: Request, env: Env): Promise<Response> {
 	const url = new URL(request.url);
 	const parts = url.pathname.split("/").filter((p) => p !== "");
 
@@ -1308,6 +1578,9 @@ export async function fetch(request: Request, env: Env): Promise<Response> {
 		}
 		if (request.method === "POST" && action === "promote" && parts.length === 3) {
 			return handlePromote(env, taskId, request);
+		}
+		if (request.method === "GET" && action === "promotions" && parts.length === 4) {
+			return handlePromotionStatus(env, taskId, parts[3], request);
 		}
 		if (request.method === "POST" && action === "rebase" && parts.length === 3) {
 			return handleRebase(env, taskId, request);
@@ -1366,7 +1639,7 @@ export async function queue(batch: QueueBatchLike, env: Env): Promise<void> {
 		if (outcome !== "ACK_DUP" && outcome !== "APPLIED_NEW" && outcome !== "REJECTED_OUT_OF_ORDER") {
 			throw new Error(`queue: unexpected outcome ${outcome} for task ${task_id}`);
 		}
-		await executeEffects(port, effects ?? []);
+		await executeEffects(port, effects ?? [], env.PROMOTION_WORKFLOW);
 	}
 }
 
@@ -1380,15 +1653,29 @@ export interface PromotionWorkflowParams {
 }
 
 /**
- * Durable wrapper around the exact-state promotion operation. The permit id
- * is the idempotent step name. A retry after a lost response is safe because
- * promotion creates no commit: container/promote.sh fast-forwards the
- * destination to the reviewed candidate itself, so on a retry it finds that
- * commit already in the destination's history (even under later commits),
- * reports ALREADY_WRITTEN, and the task authority consumes the same permit.
- * Only 5xx answers are retried; 409s (expired head, tree or baseline
- * mismatch, a refused push, an unsupported tree entry) are terminal and leave
- * the permit unconsumed (specs/amendments/rebase-ancestry-v1.md).
+ * Retries of the promotion step: 10 s, 20 s, 40 s, 80 s, 160 s. One attempt
+ * is bounded at two minutes, well inside the five minutes its Artifacts
+ * tokens live (the container's own exec deadline is 60 s).
+ */
+export const PROMOTION_STEP_CONFIG = {
+	retries: { limit: 5, delay: "10 seconds", backoff: "exponential" },
+	timeout: "2 minutes",
+} as const;
+
+/**
+ * The permit's promotion as a durable Workflow instance: POST
+ * /tasks/:id/promote creates it with the permit id as its instance id, so
+ * there is at most one per permit. Its one step runs runPromotion. A retry
+ * after a lost response is safe because promotion creates no commit:
+ * container/promote.sh fast-forwards the destination to the reviewed
+ * candidate itself, so on a retry it finds that commit already in the
+ * destination's history (even under later commits), reports ALREADY_WRITTEN,
+ * and the task authority consumes the same permit. Only 5xx answers and
+ * exceptions are retried; 409s (expired head, tree or baseline mismatch, a
+ * refused push, an unsupported tree entry, a quarantined candidate) are
+ * terminal and leave the permit unconsumed
+ * (specs/amendments/rebase-ancestry-v1.md,
+ * specs/amendments/promotion-runtime-v1.md).
  */
 export class PromotionWorkflow extends WorkflowEntrypoint<Env, PromotionWorkflowParams> {
 	async run(event: WorkflowEvent<PromotionWorkflowParams>, step: WorkflowStep) {
@@ -1396,27 +1683,14 @@ export class PromotionWorkflow extends WorkflowEntrypoint<Env, PromotionWorkflow
 		if (!p || typeof p.task_id !== "string" || typeof p.permit_id !== "string") {
 			throw new Error("PromotionWorkflow: invalid payload");
 		}
-		return step.do(`promote/${p.permit_id}`, async () => {
-			const res = await handlePromote(
-				this.env,
-				p.task_id,
-				new Request("https://workflow/promote", {
-					method: "POST",
-					headers: {
-						"content-type": "application/json",
-						authorization: `Bearer ${this.env.CONTROL_SERVICE_TOKEN}`,
-					},
-					body: JSON.stringify({ permit_id: p.permit_id }),
-				}),
-			);
-			const body = await res.text();
-			// 5xx means an infrastructure/transient failure: let Workflows retry.
-			if (res.status >= 500) {
-				throw new Error(`promotion transient failure: HTTP ${res.status} ${body}`);
-			}
+		return step.do(`promote/${p.permit_id}`, PROMOTION_STEP_CONFIG, async () => {
+			const { status, body } = await runPromotion(this.env, p.task_id, p.permit_id);
+			const text = JSON.stringify(body);
+			// 5xx is an infrastructure failure: throw, and the step retries.
+			if (status >= 500) throw new Error(`promotion attempt failed: HTTP ${status} ${text}`);
 			// A step result must be Rpc.Serializable: the JSON text is, a parsed
-			// `unknown` is not.
-			return { status: res.status, body };
+			// `unknown` is not. The status route parses it.
+			return { status, body: text };
 		});
 	}
 }

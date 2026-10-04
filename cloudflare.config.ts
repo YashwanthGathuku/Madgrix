@@ -44,12 +44,16 @@ export default defineConfig({
 			// with; its public key is pinned in keys/authority.pub (keys/README.md).
 			AUTHORITY_SIGNING_KEY: bindings.secret(),
 			PROMOTION_CONTAINER: bindings.durableObject({ worker: "madgrix", exportName: "PromotionContainer" }),
+			// POST /tasks/:id/promote creates one instance per permit, with the
+			// permit id as the instance id (spec 5 §5;
+			// specs/amendments/promotion-runtime-v1.md).
+			PROMOTION_WORKFLOW: bindings.workflow({ name: "madgrix-promotion", worker: "madgrix", exportName: "PromotionWorkflow" }),
 		},
 		// Queue consumer (spec 5 §2–§3): Artifact lifecycle events arrive via
 		// this queue (at-least-once, unordered) and are ingested by the
 		// Worker's `queue()` export → per-task DO (event_key dedupe) → effects.
 		// DEPLOY NOTE: the `madgrix-events` queue must exist in the account
-		// before deploy (e.g. `cf queues create seam-events`); a dead-letter
+		// before deploy (e.g. `cf queues create madgrix-events`); a dead-letter
 		// queue is recommended for poison messages (see docs/PRODUCTION_DEPLOYMENT.md).
 		triggers: [triggers.queue({ name: "madgrix-events", maxBatchSize: 10, maxBatchTimeout: 30 })],
 	},

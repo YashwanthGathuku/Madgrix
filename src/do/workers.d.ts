@@ -41,11 +41,13 @@ interface ContainerExecOutput {
 }
 interface ContainerExecProcess {
 	output(): Promise<ContainerExecOutput>;
+	kill(signal?: number): void;
 }
 interface ContainerHandle {
 	running: boolean;
 	start(options?: { env?: Record<string, string>; entrypoint?: string[]; enableInternet?: boolean }): void;
 	exec(cmd: string[], options?: { env?: Record<string, string> }): Promise<ContainerExecProcess>;
+	destroy(error?: unknown): Promise<void>;
 }
 
 interface DurableObjectState {
@@ -82,6 +84,20 @@ interface DoNamespace {
 	get(id: DoObjectId): DoStub;
 }
 
+/** Structural stand-in for a Workflow instance handle. */
+interface WorkflowInstanceHandle {
+	id: string;
+	status(): Promise<{ status: string; error?: { name: string; message: string }; output?: unknown }>;
+	terminate(): Promise<void>;
+	restart(): Promise<void>;
+}
+
+/** Structural stand-in for a Workflow binding (`Workflow` in the runtime types). */
+interface WorkflowBindingLike {
+	create(options?: { id?: string; params?: unknown }): Promise<WorkflowInstanceHandle>;
+	get(id: string): Promise<WorkflowInstanceHandle>;
+}
+
 /** Worker environment (structural). In production, `ARTIFACTS` is the real
  *  Artifacts binding adapted via `BindingArtifactsPort`; locally it is a
  *  `FakeArtifacts` (which already implements `ArtifactsPort`). */
@@ -95,6 +111,8 @@ interface Env {
 	/** Ed25519 PKCS8 (PEM or base64) the TaskAuthority signs promotion bundles with. */
 	AUTHORITY_SIGNING_KEY?: string;
 	PROMOTION_CONTAINER: DoNamespace;
+	/** The PromotionWorkflow binding: one instance per permit, id = permit_id. */
+	PROMOTION_WORKFLOW: WorkflowBindingLike;
 }
 
 /** Queue consumer batch shape (structural; mirrors MessageBatch). */

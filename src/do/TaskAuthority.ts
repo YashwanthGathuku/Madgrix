@@ -157,7 +157,21 @@ export class TaskAuthority {
 		return st ?? null;
 	}
 
+	/**
+	 * Every answer is JSON: a transition that throws where a route does not
+	 * expect it (storage, a bug) is a 500 `authority_internal_error`, never
+	 * the runtime's error page (specs/amendments/promotion-runtime-v1.md).
+	 */
 	async fetch(request: Request): Promise<Response> {
+		try {
+			return await this.route(request);
+		} catch (err) {
+			console.error(`TaskAuthority: ${request.method} ${new URL(request.url).pathname} failed: ${(err as Error)?.message ?? err}`);
+			return json({ error: "authority_internal_error" }, 500);
+		}
+	}
+
+	private async route(request: Request): Promise<Response> {
 		const url = new URL(request.url);
 		const path = url.pathname;
 
@@ -304,12 +318,11 @@ export class TaskAuthority {
 			if (!body.bundle || typeof body.bundle.candidate_sha !== "string") {
 				return json({ error: "invalid_bundle" }, 400);
 			}
-			// Caller identity is enforced INSIDE the authority (the zone
-			// check in submitEvaluation is what actually decides). Transport-
-			// level authentication of this claim is NOT yet verified here —
-			// TODO: bind to mTLS / service-token auth at the edge before
-			// production. Until then, an unauthenticated local caller defaults
-			// to "unknown", which submitEvaluation rejects (fail closed).
+			// The Worker's handleEvidence authenticates the evaluation domain
+			// (Bearer EVALUATION_SERVICE_TOKEN; a shared secret, not mTLS) and
+			// sets `caller` itself; only the Worker holds this object's binding.
+			// The zone check in submitEvaluation still decides, so a caller
+			// that names no zone is "unknown" and is refused (fail closed).
 			const caller: CallerIdentity = body.caller ?? { zone: "unknown" };
 			const ctx = await productionCtx();
 			return this.doState.storage.transaction(async () => {

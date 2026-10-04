@@ -26,9 +26,17 @@
  * - copy_baseline (container/copy-baseline.sh): seeds an empty fork with the
  *   frozen baseline commit when the Artifacts fork endpoint is unavailable.
  *
- * 409 answers are terminal for the request (the PromotionWorkflow does not
- * retry them; a permit stays unconsumed); 502 is a git failure, which a retry
- * may get past.
+ * Lifecycle of one operation (specs/amendments/promotion-runtime-v1.md):
+ * start the container if it is not running; exec the script, retrying while
+ * the container is not running yet (after 100, 200, 400, 800, 1600 and
+ * 3200 ms; then a retryable 503); give the script 60 s from the first exec
+ * attempt (then kill it: a retryable 503); destroy the container afterwards,
+ * whatever happened, so no token, work directory or process outlives the
+ * operation. Operations on one object run one at a time.
+ *
+ * Every answer is JSON. 409 answers are terminal for the request (the
+ * PromotionWorkflow does not retry them; a permit stays unconsumed); 502 and
+ * 503 are failures a retry may get past.
  */
 
 import { promotionHttpResult, rebaseHttpResult } from "../lib/git-promotion.ts";
@@ -67,6 +75,18 @@ interface PromotionRequest {
 	issued_at: string;
 }
 
+/** Waits between exec attempts while the container is still starting. */
+export const EXEC_RETRY_DELAYS_MS: readonly number[] = Object.freeze([100, 200, 400, 800, 1600, 3200]);
+/** One script run's budget, from the first exec attempt to its output. */
+export const EXEC_DEADLINE_MS = 60_000;
+
+/** How one script run ended. */
+type ScriptRun =
+	| { kind: "output"; exitCode: number; stdout: string; stderr: string }
+	| { kind: "not_running"; attempts: number }
+	| { kind: "deadline" }
+	| { kind: "exec_failed"; detail: string };
+
 function json(data: unknown, status = 200): Response {
 	return new Response(JSON.stringify(data), {
 		status,
@@ -97,14 +117,126 @@ function parseLines(stdout: string): Record<string, string> {
 	return out;
 }
 
+function message(err: unknown): string {
+	return err instanceof Error ? err.message : String(err);
+}
+
+function sleep(ms: number): Promise<void> {
+	return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Exec `argv` in `container`: retry while it is not running (per
+ * EXEC_RETRY_DELAYS_MS), then wait for the output. The whole run has
+ * EXEC_DEADLINE_MS; when it expires the process, if any, is killed (also one
+ * that only arrives later).
+ */
+async function execWithDeadline(
+	container: ContainerHandle,
+	argv: string[],
+	env: Record<string, string>,
+): Promise<ScriptRun> {
+	let expired = false;
+	let proc: ContainerExecProcess | undefined;
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	const kill = () => {
+		try {
+			proc?.kill();
+		} catch {
+			// Already exited.
+		}
+	};
+	const deadline = new Promise<ScriptRun>((resolve) => {
+		timer = setTimeout(() => {
+			expired = true;
+			kill();
+			resolve({ kind: "deadline" });
+		}, EXEC_DEADLINE_MS);
+	});
+	const work = (async (): Promise<ScriptRun> => {
+		for (let attempt = 0; ; attempt++) {
+			try {
+				proc = await container.exec(argv, { env });
+				break;
+			} catch (err) {
+				if (!/not running/i.test(message(err))) return { kind: "exec_failed", detail: message(err) };
+				if (attempt >= EXEC_RETRY_DELAYS_MS.length) return { kind: "not_running", attempts: attempt + 1 };
+				await sleep(EXEC_RETRY_DELAYS_MS[attempt]);
+				if (expired) return { kind: "deadline" };
+			}
+		}
+		if (expired) {
+			kill();
+			return { kind: "deadline" };
+		}
+		try {
+			const output = await proc.output();
+			const decoder = new TextDecoder();
+			return {
+				kind: "output",
+				exitCode: output.exitCode,
+				stdout: decoder.decode(output.stdout),
+				stderr: decoder.decode(output.stderr),
+			};
+		} catch (err) {
+			return { kind: "exec_failed", detail: message(err) };
+		}
+	})();
+	try {
+		return await Promise.race([work, deadline]);
+	} finally {
+		clearTimeout(timer);
+	}
+}
+
+/** The answer for a run that produced no script output. */
+function failedRun(run: Exclude<ScriptRun, { kind: "output" }>): Response {
+	switch (run.kind) {
+		case "not_running":
+			return json({ error: "container_not_running", retryable: true, attempts: run.attempts }, 503);
+		case "deadline":
+			return json({ error: "container_exec_timeout", retryable: true, deadline_ms: EXEC_DEADLINE_MS }, 503);
+		case "exec_failed":
+			return json({ error: "container_exec_failed", retryable: true, detail: run.detail }, 502);
+	}
+}
+
 export class PromotionContainer {
 	private state: DurableObjectState;
+	/** Operations on this object's container run one at a time. */
+	private queue: Promise<unknown> = Promise.resolve();
 
 	constructor(state: DurableObjectState, _env: DurableObjectEnv) {
 		this.state = state;
 	}
 
 	async fetch(request: Request): Promise<Response> {
+		try {
+			return await this.handle(request);
+		} catch (err) {
+			return json({ error: "promotion_container_internal_error", retryable: true, detail: message(err) }, 500);
+		}
+	}
+
+	/** One script run in a container started for it and destroyed after it. */
+	private run(container: ContainerHandle, script: string, env: Record<string, string>): Promise<ScriptRun> {
+		const operation = this.queue.then(async () => {
+			try {
+				if (!container.running) container.start({ enableInternet: true });
+				return await execWithDeadline(container, [`/opt/madgrix/${script}`], env);
+			} finally {
+				try {
+					await container.destroy();
+				} catch {
+					// Already stopped.
+				}
+			}
+		});
+		this.queue = operation.catch(() => undefined);
+		return operation;
+	}
+
+	private async handle(request: Request): Promise<Response> {
 		if (request.method !== "POST") return json({ error: "method_not_allowed" }, 405);
 		let raw: PromotionRequest | CopyBaselineRequest | RebaseRequest;
 		try {
@@ -114,19 +246,7 @@ export class PromotionContainer {
 		}
 
 		const container = this.state.container;
-		if (!container) return json({ error: "promotion_container_not_configured" }, 500);
-		if (!container.running) container.start({ enableInternet: true });
-
-		const execScript = async (script: string, env: Record<string, string>) => {
-			const proc = await container.exec([`/opt/madgrix/${script}`], { env });
-			const output = await proc.output();
-			const decoder = new TextDecoder();
-			return {
-				exitCode: output.exitCode,
-				stdout: decoder.decode(output.stdout),
-				stderr: decoder.decode(output.stderr),
-			};
-		};
+		if (!container) return json({ error: "promotion_container_not_configured", retryable: false }, 500);
 
 		if (raw?.action === "copy_baseline") {
 			const body = raw as CopyBaselineRequest;
@@ -140,7 +260,7 @@ export class PromotionContainer {
 			) {
 				return json({ error: "invalid_copy_baseline_request" }, 400);
 			}
-			const output = await execScript("copy-baseline.sh", {
+			const run = await this.run(container, "copy-baseline.sh", {
 				OP_ID: body.op_id,
 				SOURCE_REMOTE: body.source_remote,
 				SOURCE_TOKEN: body.source_token,
@@ -148,12 +268,13 @@ export class PromotionContainer {
 				DESTINATION_REMOTE: body.destination_remote,
 				DESTINATION_TOKEN: body.destination_token,
 			});
-			const fields = parseLines(output.stdout);
-			if (output.exitCode === 42) {
+			if (run.kind !== "output") return failedRun(run);
+			const fields = parseLines(run.stdout);
+			if (run.exitCode === 42) {
 				return json({ error: "destination_not_empty", head: fields.HEAD }, 409);
 			}
-			if (output.exitCode !== 0) {
-				return json({ error: "baseline_import_failed", detail: output.stderr.trim(), exit_code: output.exitCode }, 502);
+			if (run.exitCode !== 0) {
+				return json({ error: "baseline_import_failed", detail: run.stderr.trim(), exit_code: run.exitCode }, 502);
 			}
 			return json({ outcome: fields.OUTCOME, head: fields.HEAD });
 		}
@@ -172,7 +293,7 @@ export class PromotionContainer {
 			) {
 				return json({ error: "invalid_rebase_request" }, 400);
 			}
-			const output = await execScript("rebase.sh", {
+			const run = await this.run(container, "rebase.sh", {
 				OP_ID: body.op_id,
 				FORK_REMOTE: body.fork_remote,
 				FORK_TOKEN: body.fork_token,
@@ -181,7 +302,8 @@ export class PromotionContainer {
 				DESTINATION_TOKEN: body.destination_token,
 				ONTO: body.onto,
 			});
-			const result = rebaseHttpResult(output.exitCode, output.stdout, output.stderr);
+			if (run.kind !== "output") return failedRun(run);
+			const result = rebaseHttpResult(run.exitCode, run.stdout, run.stderr);
 			return json(result.body, result.status);
 		}
 
@@ -201,7 +323,7 @@ export class PromotionContainer {
 			return json({ error: "invalid_promotion_request" }, 400);
 		}
 
-		const output = await execScript("promote.sh", {
+		const run = await this.run(container, "promote.sh", {
 			PERMIT_ID: body.permit_id,
 			SOURCE_REMOTE: body.source_remote,
 			SOURCE_TOKEN: body.source_token,
@@ -212,7 +334,8 @@ export class PromotionContainer {
 			WINNING_TREE_SHA256: body.winning_tree_sha256,
 			ISSUED_AT: body.issued_at,
 		});
-		const result = promotionHttpResult(output.exitCode, output.stdout, output.stderr);
+		if (run.kind !== "output") return failedRun(run);
+		const result = promotionHttpResult(run.exitCode, run.stdout, run.stderr);
 		return json(result.body, result.status);
 	}
 }

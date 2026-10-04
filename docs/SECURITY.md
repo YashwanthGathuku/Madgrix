@@ -225,7 +225,8 @@ The amendment is `specs/amendments/rebase-ancestry-v1.md`.
 - **Terminal refusals stay terminal.** Every refusal of `promote.sh` and
   `rebase.sh` (head moved, tree or baseline mismatch, refused push, unsupported tree
   entry, conflict) is a 409 that the PromotionWorkflow does not retry; only git
-  failures (502) are retried. The permit stays unconsumed.
+  failures (502) and a container that is not running or overran its 60 s (503) are
+  retried. The permit stays unconsumed.
 
 `test/promotion-fixtures.test.ts` runs both scripts against real git repositories on
 a shared fixture table (`test/fixtures/promotion-cases.json`) and checks that the
@@ -251,10 +252,13 @@ policy, or anything outside its destroyed sandbox).
 
 - **Quarantine is a sanction track, not a verdict state.** It is entered *only* from a
   mechanically verified violation — agent accusation is explicitly **not** a trigger.
-- On entering quarantine: the contender's write token is revoked, pending Workflow
-  steps are canceled, the candidate is removed from selection, the evidence bundle is
-  frozen (content-addressed, immutable), the fork stays read-only for forensics, and
-  downstream artifacts are marked tainted.
+- On entering quarantine: the contender's write token is revoked, the
+  `PromotionWorkflow` instances of its unconsumed permits are terminated, the
+  candidate is removed from selection, the evidence bundle is frozen
+  (content-addressed, immutable), the fork stays read-only for forensics, and
+  downstream artifacts are marked tainted. A push already running in the promotion
+  container is not undone; finalize refuses it, so no bundle is signed
+  (`specs/amendments/promotion-runtime-v1.md`).
 - Review is conducted by the **operator-of-record**. `RELEASED` requires a
   determination of mechanical false positive plus passing re-verification; otherwise
   `REVOKED`. Salvage is a new SHA with full re-evaluation — quarantined state can

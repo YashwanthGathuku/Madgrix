@@ -584,19 +584,28 @@ describe("PromotionContainer runs the real scripts with the environment they rea
 		});
 		rewrite.GIT_CONFIG_COUNT = String(Object.keys(remotes).length);
 		const calls: string[][] = [];
-		return {
+		const container = {
 			calls,
-			running: true,
-			start() {},
+			running: false,
+			destroyed: 0,
+			start() {
+				container.running = true;
+			},
 			async exec(argv: string[], opts: { env: Record<string, string> }) {
 				calls.push(argv);
 				const script = path.join(REPO_ROOT, "container", path.basename(argv[0]));
 				const r = spawnSync("bash", [script], { env: { ...gitEnv(root), ...rewrite, ...opts.env } });
 				return {
 					output: async () => ({ exitCode: r.status ?? -1, stdout: new Uint8Array(r.stdout), stderr: new Uint8Array(r.stderr) }),
+					kill() {},
 				};
 			},
+			async destroy() {
+				container.running = false;
+				container.destroyed++;
+			},
 		};
+		return container;
 	}
 
 	it("promote: the reviewed candidate fast-forwards; BASE and PARENT come back from git", async () => {
@@ -633,6 +642,7 @@ describe("PromotionContainer runs the real scripts with the environment they rea
 			parent: shaOf.C1,
 		});
 		assert.deepEqual(container.calls, [["/opt/madgrix/promote.sh"]]);
+		assert.equal(container.destroyed, 1, "the container is destroyed after the promotion");
 	});
 
 	it("rebase: a clean rebase is REBASED and a conflict is CONFLICT with its paths", async () => {
@@ -665,6 +675,7 @@ describe("PromotionContainer runs the real scripts with the environment they rea
 			assert.equal(res.status, status, prefix);
 			const body = (await res.json()) as Record<string, unknown>;
 			assert.deepEqual(container.calls, [["/opt/madgrix/rebase.sh"]]);
+			assert.equal(container.destroyed, 1, "the container is destroyed after the rebase");
 			if (status === 200) {
 				assert.equal(body.outcome, "REBASED");
 				assert.equal(body.onto, shaOf.H2);

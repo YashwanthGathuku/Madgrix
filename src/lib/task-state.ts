@@ -93,7 +93,9 @@ export function defaultCtx(selectorPolicyHash: string): Ctx {
 /** Side effects the authority REQUESTS; the platform layer executes them. */
 export type Effect =
 	| { kind: "revoke_token"; repo: string; token_id: string }
-	| { kind: "cancel_workflow"; contender_id: string }
+	/** Stop the contender's pending promotions: the PromotionWorkflow
+	 *  instances of its unconsumed permits (instance id = permit_id). */
+	| { kind: "cancel_workflow"; contender_id: string; permit_ids: string[] }
 	| { kind: "notify"; to: string[]; message: string }
 	/** Fast-forward `repo`'s main from `base` to `commit` (the reviewed
 	 *  candidate, unchanged). Only the promotion service performs it. */
@@ -554,11 +556,11 @@ export type SubmitEvaluationOutcome = "RECORDED" | "ACK_DUP" | "REPLACEMENT_REJE
 /**
  * Store an evaluation bundle. The caller identity is checked against the
  * credential matrix IN THE AUTHORITY (spec 3 §5): only the evaluation
- * domain may submit evidence. Transport-level authentication of that
- * identity is the edge's job — the DO/worker routes carry an explicit
- * TODO where mTLS/service-token auth cannot exist locally — but the zone
- * check itself is enforced here, so a misrouted or forged caller identity
- * fails closed even if the edge is naive.
+ * domain may submit evidence. Authenticating that identity is the edge's
+ * job — the Worker's /evidence route requires EVALUATION_SERVICE_TOKEN (a
+ * bearer secret, not mTLS) and sets the zone itself — but the zone check is
+ * enforced here too, so a misrouted or forged caller identity fails closed
+ * even if the edge is naive.
  *
  * Binding (specs/amendments/evidence-integrity-v1.md): the bundle must name
  * a known contender, and its candidate_sha must be that contender's
@@ -1365,7 +1367,13 @@ export async function quarantineContender(
 		...contenderTokenIds(contender).map(
 			(token_id): Effect => ({ kind: "revoke_token", repo: contender.fork_repo, token_id }),
 		),
-		{ kind: "cancel_workflow", contender_id },
+		{
+			kind: "cancel_workflow",
+			contender_id,
+			permit_ids: Object.values(state.permits)
+				.filter((p) => p.contender_id === contender_id && !p.consumed)
+				.map((p) => p.permit_id),
+		},
 		{
 			kind: "notify",
 			to: ["operator-of-record"],
