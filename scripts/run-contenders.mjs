@@ -212,11 +212,15 @@ const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), ".."
  * Subscribe after the Worker has created the contender repo and before the
  * agent push. Skipped when MADGRIX_QUEUE_ID is unset (local tests).
  *
+ * A subscription that the API has just accepted does not yet emit `pushed`.
+ * The caller must wait, and push again if the first push is not applied.
+ *
  * @param {string} repoName
+ * @returns {Promise<'skipped' | 'created' | 'existing'>}
  */
 async function ensurePushSubscription(repoName) {
 	const queueId = process.env.MADGRIX_QUEUE_ID;
-	if (!queueId) return;
+	if (!queueId) return 'skipped';
 	if (!/^[A-Za-z0-9._-]{1,128}$/.test(repoName)) {
 		throw new Error("refusing to subscribe a repo name that is not a single Artifacts path segment");
 	}
@@ -238,11 +242,33 @@ async function ensurePushSubscription(repoName) {
 		);
 	} catch (err) {
 		const raw = err instanceof Error ? err.message : String(err);
-		if (/already exists|duplicate|409/i.test(raw)) return;
+		if (/already exists|duplicate|409/i.test(raw)) return 'existing';
 		const redacted = raw.split(queueId).join("[id]").replace(/https:\/\/\S+/g, "[url]").replace(/[0-9a-f]{16,}/gi, "[id]").replace(/art_v2_\S+/g, "[token]");
 		throw new Error(`push subscription for ${repoName} failed: ${redacted}`);
 	} finally {
 		await rm(tmp, { force: true });
+	}
+	return 'created';
+}
+
+function sleep(ms) {
+	return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * The queue consumer batches for up to 30s. Poll a little longer than that.
+ * @param {string} contenderId
+ * @param {string} sha
+ * @param {number} timeoutMs
+ */
+async function pushWasApplied(contenderId, sha, timeoutMs) {
+	const deadline = Date.now() + timeoutMs;
+	for (;;) {
+		const context = await getJson(`${taskUrl}/context`);
+		const row = (context.contenders ?? []).find((c) => c.contender_id === contenderId);
+		if (row?.latest_commit === sha) return true;
+		if (Date.now() >= deadline) return false;
+		await sleep(2000);
 	}
 }
 
@@ -293,7 +319,7 @@ const runOne = async (agentId) => {
 		throw new Error(`invalid contender response for ${agentId}`);
 	}
 
-	await ensurePushSubscription(forkRepo);
+	const subscription = await ensurePushSubscription(forkRepo);
 
 	const dir = await mkdtemp(path.join(workRoot, `madgrix-${agentId.replace(/[^A-Za-z0-9._-]/g, "_")}-`));
 	try {
@@ -321,12 +347,37 @@ const runOne = async (agentId) => {
 			await run("git", ["-c", `user.name=${name}`, "-c", `user.email=${email}`, "commit", "-m", `MADGRIX contender: ${agentId}`], { cwd: dir });
 		}
 
-		const candidateSha = await capture("git", ["rev-parse", "HEAD"], { cwd: dir });
+		let candidateSha = await capture("git", ["rev-parse", "HEAD"], { cwd: dir });
 		if (candidateSha === baseline) {
 			throw new Error(`${agentId} produced no candidate change`);
 		}
+		// A subscription the API just created does not emit `pushed` yet.
+		// The previous live run subscribed and pushed within a few seconds,
+		// and the queue never received those pushes. An already-live
+		// subscription does deliver. Wait before the first push, then push
+		// once more if the authority still has not applied it.
+		if (subscription === 'created') {
+			console.error(`[Git4agents] waiting for the ${forkRepo} push subscription to start emitting`);
+			await sleep(30000);
+		}
 		await run("git", ["push", "--quiet", "origin", "HEAD:refs/heads/main"], { cwd: dir, env: gitAuthEnv(token) });
 		console.error(`[Git4agents] ${agentId} pushed ${candidateSha.slice(0, 12)}`);
+		if (subscription !== 'skipped') {
+			let applied = await pushWasApplied(contenderId, candidateSha, 45000);
+			if (!applied) {
+				console.error(`[Git4agents] ${agentId} push was not applied; pushing again now that the subscription is live`);
+				const name = process.env.GIT_AUTHOR_NAME ?? `MADGRIX ${agentId}`;
+				const email = process.env.GIT_AUTHOR_EMAIL ?? `${agentId.replace(/[^A-Za-z0-9]/g, "")}@madgrix.invalid`;
+				await run("git", ["-c", `user.name=${name}`, "-c", `user.email=${email}`, "commit", "--allow-empty", "-m", `MADGRIX contender republish: ${agentId}`], { cwd: dir });
+				candidateSha = await capture("git", ["rev-parse", "HEAD"], { cwd: dir });
+				await run("git", ["push", "--quiet", "origin", "HEAD:refs/heads/main"], { cwd: dir, env: gitAuthEnv(token) });
+				console.error(`[Git4agents] ${agentId} pushed ${candidateSha.slice(0, 12)} again`);
+				applied = await pushWasApplied(contenderId, candidateSha, 50000);
+			}
+			if (!applied) {
+				throw new Error(`${agentId} push event was not applied by the task authority`);
+			}
+		}
 		return {
 			agent_id: agentId,
 			contender_id: contenderId,
