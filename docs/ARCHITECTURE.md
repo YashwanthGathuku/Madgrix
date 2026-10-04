@@ -1,4 +1,4 @@
-# Architecture — Verdict Seam
+# Architecture — MADGRIX
 
 The full protocol contracts live in `./specs/` (specs 1, 3, 5 are FROZEN-v1). This
 document is the plain-language map of the system: what runs where, what each part is
@@ -10,15 +10,15 @@ as the mermaid source below).
 ```mermaid
 flowchart TB
     INTENT(["Operator intent"]) --> FREEZE["1. Control plane — TaskAuthority (Durable Object)<br/>freeze task: task_hash pins intent, baseline commit, policy version"]
-    FREEZE --> CLAIMS["Work claims + conflict graph<br/>contract conflicts classified GREEN / YELLOW / RED"]
-    CLAIMS --> FORKS["2. Contender microVMs — one Firecracker microVM per contender<br/>idempotent fork · short-lived WRITE token (own fork only)"]
+    FREEZE --> CLAIMS["Work claims + conflict graph<br/>conflicts classified GREEN / AMBER / RED / BLOCKED"]
+    CLAIMS --> FORKS["2. Contender repositories<br/>native Artifact fork or beta import fallback<br/>short-lived WRITE token (own repo only)"]
     FORKS --> PUSH["Contenders push candidate commits"]
     PUSH --> QUEUE["1. Queue ingestion — at-least-once, unordered<br/>content-derived event_key · Durable Object dedupe · ACK_DUP"]
     QUEUE --> EVAL["3. Evaluation domain<br/>admission gates → hidden oracle (black-box preferred)<br/>tamper → mechanical quarantine · token revoked"]
     EVAL --> VER["Blind verifiers — commit → judge anonymized code → reveal<br/>invalid reveal → VERIFIER_REPORT_INADMISSIBLE, no retry"]
     VER --> SEAM["4. Verdict plane — the verdict seam<br/>eligibility AND-gates → objective dominance<br/>(correctness → regressions → security → blast radius → minimality)<br/>→ blind 2-of-3 vote → ACCEPT / ABSTAIN / ESCALATE"]
     SEAM --> PERMIT["5. Promotion service — exact-state single-use permit<br/>binds task · baseline · winning tree · evaluation bundle · policy · destination head"]
-    PERMIT --> PROMOTE["Canonical write — the sole writer<br/>replay → ALREADY_CONSUMED · destination HEAD moved → permit EXPIRED"]
+    PERMIT --> PROMOTE["Trusted promotion Container — sole canonical writer<br/>recompute tree-digest/v1 · exact candidate SHA<br/>replay reconciled · destination HEAD moved → permit EXPIRED"]
     PROMOTE --> ATTEST["Attestation chain — in-toto statements, DSSE envelope<br/>→ promotion.bundle"]
     ATTEST --> OFFLINE(["Offline verify — 10-line transcript → VERIFIED<br/>no network · pinned authority key"])
 ```
@@ -28,10 +28,10 @@ flowchart TB
 | # | Zone | Runs on | Holds | Must never |
 |---|---|---|---|---|
 | 1 | Control plane | Worker + Durable Object (per task) | Task state, policy, secrets, signing keys, permit ledger, conflict graph | Hand model/attestation credentials to any other zone |
-| 2 | Contender microVMs | One Cloudflare Sandbox (Firecracker microVM) per contender | Its fork repo, a short-lived WRITE-scoped token for that fork only | See hidden tests, verifier prompts, other contenders' code or tokens, policy, ledger |
+| 2 | Contender domain | External coding-agent process + one isolated Artifact repository per contender | Its candidate repo, a short-lived WRITE-scoped token for that repo only | See hidden evaluation material, verifier secrets, other contenders' tokens, policy, canonical credentials |
 | 3 | Evaluation domain | Separate sandbox(es) / external evaluator | Read-only candidate input, hidden oracles, independent credentials | Hold any canonical write token; persist state across evaluations |
 | 4 | Verdict plane | Worker (control-plane code path) | Evidence, policy | Mutate candidate state, evaluation outputs, or canonical state |
-| 5 | Promotion service | Worker (control-plane code path) | Canonical write token, signing-key access | Be reachable by contenders, reviewers, or test harnesses |
+| 5 | Promotion service | Worker + trusted Cloudflare Container | Short-lived source READ and canonical WRITE credentials | Expose canonical credentials to contenders/evaluators or promote a state other than the permitted candidate |
 
 The credential matrix, in short: contenders get write access to *their own fork only*;
 the evaluator gets read-only access to one candidate SHA; verifiers get *no* repo
@@ -45,10 +45,12 @@ component that can write canonical state, and it lives inside the control plane.
    the baseline commit, and the policy version. Nothing downstream can silently swap
    any of the three.
 2. **Claim.** Agents register work claims against the task. Overlapping claims are
-   classified by the conflict graph (GREEN / YELLOW / RED) — RED means
+   classified by the conflict graph (GREEN / AMBER / RED / BLOCKED) — RED means
    proceed-with-awareness and counts toward blast radius; it never silently blocks.
-3. **Fork.** Each contender gets an idempotent fork of the baseline and a short-lived
-   write token scoped to that fork. Double-fork converges on the same fork.
+3. **Isolate.** Each contender gets an idempotently named Artifact repository and a
+   short-lived write token scoped to that repository. MADGRIX attempts the native
+   Artifacts fork first; the currently observed beta fork error triggers the explicit
+   baseline-import fallback, which copies the exact baseline commit into a fresh repo.
 4. **Work.** Contenders push candidate commits. Pushes arrive as queue events that are
    at-least-once and unordered: ingestion uses a content-derived `event_key` plus
    Durable Object dedupe (`ACK_DUP`), and rejects events for unknown repos.
@@ -128,7 +130,9 @@ what white-box protects is evaluation *authority and persistence*).
 | Offline verifier | `src/cli/verify.ts` | Verify-only Ed25519 signer over the pinned authority key; prints the 10-line transcript |
 | Benchmark harness | `src/lib/benchmark.ts` | Synthetic / harness-validation only — not evidence |
 
-In the current prototype the platform layer (`src/do/`, `src/worker/`) runs against
-`FakeArtifacts`; production swaps in the real Artifacts binding without changing
-protocol logic. The live Cloudflare end-to-end run is still pending (needs a
-direct-egress machine or deploy permission).
+The deterministic local slice uses `FakeArtifacts` for repeatability. The
+production Worker uses `ArtifactsPort` backed by the real Cloudflare Artifacts
+binding. Real repository/token/push/clone/revocation primitives have been validated;
+the complete deployed MADGRIX live E2E is the remaining evidence-collection step.
+`scripts/live-e2e.ts` deliberately exercises the real path and fails if Artifact
+push events do not reach Queue → TaskAuthority.

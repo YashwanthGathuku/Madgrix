@@ -1,62 +1,99 @@
-# Submission Checklist — Madgrix
+# Submission Checklist — MADGRIX
 
-**Competition:** Cloudflare "Build the next Git platform" — **deadline Oct 14, 2026.**
-License requirement: MIT, Apache, or BSD. This repo is **MIT** (`LICENSE`,
-copyright 2026 Yashwanth Gathuku).
-**Public repo:** `github.com/YashwanthGathuku/Madgrix` (pushed 2026-10-01).
+**Competition:** Cloudflare “Build the next Git platform”  
+**Deadline:** October 14, 2026  
+**Repository:** YashwanthGathuku/Madgrix  
+**License:** MIT
 
-Each requirement is mapped to where it lives in this repo. Items marked ⬜ need a
-user decision or remaining work.
+This checklist separates implementation evidence from competition evidence.
+A green local/CI test is not presented as a completed live Cloudflare run.
 
-## Requirement → repo location
+## Competition package
 
-| # | Requirement | Status | Location |
-|---|---|---|---|
-| 1 | Working code built on Cloudflare primitives | ✅ Prototype (local) | `src/worker/` (Worker router), `src/do/TaskAuthority.ts` (Durable Object), `src/lib/` (protocol), `./specs/CLOUDFLARE_RUNTIME_MODEL.md` (runtime model) |
-| 2 | Agent-native Git concept | ✅ | `README.md` ("Why it matters"); `./specs/PROMOTION_PROTOCOL.md` (FROZEN-v1) |
-| 3 | End-to-end demo | ✅ Script; ⬜ recording | `docs/DEMO_SCRIPT.md` (7-minute narrated script, exact commands + expected output) |
-| 4 | Architecture documentation | ✅ | `docs/ARCHITECTURE.md` + `docs/architecture.svg` (mermaid + rendered SVG) |
-| 5 | Security / threat model | ✅ | `docs/SECURITY.md`; normative spec `./specs/EVALUATION_THREAT_MODEL.md` (FROZEN-v1) |
-| 6 | Open-source license (MIT/Apache/BSD) | ✅ MIT | `LICENSE` |
-| 7 | Reproducible on a fresh machine | ✅ | `README.md` Quickstart: `npm install` → `npm test` → `npm run slice` → `npm run verify` → `npm run bench` (all local, no credentials/network) |
-| 8 | Honest claims (no vaporware) | ✅ | "Honest limitations" in `README.md`; benchmark harness labeled synthetic in `README.md` and `src/lib/benchmark.ts` |
-| 9 | Attack-resistance evidence | ✅ Harness-level | `npm run bench -- --quick` → `"zero_tolerance_ok": true` (13 attacks × 2 trials against the real protocol modules); full benchmark on real datasets is future work |
+| Requirement | Status | Evidence |
+|---|---|---|
+| Agent-native Git concept | ✅ | `README.md`, frozen protocol specs |
+| Cloudflare Worker | ✅ built/CI | `src/worker/index.ts`, `cloudflare.config.ts` |
+| Durable Object authority | ✅ built/CI | `src/do/TaskAuthority.ts` |
+| Cloudflare Queue consumer | ✅ built/CI | official Artifacts push-envelope routing + dedupe tests |
+| Cloudflare Workflow | ✅ built/CI | `PromotionWorkflow` registered in config |
+| Cloudflare Container | ✅ built/CI | `src/do/PromotionContainer.ts`, `container/` |
+| Cloudflare Artifacts integration | ✅ primitives validated | real repo/token/push/clone/revocation validation |
+| Real 3-agent contender runner | ✅ implemented | `scripts/run-contenders.mjs` |
+| Independent evaluator | ✅ implemented | `scripts/evaluate-candidate.ts` |
+| Complete live orchestrator | ✅ implemented | `scripts/live-e2e.ts` |
+| Exact reviewed-state promotion | ✅ implemented/CI | candidate SHA + `tree-digest/v1` + destination HEAD |
+| Offline verifiable evidence | ✅ local slice | in-toto-style statements + DSSE + verifier CLI |
+| Security/threat model | ✅ | `docs/SECURITY.md`, `specs/EVALUATION_THREAT_MODEL.md` |
+| Architecture documentation | ✅ | `docs/ARCHITECTURE.md` |
+| Open-source license | ✅ MIT | `LICENSE` |
+| Real deployed MADGRIX E2E transcript | ⬜ | run `npm run live:e2e` after deployment |
+| Demo video | ⬜ | record after successful live E2E |
+| Real benchmark dataset run | ⬜ | `docs/BENCHMARK_RUNBOOK.md` |
+| Submission form | ⬜ | final competition submission |
 
-## Verification evidence (all re-verified 2026-10-01)
+## Current CI evidence
 
-- `npm test` → **105 tests, 26 suites, 0 failures** (includes the slice as an
-  integration test).
-- `npm run slice` → exit 0, ends with **`SLICE OK`**; outcomes deterministic across
-  runs (verdict ACCEPT, winner contender-1, contender-3 quarantined, permit replay
-  `ALREADY_CONSUMED`, bundle `VERIFIED`).
-- `npm run headmove` → exit 0, ends with **`HEAD-MOVE OK`** (destination head move →
-  permit `EXPIRED_HEAD_MOVED` → re-evaluation → re-promotion, exactly one write).
-- `npm run verify -- --trust-key .slice-output/authority.pub .slice-output/promotion.bundle`
-  → 10-line transcript + `VERIFIED`, exit 0. Without a pinned key → exit 2.
-- Tamper check: one flipped signature byte → `NOT VERIFIED`, exit 1.
-- `npm run bench` → exit 0, `"zero_tolerance_ok": true` (13 attacks × 2 trials
-  against the real protocol modules).
+The Oct 2 `codex/competition-critical-paths` tip recorded:
 
-## Remaining work (⬜)
+```
+npm run typecheck        PASS
+npm run build            PASS
+npm test                 110 tests / 27 suites / 0 failures
+npm run slice            SLICE OK
+npm run headmove         HEAD-MOVE OK
+npm run bench            26/26 adversarial trials
+                         zero_tolerance_ok=true
+```
 
-1. **Demo video recording.** The script is written (`docs/DEMO_SCRIPT.md`) with a
-   pre-rendered backup plan; the actual recording is still to do.
-2. **Live Cloudflare end-to-end.** The prototype runs against the in-memory
-   `FakeArtifacts` stand-in; a live E2E needs a direct-egress machine or deploy
-   permission — see `docs/PRODUCTION_DEPLOYMENT.md` for the exact post-deploy
-   smoke test.
-3. **Real benchmark run.** The harness is validated on synthetic inputs
-   (explicitly labeled, not evidence); the pre-registered procedure for the real
-   run on SWE-bench/SpecBench is `docs/BENCHMARK_RUNBOOK.md`.
-4. **Full trademark search** on "Madgrix" + legal review before launch
-   (screening only so far — `docs/NAME_SHORTLIST.md`).
-5. **Deadline.** October 14, 2026.
+That count is not this branch. Local `npm test` on the merge is 281 tests / 87 suites / 0 failures. Typecheck, build, slice, headmove, and bench were not re-run for the merge. The Oct 2 CI also syntax-checked the three live-run scripts and both container Git helpers.
 
-## Known non-blockers (documented, not hidden)
+## Required before recording the final demo
 
-- Deterministic verifier stand-ins (no LLMs) in the slice; judgments are scripted,
-  ordering guarantees are real.
-- Ed25519 slice signer vs production Sigstore (identical DSSE envelope shape).
-- Remote Artifacts binding untested from this sandbox.
-- Benchmark harness is synthetic/harness-validation — explicitly not competition
-  evidence.
+1. Deploy `madgrix` with three distinct service secrets.
+2. Create/configure `madgrix-events`.
+3. Subscribe `cf.artifacts.repo.pushed` events from the competition namespace
+   to that Queue.
+4. Prepare the real baseline and canonical Artifact repositories.
+5. Run `npm run live:e2e`.
+6. Save the successful transcript and `promotion.bundle`.
+7. Run the verifier separately against that saved bundle.
+8. Re-run the stale-HEAD/commit-swap attack against the deployed path if time
+   permits and preserve the rejection transcript.
+9. Record the demo from the live path; keep the deterministic local slice only
+   as a backup.
+10. Submit before October 14.
+
+## Claims that are safe today
+
+MADGRIX can be described as implementing a governed promotion protocol with
+WorkClaims, isolated candidate repositories, independent evidence,
+non-compensatory eligibility gates, blind signed verifier reports, exact-state
+single-use promotion permits, and offline-verifiable promotion evidence.
+
+Real Cloudflare Artifacts repository/token behavior has been exercised. The
+full Worker → Queue → Durable Object → evaluation → verdict → Container
+promotion path is implemented and builds in CI.
+
+## Claims to withhold until the live run exists
+
+Do **not** yet claim that the complete MADGRIX production path has run
+end-to-end on Cloudflare. Do not call the synthetic benchmark a real-world
+accuracy improvement. Do not claim Sigstore-backed production signing; the
+competition implementation uses Ed25519 DSSE envelopes. Do not claim the
+Cloudflare beta fork endpoint works; the documented import fallback is used
+when its known beta failure signature occurs.
+
+## Submission assets still needed
+
+- successful live-E2E transcript;
+- live promotion bundle + independent verifier transcript;
+- final demo video;
+- screenshots/diagram chosen for the submission page;
+- concise project description and technical write-up;
+- optional real benchmark evidence if completed in time;
+- final name/trademark clearance before broader commercial launch.
+
+The engineering critical path is complete enough to attempt the real
+deployment. The next blocker is evidence collection on the live Cloudflare
+runtime, not another round of protocol redesign.

@@ -1428,17 +1428,29 @@ export async function handleVerifyAttestation(
 		currentHead = null;
 	}
 
+	const destinationState =
+		permit.consumed
+			? currentHead === permit.winner_candidate_sha
+				? "PROMOTED_EXACT_CANDIDATE"
+				: "PROMOTED_BUT_DESTINATION_MOVED_AFTERWARD"
+			: currentHead === permit.expected_destination_head
+				? "UNCONSUMED_AT_EXPECTED_PARENT"
+				: "UNCONSUMED_DESTINATION_MOVED";
+
 	return json({
 		permit_id: permitId,
 		permit_id_valid: recomputed === permitId,
 		consumed: permit.consumed,
 		consumed_at: permit.consumed_at,
 		expected_destination_head: permit.expected_destination_head,
-		current_destination_head: currentHead,
-		head_matches: currentHead === permit.expected_destination_head,
-		task_hash: permit.task_hash,
 		winner_candidate_sha: permit.winner_candidate_sha,
-		note: "Platform-level verification only. Full attestation (in-toto + DSSE + Sigstore) is spec 4, protocol-layer.",
+		current_destination_head: currentHead,
+		destination_state: destinationState,
+		exact_reviewed_candidate_current:
+			permit.consumed && currentHead === permit.winner_candidate_sha,
+		task_hash: permit.task_hash,
+		note:
+			"Platform-level permit/destination check. Full offline evidence verification uses promotion.bundle via src/cli/verify.ts.",
 	});
 }
 
