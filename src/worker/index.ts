@@ -64,6 +64,7 @@ import type {
 } from "../lib/artifacts-port.ts";
 import { forkIdempotent } from "../lib/artifacts-port.ts";
 import type { SimulatedGit } from "../lib/artifacts-port.ts";
+import { FakeArtifacts } from "../lib/fake-artifacts.ts";
 import { joinHashParts, randomHex, sha256Hex } from "../lib/canonical.ts";
 import { contenderRepoName, normalizeArtifactQueueBody } from "../lib/artifact-events.ts";
 import type {
@@ -340,9 +341,13 @@ class BindingRepo implements ArtifactsRepo {
 		return { hash: e.hash, treeHash: e.treeHash, parents: e.parents, message: e.message };
 	}
 
-	/** Convenience over log({ ref, limit: 1 }); no direct binding equivalent. */
+	/**
+	 * Branch tip. The binding method is `log` (ArtifactsRepo.log in
+	 * workerd's worker.mjs); there is no getHead on the RPC repo.
+	 */
 	async getHead(ref: string = "main"): Promise<string | null> {
-		const entries = await this.log({ ref, limit: 1 });
+		const entries = await this.binding.log({ ref, limit: 1 });
+		if (!Array.isArray(entries) || entries.length === 0) return null;
 		const hash = entries[0]?.hash;
 		return typeof hash === "string" && hash.length > 0 ? hash : null;
 	}
@@ -393,11 +398,12 @@ class BindingArtifactsPort implements ArtifactsPort {
 }
 
 function isSimulatedGitPort(v: unknown): v is ArtifactsPort & SimulatedGit {
-	return (
-		typeof v === "object" &&
-		v !== null &&
-		typeof (v as { adminPush?: unknown }).adminPush === "function"
-	);
+	// An Artifacts RPC stub reports every property access as a function,
+	// including adminPush, which the binding does not implement. Probing
+	// that name treated the real binding as FakeArtifacts, and the next
+	// repo.getHead() was an RPC call. workerd's ArtifactsRepo has no
+	// getHead; history is ArtifactsRepo.log().
+	return v instanceof FakeArtifacts;
 }
 
 /**
@@ -667,12 +673,24 @@ async function revokeForkCreationToken(repo: ArtifactsRepo, plaintext: string): 
 	}
 }
 
+
+/**
+ * Tip of main via ArtifactsRepo.log, the history method the binding
+ * actually implements. getHead is only a port convenience and is not an
+ * RPC method.
+ */
+async function headFromLog(repo: ArtifactsRepo): Promise<string | null> {
+	const entries = await repo.log({ ref: "main", limit: 1 });
+	const hash = entries[0]?.hash;
+	return typeof hash === "string" && hash.length > 0 ? hash : null;
+}
+
 /** A fork's main ref can lag the fork() response by a moment. Retry, then throw the last error. */
 async function readForkHead(repo: ArtifactsRepo): Promise<string | null> {
 	let last: unknown;
 	for (let attempt = 0; attempt < 4; attempt++) {
 		try {
-			const head = await repo.getHead();
+			const head = await headFromLog(repo);
 			if (head) return head;
 		} catch (err) {
 			last = err;
@@ -764,7 +782,7 @@ export async function handleCreateContender(
 	// cannot be read counts as empty: whether the binding's log() throws for
 	// an empty repository is not known, and copy-baseline.sh checks the
 	// destination itself (ALREADY_IMPORTED, or DESTINATION_NOT_EMPTY).
-	const unfinishedCopy = !created && (await repo.getHead().catch(() => null)) === null;
+	const unfinishedCopy = !created && (await headFromLog(repo).catch(() => null)) === null;
 	if ((created && viaImportFallback) || unfinishedCopy) {
 		let destinationToken: string;
 		let revokeDestinationToken: string;
