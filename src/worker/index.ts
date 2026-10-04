@@ -276,7 +276,7 @@ interface RealArtifactsBinding {
 	delete(name: string): Promise<boolean>;
 }
 
-class BindingRepo implements ArtifactsRepo {
+class BindingRepo {
 	private binding: RealArtifactsRepoBinding;
 	private repoName: string;
 	private repoRemote: string;
@@ -341,16 +341,6 @@ class BindingRepo implements ArtifactsRepo {
 		return { hash: e.hash, treeHash: e.treeHash, parents: e.parents, message: e.message };
 	}
 
-	/**
-	 * Branch tip. The binding method is `log` (ArtifactsRepo.log in
-	 * workerd's worker.mjs); there is no getHead on the RPC repo.
-	 */
-	async getHead(ref: string = "main"): Promise<string | null> {
-		const entries = await this.binding.log({ ref, limit: 1 });
-		if (!Array.isArray(entries) || entries.length === 0) return null;
-		const hash = entries[0]?.hash;
-		return typeof hash === "string" && hash.length > 0 ? hash : null;
-	}
 }
 
 /**
@@ -375,7 +365,9 @@ class BindingArtifactsPort implements ArtifactsPort {
 	async get(name: string): Promise<ArtifactsRepo> {
 		const b = await this.binding.get(name);
 		const info = await b.info();
-		return new BindingRepo(b, info.name, info.remote);
+		// BindingRepo has no getHead. The Artifacts RPC repo does not either
+		// (workerd types/defines/artifacts.d.ts). Callers use log() or readCommit().
+		return new BindingRepo(b, info.name, info.remote) as unknown as ArtifactsRepo;
 	}
 
 	async list(opts?: { limit?: number; cursor?: string }): Promise<RepoListResult> {
@@ -647,7 +639,12 @@ function errorLabel(err: unknown): string {
 	const message = String(e?.message ?? err)
 		.replace(/https:\/\/\S+/g, "[url]")
 		.replace(/art_v2_\S+/g, "[token]");
-	return `${e?.name ?? "Error"}${e?.code ? " " + e.code : ""}: ${message}`.slice(0, 300);
+	const frame = String((err as { stack?: string })?.stack ?? "")
+		.split("\n")
+		.map((line) => line.trim())
+		.find((line) => line.startsWith("at ") && !line.includes("node:internal"));
+	const where = frame ? ` @ ${frame.replace(/https:\/\/\S+/g, "[url]")}` : "";
+	return `${e?.name ?? "Error"}${e?.code ? " " + e.code : ""}: ${message}${where}`.slice(0, 300);
 }
 
 /**
@@ -675,23 +672,28 @@ async function revokeForkCreationToken(repo: ArtifactsRepo, plaintext: string): 
 
 
 /**
- * Tip of main via ArtifactsRepo.log, the history method the binding
- * actually implements. getHead is only a port convenience and is not an
- * RPC method.
+ * Branch tip via ArtifactsRepo.log. workerd's ArtifactsRepo has no getHead
+ * (types/defines/artifacts.d.ts). Do not call a method by that name.
  */
-async function headFromLog(repo: ArtifactsRepo): Promise<string | null> {
-	const entries = await repo.log({ ref: "main", limit: 1 });
+async function branchTip(repo: ArtifactsRepo, ref = "main"): Promise<string | null> {
+	const entries = await repo.log({ ref, limit: 1 });
+	if (!Array.isArray(entries) || entries.length === 0) return null;
 	const hash = entries[0]?.hash;
 	return typeof hash === "string" && hash.length > 0 ? hash : null;
 }
 
-/** A fork's main ref can lag the fork() response by a moment. Retry, then throw the last error. */
-async function readForkHead(repo: ArtifactsRepo): Promise<string | null> {
+/**
+ * Whether the frozen baseline commit object is in this repo.
+ * ArtifactsRepo.readCommit(hash) is the binding method that reads an object
+ * id. Contender creation uses the baseline SHA already frozen on the task
+ * and does not call log() or getHead.
+ */
+async function baselinePresent(repo: ArtifactsRepo, hash: string): Promise<string | null> {
 	let last: unknown;
 	for (let attempt = 0; attempt < 4; attempt++) {
 		try {
-			const head = await headFromLog(repo);
-			if (head) return head;
+			const commit = await repo.readCommit(hash);
+			if (commit && commit.hash === hash) return hash;
 		} catch (err) {
 			last = err;
 		}
@@ -778,11 +780,11 @@ export async function handleCreateContender(
 	// credential. A fork that already exists but is still empty is such a
 	// repo whose copy did not finish (the container answered a retryable
 	// 503, say): this request copies again, with a fresh five-minute write
-	// token, so retrying the request is how a caller recovers. A head that
-	// cannot be read counts as empty: whether the binding's log() throws for
-	// an empty repository is not known, and copy-baseline.sh checks the
-	// destination itself (ALREADY_IMPORTED, or DESTINATION_NOT_EMPTY).
-	const unfinishedCopy = !created && (await headFromLog(repo).catch(() => null)) === null;
+	// token, so retrying the request is how a caller recovers. A missing
+	// baseline object counts as empty: readCommit returns null when the
+	// object is not in the repo, and copy-baseline.sh checks the destination
+	// itself (ALREADY_IMPORTED, or DESTINATION_NOT_EMPTY).
+	const unfinishedCopy = !created && (await repo.readCommit(state.task.baseline_commit).catch(() => null)) === null;
 	if ((created && viaImportFallback) || unfinishedCopy) {
 		let destinationToken: string;
 		let revokeDestinationToken: string;
@@ -837,7 +839,7 @@ export async function handleCreateContender(
 	}
 
 	const credentials = await issueContenderCredentials(port, forkName, 3600);
-	const latest_commit = await readForkHead(repo);
+	const latest_commit = await baselinePresent(repo, state.task.baseline_commit);
 	if (latest_commit !== state.task.baseline_commit) {
 		await repo.revokeToken(credentials.id);
 		return json({
@@ -1074,7 +1076,7 @@ export async function handleVerdict(env: Env, taskId: string, request: Request):
 	}
 
 	const dest = await productionPort(env).get(destination_repo);
-	const destination_head = await dest.getHead();
+	const destination_head = await branchTip(dest);
 	if (!destination_head) return json({ error: "destination_head_not_found", destination_repo }, 409);
 	const pr = await doRpc(taskStub(env, taskId), "/permit", {
 		body: { winner_sha: verdict.winner_sha, destination_repo, destination_head },
@@ -1403,7 +1405,7 @@ export async function handleRebase(env: Env, taskId: string, request: Request): 
 	const port = productionPort(env);
 	const fork = await port.get(contender.fork_repo);
 	const destination = await port.get(destination_repo);
-	const onto = await destination.getHead();
+	const onto = await branchTip(destination);
 	if (!onto) return json({ error: "destination_head_not_found", destination_repo }, 409);
 
 	const opId = (await sha256Hex(joinHashParts("rebase", taskId, contender_id, candidate, onto))).slice(0, 32);
@@ -1504,7 +1506,7 @@ export async function handleVerifyAttestation(
 	const port = productionPort(env);
 	let currentHead: string | null = null;
 	try {
-		currentHead = await (await port.get(permit.destination_repo)).getHead();
+		currentHead = await branchTip(await port.get(permit.destination_repo));
 	} catch {
 		currentHead = null;
 	}
