@@ -23,7 +23,9 @@
  * claude-code-tool-log.mjs writes it from `--output-format stream-json`.
  *
  * Optional:
- *   MADGRIX_AGENT_IDS=agent-a,agent-b,agent-c   (default)
+ *   MADGRIX_AGENT_IDS=agent-01,agent-02,...   overrides the Agentfleet roster
+ *   MADGRIX_FLEET_BIN / MADGRIX_FLEET_CONFIG   fleet executable and manifest;
+ *     default manifest configs/git4agents-contenders.yaml (ten contenders)
  *   MADGRIX_KEEP_WORKSPACES=1
  *   MADGRIX_WORK_ROOT=/tmp
  *   MADGRIX_AGENT_ENV_ALLOWLIST=NAME[,NAME...]  variables passed through to
@@ -47,16 +49,20 @@ import path from "node:path";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
+import { loadContenderIds } from "./lib/agentfleet-slots.mjs";
 import { gitAuthEnv, minimalEnv, parseAgentEnvAllowlist, pickEnv } from "./lib/child-env.mjs";
 
 const baseUrl = process.env.MADGRIX_BASE_URL?.replace(/\/$/, "");
 const taskId = process.env.MADGRIX_TASK_ID;
 const agentCommand = process.env.MADGRIX_AGENT_COMMAND;
 const agentServiceToken = process.env.MADGRIX_AGENT_SERVICE_TOKEN;
-const agentIds = (process.env.MADGRIX_AGENT_IDS ?? "agent-a,agent-b,agent-c")
-	.split(",")
-	.map((s) => s.trim())
-	.filter(Boolean);
+let agentIds;
+try {
+	agentIds = loadContenderIds();
+} catch (err) {
+	console.error(/** @type {Error} */ (err).message);
+	process.exit(2);
+}
 const keep = process.env.MADGRIX_KEEP_WORKSPACES === "1";
 const workRoot = process.env.MADGRIX_WORK_ROOT ?? os.tmpdir();
 
@@ -65,7 +71,7 @@ if (!baseUrl || !taskId || !agentCommand || !agentServiceToken) {
 	process.exit(2);
 }
 if (agentIds.length < 2) {
-	console.error("MADGRIX requires at least two concurrent agents; the competition demo should use three.");
+	console.error("MADGRIX requires at least two concurrent agents. The roster is the Agentfleet manifest (configs/git4agents-contenders.yaml).");
 	process.exit(2);
 }
 /** @type {string[]} */
@@ -251,6 +257,9 @@ async function ensurePushSubscription(repoName) {
 	return 'created';
 }
 
+/**
+ * @param {number} ms
+ */
 function sleep(ms) {
 	return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -265,7 +274,7 @@ async function pushWasApplied(contenderId, sha, timeoutMs) {
 	const deadline = Date.now() + timeoutMs;
 	for (;;) {
 		const context = await getJson(`${taskUrl}/context`);
-		const row = (context.contenders ?? []).find((c) => c.contender_id === contenderId);
+		const row = (context.contenders ?? []).find((/** @type {{ contender_id?: string, latest_commit?: string }} */ c) => c.contender_id === contenderId);
 		if (row?.latest_commit === sha) return true;
 		if (Date.now() >= deadline) return false;
 		await sleep(2000);

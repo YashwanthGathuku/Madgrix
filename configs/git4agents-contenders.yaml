@@ -1,0 +1,93 @@
+# Git4agents contender roster, in Agentfleet's swarm manifest format.
+# Launch count is the length of `agents`. Add or remove an agent (and its
+# task) here; do not add another launch script. Agentfleet is not vendored:
+# `fleet validate --config` this file and read summary.agent_ids.
+version: "1.0"
+name: git4agents-contenders
+endpoints:
+  local:
+    provider: mock
+    base_url: http://127.0.0.1:9/v1
+    model_name: mock
+agents:
+  - id: agent-01
+    role: contender
+    model_ref: local
+    system_prompt: Change only the paths named in the Git4agents claim.
+  - id: agent-02
+    role: contender
+    model_ref: local
+    system_prompt: Change only the paths named in the Git4agents claim.
+  - id: agent-03
+    role: contender
+    model_ref: local
+    system_prompt: Change only the paths named in the Git4agents claim.
+  - id: agent-04
+    role: contender
+    model_ref: local
+    system_prompt: Change only the paths named in the Git4agents claim.
+  - id: agent-05
+    role: contender
+    model_ref: local
+    system_prompt: Change only the paths named in the Git4agents claim.
+  - id: agent-06
+    role: contender
+    model_ref: local
+    system_prompt: Change only the paths named in the Git4agents claim.
+  - id: agent-07
+    role: contender
+    model_ref: local
+    system_prompt: Change only the paths named in the Git4agents claim.
+  - id: agent-08
+    role: contender
+    model_ref: local
+    system_prompt: Change only the paths named in the Git4agents claim.
+  - id: agent-09
+    role: contender
+    model_ref: local
+    system_prompt: Change only the paths named in the Git4agents claim.
+  - id: agent-10
+    role: contender
+    model_ref: local
+    system_prompt: Change only the paths named in the Git4agents claim.
+tasks:
+  - id: work-agent-01
+    assigned_agent: agent-01
+    instruction: Produce a candidate.
+    expected_output: out/agent-01.md
+  - id: work-agent-02
+    assigned_agent: agent-02
+    instruction: Produce a candidate.
+    expected_output: out/agent-02.md
+  - id: work-agent-03
+    assigned_agent: agent-03
+    instruction: Produce a candidate.
+    expected_output: out/agent-03.md
+  - id: work-agent-04
+    assigned_agent: agent-04
+    instruction: Produce a candidate.
+    expected_output: out/agent-04.md
+  - id: work-agent-05
+    assigned_agent: agent-05
+    instruction: Produce a candidate.
+    expected_output: out/agent-05.md
+  - id: work-agent-06
+    assigned_agent: agent-06
+    instruction: Produce a candidate.
+    expected_output: out/agent-06.md
+  - id: work-agent-07
+    assigned_agent: agent-07
+    instruction: Produce a candidate.
+    expected_output: out/agent-07.md
+  - id: work-agent-08
+    assigned_agent: agent-08
+    instruction: Produce a candidate.
+    expected_output: out/agent-08.md
+  - id: work-agent-09
+    assigned_agent: agent-09
+    instruction: Produce a candidate.
+    expected_output: out/agent-09.md
+  - id: work-agent-10
+    assigned_agent: agent-10
+    instruction: Produce a candidate.
+    expected_output: out/agent-10.md

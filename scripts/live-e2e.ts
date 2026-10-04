@@ -26,8 +26,11 @@
  *   MADGRIX_DESTINATION_REPO       default baseline repo
  *   MADGRIX_QUEUE_ID               queue that receives per-repo `pushed` subscriptions
  *   MADGRIX_ARTIFACTS_NAMESPACE    default `default`
- *   MADGRIX_AGENT_IDS              default agent-a,agent-b,agent-c; enrolled at
- *                                  task creation, each with its own secret
+ *   MADGRIX_AGENT_IDS              overrides the Agentfleet roster; otherwise
+ *                                  summary.agent_ids from fleet validate of
+ *                                  configs/git4agents-contenders.yaml
+ *   MADGRIX_FLEET_BIN              fleet executable (default: fleet on PATH)
+ *   MADGRIX_FLEET_CONFIG           swarm manifest (default: that yaml)
  *   MADGRIX_EVENT_TIMEOUT_MS       default 60000
  *   MADGRIX_PROMOTION_TIMEOUT_MS   how long to poll the promotion's Workflow
  *                                  instance; default 900000 (15 minutes)
@@ -67,6 +70,7 @@ import { classifyPair } from "../src/lib/claims.ts";
 import { createCommitment } from "../src/lib/verifiers.ts";
 import { verifierReportPayload } from "../src/lib/verifier-keys.ts";
 import { SELECTOR_POLICY_VERSION, type ReferenceReport } from "../src/lib/types.ts";
+import { loadContenderIds } from "./lib/agentfleet-slots.mjs";
 import { minimalEnv, parseAgentEnvAllowlist, pickEnv } from "./lib/child-env.mjs";
 
 const env = process.env;
@@ -81,10 +85,13 @@ const intent = env.MADGRIX_INTENT;
 const behaviorContract = env.MADGRIX_BEHAVIOR_CONTRACT;
 const agentCommand = env.MADGRIX_AGENT_COMMAND;
 const hiddenCommand = env.MADGRIX_HIDDEN_TEST_COMMAND;
-const agentIds = (env.MADGRIX_AGENT_IDS ?? "agent-a,agent-b,agent-c")
-	.split(",")
-	.map((s) => s.trim())
-	.filter(Boolean);
+let agentIds: string[];
+try {
+	agentIds = loadContenderIds();
+} catch (err) {
+	console.error((err as Error).message);
+	process.exit(2);
+}
 const eventTimeoutMs = Number(env.MADGRIX_EVENT_TIMEOUT_MS ?? "60000");
 const promotionTimeoutMs = Number(env.MADGRIX_PROMOTION_TIMEOUT_MS ?? "900000");
 /** Between two polls of the promotion's status. */
