@@ -41,10 +41,11 @@
  * token. See docs/SECURITY.md "Process environment boundaries".
  */
 
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
+import { fileURLToPath } from "node:url";
 
 import { gitAuthEnv, minimalEnv, parseAgentEnvAllowlist, pickEnv } from "./lib/child-env.mjs";
 
@@ -200,6 +201,51 @@ async function postJson(url, body, extraHeaders = {}) {
 	return data;
 }
 
+
+const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+
+/**
+ * Cloudflare accepts a per-repo subscription only. The event name on the
+ * subscription is `pushed`; the queue message the Worker normalizes is still
+ * type `cf.artifacts.repo.pushed` with source.type `artifacts.repo`.
+ * Namespace-wide and "*" repo names are rejected by the API.
+ * Subscribe after the Worker has created the contender repo and before the
+ * agent push. Skipped when MADGRIX_QUEUE_ID is unset (local tests).
+ *
+ * @param {string} repoName
+ */
+async function ensurePushSubscription(repoName) {
+	const queueId = process.env.MADGRIX_QUEUE_ID;
+	if (!queueId) return;
+	if (!/^[A-Za-z0-9._-]{1,128}$/.test(repoName)) {
+		throw new Error("refusing to subscribe a repo name that is not a single Artifacts path segment");
+	}
+	const namespace = process.env.MADGRIX_ARTIFACTS_NAMESPACE || "default";
+	const body = {
+		name: `madgrix-${repoName}`.slice(0, 63),
+		enabled: true,
+		source: { type: "artifacts.repo", namespace, repo_name: repoName },
+		events: ["pushed"],
+		destination: { type: "queues.queue", queue_id: queueId },
+	};
+	const tmp = path.join(os.tmpdir(), `madgrix-sub-${process.pid}-${repoName}.json`);
+	await writeFile(tmp, JSON.stringify(body), { mode: 0o600 });
+	try {
+		await capture(
+			"cf",
+			["queues", "subscriptions", "create", "--body", JSON.stringify(body)],
+			{ cwd: repoRoot, env: minimalEnv() },
+		);
+	} catch (err) {
+		const raw = err instanceof Error ? err.message : String(err);
+		if (/already exists|duplicate|409/i.test(raw)) return;
+		const redacted = raw.split(queueId).join("[id]").replace(/https:\/\/\S+/g, "[url]").replace(/[0-9a-f]{16,}/gi, "[id]").replace(/art_v2_\S+/g, "[token]");
+		throw new Error(`push subscription for ${repoName} failed: ${redacted}`);
+	} finally {
+		await rm(tmp, { force: true });
+	}
+}
+
 const taskUrl = `${baseUrl}/tasks/${encodeURIComponent(taskId)}`;
 const context = await getJson(`${taskUrl}/context`);
 const task = context.task;
@@ -247,6 +293,8 @@ const runOne = async (agentId) => {
 		throw new Error(`invalid contender response for ${agentId}`);
 	}
 
+	await ensurePushSubscription(forkRepo);
+
 	const dir = await mkdtemp(path.join(workRoot, `madgrix-${agentId.replace(/[^A-Za-z0-9._-]/g, "_")}-`));
 	try {
 		await run("git", ["clone", "--quiet", "--single-branch", "--branch", "main", remote, dir], { env: gitAuthEnv(token) });
@@ -262,7 +310,7 @@ const runOne = async (agentId) => {
 			MADGRIX_BASELINE_SHA: baseline,
 			MADGRIX_WORKSPACE: dir,
 		});
-		console.error(`[madgrix] starting ${agentId} in isolated repo ${forkRepo}`);
+		console.error(`[Git4agents] starting ${agentId} in isolated repo ${forkRepo}`);
 		await run("bash", ["-c", agentCommand], { cwd: dir, env });
 
 		const dirty = await capture("git", ["status", "--porcelain"], { cwd: dir });
@@ -278,7 +326,7 @@ const runOne = async (agentId) => {
 			throw new Error(`${agentId} produced no candidate change`);
 		}
 		await run("git", ["push", "--quiet", "origin", "HEAD:refs/heads/main"], { cwd: dir, env: gitAuthEnv(token) });
-		console.error(`[madgrix] ${agentId} pushed ${candidateSha.slice(0, 12)}`);
+		console.error(`[Git4agents] ${agentId} pushed ${candidateSha.slice(0, 12)}`);
 		return {
 			agent_id: agentId,
 			contender_id: contenderId,
@@ -301,7 +349,7 @@ const started = Date.now();
 const settled = await Promise.allSettled(agentIds.map(runOne));
 const failed = settled.filter((r) => r.status === "rejected");
 if (failed.length) {
-	for (const f of failed) console.error("[madgrix] contender failed:", f.reason);
+	for (const f of failed) console.error("[Git4agents] contender failed:", f.reason);
 	process.exit(1);
 }
 const candidates = settled.flatMap((r) => (r.status === "fulfilled" ? [r.value] : []));

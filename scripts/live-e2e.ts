@@ -24,6 +24,8 @@
  *
  * Optional:
  *   MADGRIX_DESTINATION_REPO       default baseline repo
+ *   MADGRIX_QUEUE_ID               queue that receives per-repo `pushed` subscriptions
+ *   MADGRIX_ARTIFACTS_NAMESPACE    default `default`
  *   MADGRIX_AGENT_IDS              default agent-a,agent-b,agent-c; enrolled at
  *                                  task creation, each with its own secret
  *   MADGRIX_EVENT_TIMEOUT_MS       default 60000
@@ -213,7 +215,7 @@ const verifiers = [
 	makeVerifier("verifier-minimality", "minimality"),
 ];
 
-console.error("[madgrix-live] 1/9 freeze task and verifier identities");
+console.error("[Git4agents] 1/9 freeze task and verifier identities");
 const created = await requestJson(`${baseUrl}/tasks`, {
 	token: controlToken,
 	body: {
@@ -238,7 +240,7 @@ if (!agentSecrets || !agentIds.every((id) => typeof agentSecrets[id] === "string
 }
 if (!taskId || !taskHash) throw new Error("task creation returned no task identity");
 
-console.error("[madgrix-live] 2/9 commit blind-verifier references before candidates exist");
+console.error("[Git4agents] 2/9 commit blind-verifier references before candidates exist");
 for (const v of verifiers) {
 	const commitment = await createCommitment(
 		v.reference,
@@ -264,7 +266,7 @@ for (const v of verifiers) {
 
 const temp = await mkdtemp(path.join(os.tmpdir(), "madgrix-live-"));
 try {
-	console.error("[madgrix-live] 3/9 launch real coding agents concurrently");
+	console.error("[Git4agents] 3/9 launch real coding agents concurrently");
 	const contenderResultPath = path.join(temp, "contenders.json");
 	// Agent zone: the AGENT token only. The runner forwards the allowlisted
 	// variables, and nothing else, to the agent command.
@@ -286,6 +288,10 @@ try {
 			GIT_AUTHOR_NAME: env.GIT_AUTHOR_NAME,
 			GIT_AUTHOR_EMAIL: env.GIT_AUTHOR_EMAIL,
 			MADGRIX_RESULT_PATH: contenderResultPath,
+			// Per-repo Artifacts subscription. The API rejects a namespace-wide
+			// source, so the runner subscribes each contender repo before push.
+			MADGRIX_QUEUE_ID: env.MADGRIX_QUEUE_ID,
+			MADGRIX_ARTIFACTS_NAMESPACE: env.MADGRIX_ARTIFACTS_NAMESPACE,
 		}),
 	});
 	const contenderRun = JSON.parse(await readFile(contenderResultPath, "utf8"));
@@ -302,7 +308,7 @@ try {
 		throw new Error("real contender run produced fewer than two candidates");
 	}
 
-	console.error("[madgrix-live] 4/9 wait for real Artifacts push events through Queue → TaskAuthority");
+	console.error("[Git4agents] 4/9 wait for real Artifacts push events through Queue → TaskAuthority");
 	const deadline = Date.now() + eventTimeoutMs;
 	for (;;) {
 		const context = await requestJson(`${baseUrl}/tasks/${encodeURIComponent(taskId)}/context`, {
@@ -322,7 +328,7 @@ try {
 		await sleep(1000);
 	}
 
-	console.error("[madgrix-live] 5/9 evaluate immutable candidates in the independent evaluation domain");
+	console.error("[Git4agents] 5/9 evaluate immutable candidates in the independent evaluation domain");
 	const evalResults = await Promise.all(
 		candidates.map(async (candidate, i) => {
 			const resultPath = path.join(temp, `evaluation-${i}.json`);
@@ -349,7 +355,7 @@ try {
 		}),
 	);
 
-	console.error("[madgrix-live] 6/9 reveal blind references and submit signed independent verdicts");
+	console.error("[Git4agents] 6/9 reveal blind references and submit signed independent verdicts");
 	await requestJson(`${baseUrl}/tasks/${encodeURIComponent(taskId)}/verifiers/labels`, {
 		token: controlToken,
 		body: { candidate_shas: candidates.map((c) => c.candidate_sha) },
@@ -421,7 +427,7 @@ try {
 		};
 	});
 
-	console.error("[madgrix-live] 7/9 execute Verdict Seam and issue exact-state permit");
+	console.error("[Git4agents] 7/9 execute Verdict Seam and issue exact-state permit");
 	const verdictResponse = await requestJson(`${baseUrl}/tasks/${encodeURIComponent(taskId)}/verdict`, {
 		token: controlToken,
 		body: { candidates: ranked, destination_repo: destinationRepo },
@@ -434,7 +440,7 @@ try {
 	if (winnerIndex < 0) throw new Error("verdict winner is not in the contender set");
 	const winner = candidates[winnerIndex];
 
-	console.error("[madgrix-live] 8/9 promote the exact reviewed commit to canonical Artifacts state");
+	console.error("[Git4agents] 8/9 promote the exact reviewed commit to canonical Artifacts state");
 	// POST /promote starts the permit's PromotionWorkflow instance (202); the
 	// promotion's answer is the instance's result once it is complete.
 	const started = await requestJson(`${baseUrl}/tasks/${encodeURIComponent(taskId)}/promote`, {
@@ -464,7 +470,7 @@ try {
 		throw new Error(`exact-state promotion failed: ${JSON.stringify(instance)}`);
 	}
 
-	console.error("[madgrix-live] 9/9 fetch the authority-signed bundle and verify it offline");
+	console.error("[Git4agents] 9/9 fetch the authority-signed bundle and verify it offline");
 	// The TaskAuthority signed the ship record at /promotion/finalize from its
 	// own state (amendment authority-signing-v1); nothing is built locally.
 	const bundle = await requestJson(
@@ -485,7 +491,9 @@ try {
 	console.log(
 		JSON.stringify(
 			{
+				name: "Git4agents",
 				status: "MADGRIX_LIVE_E2E_OK",
+				public_url: baseUrl,
 				task_id: taskId,
 				concurrent_agents: candidates.length,
 				winner: winner.candidate_sha,

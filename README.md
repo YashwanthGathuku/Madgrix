@@ -1,4 +1,4 @@
-# MADGRIX
+# Git4agents
 
 **A governed promotion protocol for autonomous software agents** — built on Cloudflare Workers, Artifacts, Queues, Durable Objects, Workflows, and Containers.
 

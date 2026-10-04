@@ -323,6 +323,9 @@ class BindingRepo implements ArtifactsRepo {
 
 	async log(opts?: { ref?: string; limit?: number; offset?: number }): Promise<CommitMetadata[]> {
 		const entries = await this.binding.log(opts);
+		// A just-created fork can answer log() with null instead of [] while
+		// its ref is published. That is an empty history, not a thrown 500.
+		if (!Array.isArray(entries)) return [];
 		return entries.map((e) => ({
 			hash: e.hash,
 			treeHash: e.treeHash,
@@ -339,8 +342,9 @@ class BindingRepo implements ArtifactsRepo {
 
 	/** Convenience over log({ ref, limit: 1 }); no direct binding equivalent. */
 	async getHead(ref: string = "main"): Promise<string | null> {
-		const entries = await this.binding.log({ ref, limit: 1 });
-		return entries.length > 0 ? entries[0].hash : null;
+		const entries = await this.log({ ref, limit: 1 });
+		const hash = entries[0]?.hash;
+		return typeof hash === "string" && hash.length > 0 ? hash : null;
 	}
 }
 
@@ -630,6 +634,55 @@ export async function handleClaim(env: Env, taskId: string, request: Request): P
 	return json(res.body, res.status);
 }
 
+
+/** Name an Artifacts/runtime error without echoing a remote URL or token. */
+function errorLabel(err: unknown): string {
+	const e = err as { name?: string; code?: string; message?: string };
+	const message = String(e?.message ?? err)
+		.replace(/https:\/\/\S+/g, "[url]")
+		.replace(/art_v2_\S+/g, "[token]");
+	return `${e?.name ?? "Error"}${e?.code ? " " + e.code : ""}: ${message}`.slice(0, 300);
+}
+
+/**
+ * Drop the long-lived token fork() just minted. Prefer its plaintext, then
+ * any still-active token id. Failures are logged and swallowed: the
+ * contender credential is minted afterwards, and a revoke error here was
+ * surfacing as HTTP 500 internal_error after the fork already existed.
+ */
+async function revokeForkCreationToken(repo: ArtifactsRepo, plaintext: string): Promise<void> {
+	try {
+		await repo.revokeToken(plaintext);
+		return;
+	} catch (err) {
+		console.error(`madgrix: revoke fork plaintext failed: ${errorLabel(err)}`);
+	}
+	try {
+		const tokens = await repo.listTokens();
+		await Promise.all(
+			tokens.filter((tok) => tok.state === "active").map((tok) => repo.revokeToken(tok.id).catch(() => false)),
+		);
+	} catch (err) {
+		console.error(`madgrix: revoke fork ids failed: ${errorLabel(err)}`);
+	}
+}
+
+/** A fork's main ref can lag the fork() response by a moment. Retry, then throw the last error. */
+async function readForkHead(repo: ArtifactsRepo): Promise<string | null> {
+	let last: unknown;
+	for (let attempt = 0; attempt < 4; attempt++) {
+		try {
+			const head = await repo.getHead();
+			if (head) return head;
+		} catch (err) {
+			last = err;
+		}
+		await new Promise((resolve) => setTimeout(resolve, 200 * 2 ** attempt));
+	}
+	if (last) throw last;
+	return null;
+}
+
 /** 200 for a contender that already exists: its record stands, no token. */
 function existingContender(record: ContenderRecord): Response {
 	return json({ contender_id: record.contender_id, fork_repo: record.fork_repo, created: false, token_issued: false });
@@ -693,6 +746,7 @@ export async function handleCreateContender(
 	const forkName = contenderRepoName(taskId, forkOpId);
 
 	const port = productionPort(env);
+	try {
 	const { repo, created, initialTokenPlaintext, viaImportFallback } = await forkIdempotent(
 		port,
 		state.task.baseline_repo,
@@ -758,11 +812,14 @@ export async function handleCreateContender(
 	} else if (created && initialTokenPlaintext !== null) {
 		// The fork-creation token has the binding default TTL (24h) — too
 		// long for a contender. Revoke it; the contender gets a ≤1h token.
-		await repo.revokeToken(initialTokenPlaintext);
+		// Revocation of a token minted in this same request can throw
+		// (ArtifactsError) even though the fork itself succeeded. That must
+		// not fail contender creation: the credential we return is a new one.
+		await revokeForkCreationToken(repo, initialTokenPlaintext);
 	}
 
 	const credentials = await issueContenderCredentials(port, forkName, 3600);
-	const latest_commit = await repo.getHead();
+	const latest_commit = await readForkHead(repo);
 	if (latest_commit !== state.task.baseline_commit) {
 		await repo.revokeToken(credentials.id);
 		return json({
@@ -811,6 +868,12 @@ export async function handleCreateContender(
 		},
 		created ? 201 : 200,
 	);
+	} catch (err) {
+		// The fork may already exist. Name the exception instead of collapsing
+		// it to internal_error; nothing secret is included.
+		console.error(`madgrix: POST /contenders failed: ${errorLabel(err)}`);
+		return json({ error: "contender_create_failed", detail: errorLabel(err) }, 500);
+	}
 }
 
 /** GET /tasks/:id/context — non-secret frozen task + work graph context. */
