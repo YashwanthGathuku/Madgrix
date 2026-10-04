@@ -343,8 +343,67 @@ export function combineSubagentBranches(repo, baseline, commits) {
  * @param {string} repo
  * @param {ReturnType<typeof loadForkCrew>} crew
  * @param {(sub: ReturnType<typeof loadForkCrew>["subs"][number], repo: string) => void} [runSub]
+ * @param {(repo: string, baseline: string) => void} [verify]
  */
-export function runCrewOnFork(repo, crew, runSub) {
+
+/** MIT commit of https://github.com/YashwanthGathuku/theustad branch claude/project-analysis-bugs-xdq0xz. */
+export const THEUSTAD_MIT_COMMIT = "7d021cbbfede6db8b37ae01e49cd89919f80535d";
+
+/**
+ * Gate the combined commit. `python theustad.py` runs on the frozen baseline
+ * with state and logs outside the agent workspace. Only exit 0 and
+ * `FINAL VERIFIED` may continue. Hook mode is not used.
+ *
+ * @param {string} repo
+ * @param {string} baseline
+ */
+export function verifyFrozenBaseline(repo, baseline) {
+	const root = process.env.MADGRIX_THEUSTAD_ROOT || path.join(repoRoot, "third_party/theustad");
+	const script = path.join(root, "theustad.py");
+	const python = process.env.MADGRIX_PYTHON || "python3";
+	const claim = path.join(repoRoot, "scripts/theustad-baseline-claim.py");
+	const check = path.join(repoRoot, "scripts/theustad-baseline-check.py");
+	const stateDir = mkdtempSync(path.join(os.tmpdir(), "madgrix-theustad-state-"));
+	const logDir = mkdtempSync(path.join(os.tmpdir(), "madgrix-theustad-logs-"));
+	const result = spawnSync(
+		python,
+		[
+			script,
+			"--repo",
+			repo,
+			"--cmd",
+			`${python} ${claim}`,
+			"--verifier",
+			`${python} ${check} ${baseline}`,
+			"--state-dir",
+			stateDir,
+			"--log",
+			logDir,
+			"--max-retries",
+			"0",
+			"--timeout",
+			"30",
+			"--no-color",
+		],
+		{
+			cwd: root,
+			encoding: "utf8",
+			timeout: 60_000,
+			env: minimalEnv({
+				PYTHONDONTWRITEBYTECODE: "1",
+				PYTHONUNBUFFERED: "1",
+			}),
+		},
+	);
+	const stdout = result.stdout ?? "";
+	const finalLine = stdout.match(/^FINAL \S+$/m)?.[0] ?? "no FINAL line";
+	if (result.error || (result.status ?? 1) !== 0 || finalLine !== "FINAL VERIFIED") {
+		const exit = result.error ? result.error.message : String(result.status ?? "signal");
+		throw new Error(`TheUstad blocked the combined commit: ${finalLine} (exit ${exit})`);
+	}
+}
+
+export function runCrewOnFork(repo, crew, runSub, verify = verifyFrozenBaseline) {
 	const baseline = git(repo, ["rev-parse", "HEAD"]).stdout.trim();
 	/** @type {Array<{ id: string, role: string, intent: string, paths: string[], sha: string, claim_work_id: string | null, files: string[] }>} */
 	const commits = [];
@@ -375,6 +434,7 @@ export function runCrewOnFork(repo, crew, runSub) {
 		});
 	}
 	git(repo, ["checkout", "main"]);
+	verify(repo, baseline);
 	const combined = combineSubagentBranches(repo, baseline, commits);
 	return { baseline, commits, ...combined };
 }

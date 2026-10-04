@@ -9,7 +9,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { after, describe, it } from "node:test";
 
-import { crewAgentIds, loadForkCrew, runCrewOnFork } from "../scripts/lib/fork-crew.mjs";
+import { crewAgentIds, loadForkCrew, runCrewOnFork, verifyFrozenBaseline } from "../scripts/lib/fork-crew.mjs";
 
 const dirs: string[] = [];
 
@@ -138,5 +138,21 @@ describe("fork crew", () => {
 		);
 		assert.notEqual(shared.trim(), "api-body");
 		assert.notEqual(shared.trim(), "ui-body");
+	});
+
+	it("does not write the combined commit when TheUstad does not verify", () => {
+		const repo = initFork();
+		const crew = loadForkCrew();
+		const head = git(repo, ["rev-parse", "HEAD"]);
+		assert.throws(
+			() =>
+				runCrewOnFork(repo, crew, undefined, (worktree) => {
+					verifyFrozenBaseline(worktree, "0".repeat(40));
+				}),
+			/TheUstad blocked the combined commit: FINAL FALSIFIED/,
+		);
+		assert.equal(git(repo, ["rev-parse", "HEAD"]), head);
+		assert.equal(git(repo, ["status", "--porcelain"]), "");
+		assert.equal(git(repo, ["rev-parse", "HEAD"]), head);
 	});
 });
