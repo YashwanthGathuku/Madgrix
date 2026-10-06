@@ -1,12 +1,15 @@
 /**
  * One parent fork, role-scoped sub-agents, one combined SHA.
  *
- * Agentfleet is proprietary. This module does not vendor it. The live runner
- * calls `fleet validate` on the manifest paired with the crew config.
+ * Agentfleet is proprietary. This module does not vendor it and does not
+ * ask it to run the sub-agents. MADGRIX checks the paired manifest itself:
+ * agent ids in order, roles, and the crew's path scopes.
  * configs/git4agents-fork-crew.yaml lists parent, sub-api, and sub-ui.
  * configs/git4agents-demo-composition.yaml lists parent, sub-api, sub-ui,
- * and sub-test, in that order. Roles and file areas come from the JSON
- * config, which we own. `MADGRIX_FLEET_CONFIG` overrides the pair.
+ * and sub-test, in that order. `MADGRIX_FLEET_CONFIG` overrides the pair.
+ * `fleet validate` runs only when `MADGRIX_FLEET_BIN` is set, as a roster
+ * cross-check. An older fleet that omits summary.agent_ids fails that
+ * explicit path. It does not fail the default path.
  *
  * Sub-agents do not get sibling repos. Each commits on its own worktree of the
  * parent fork, and those commands run concurrently. Disjoint edits, including
@@ -33,10 +36,9 @@ export const DEMO_COMPOSITION_CONFIG = path.join(repoRoot, "configs/demo-composi
 export const DEMO_COMPOSITION_FLEET_CONFIG = path.join(repoRoot, "configs/git4agents-demo-composition.yaml");
 
 /**
- * The fleet manifest whose summary.agent_ids must equal the crew, in order.
- * The demo JSON pairs with the four-agent manifest. Any other crew config
- * pairs with the two-sub-agent manifest. An explicit MADGRIX_FLEET_CONFIG
- * still wins at the call site.
+ * The manifest paired with a crew config. The demo JSON pairs with the
+ * four-agent manifest. Any other crew config pairs with the three-agent
+ * manifest. An explicit MADGRIX_FLEET_CONFIG still wins at the call site.
  *
  * @param {string} [crewConfig]
  * @returns {string}
@@ -151,24 +153,86 @@ export function crewAgentIds(crew) {
 }
 
 /**
- * Agentfleet must list the same ids, in crew order. Does not copy fleet source
- * and does not call `fleet run` (that would invoke a model).
+ * Agent ids and roles from a manifest we ship. The file is the flat
+ * `agents: - id / role` shape. This does not start Agentfleet.
  *
- * @param {{ parent: { id: string }, subs: { id: string }[] }} crew
+ * @param {string} manifestPath
+ * @returns {Array<{ id: string, role: string }>}
+ */
+export function manifestRoster(manifestPath) {
+	const text = readFileSync(manifestPath, "utf8");
+	/** @type {Array<{ id: string, role: string }>} */
+	const agents = [];
+	let inAgents = false;
+	/** @type {{ id: string, role?: string } | null} */
+	let current = null;
+	for (const line of text.split(/\r?\n/)) {
+		if (/^agents:\s*$/.test(line)) {
+			inAgents = true;
+			continue;
+		}
+		if (!inAgents) continue;
+		if (/^[A-Za-z]/.test(line)) break;
+		const id = /^ {2}- id: (\S+)\s*$/.exec(line);
+		if (id) {
+			if (current) throw new Error(`fleet manifest ${path.basename(manifestPath)} has an agent without a role`);
+			if (!AGENT_ID.test(id[1])) throw new Error(`fleet manifest has an agent id Git4agents cannot enroll`);
+			current = { id: id[1] };
+			continue;
+		}
+		const role = /^ {4}role: (\S+)\s*$/.exec(line);
+		if (role && current) {
+			current.role = role[1];
+			agents.push({ id: current.id, role: current.role });
+			current = null;
+		}
+	}
+	if (current) throw new Error(`fleet manifest ${path.basename(manifestPath)} has an agent without a role`);
+	if (agents.length < 2) throw new Error(`fleet manifest ${path.basename(manifestPath)} did not list at least two agents`);
+	const seen = new Set();
+	for (const agent of agents) {
+		if (seen.has(agent.id)) throw new Error(`fleet manifest repeats ${agent.id}`);
+		seen.add(agent.id);
+	}
+	return agents;
+}
+
+/**
+ * The configured crew must match the paired manifest: ids in order, roles,
+ * and a bounded path scope on every sub-agent. Agentfleet is not started
+ * unless MADGRIX_FLEET_BIN is set. That call only cross-checks the roster.
+ * It does not execute the sub-agents.
+ *
+ * @param {{ parent: { id: string, role: string }, subs: { id: string, role: string, paths: string[] }[] }} crew
  * @param {string} [fleetConfig]
  * @param {Record<string, string | undefined>} [env]
  */
 export function assertFleetRoster(crew, fleetConfig = DEFAULT_FORK_CREW_FLEET_CONFIG, env = process.env) {
-	const ids = loadContenderIds({
-		env: { ...env, MADGRIX_FLEET_CONFIG: fleetConfig, MADGRIX_AGENT_IDS: undefined },
-		configPath: fleetConfig,
-		fleetBin: env.MADGRIX_FLEET_BIN,
-	});
-	const expected = crewAgentIds(crew);
-	if (ids.join("\n") !== expected.join("\n")) {
-		throw new Error(`fleet validate roster is ${ids.join(", ")}; fork crew is ${expected.join(", ")}`);
+	const roster = manifestRoster(fleetConfig);
+	const expected = [{ id: crew.parent.id, role: crew.parent.role }, ...crew.subs.map((sub) => ({ id: sub.id, role: sub.role }))];
+	if (roster.map((agent) => `${agent.id} ${agent.role}`).join("\n") !== expected.map((agent) => `${agent.id} ${agent.role}`).join("\n")) {
+		throw new Error(
+			`manifest roster is ${roster.map((agent) => agent.id).join(", ")}; fork crew is ${expected.map((agent) => agent.id).join(", ")}`,
+		);
 	}
-	return ids;
+	for (const sub of crew.subs) {
+		if (!Array.isArray(sub.paths) || sub.paths.length === 0 || sub.paths.includes("**")) {
+			throw new Error(`fork crew ${sub.id} needs bounded path scopes`);
+		}
+	}
+	const bin = env.MADGRIX_FLEET_BIN;
+	if (typeof bin === "string" && bin.trim()) {
+		const checked = loadContenderIds({
+			env: { ...env, MADGRIX_FLEET_CONFIG: fleetConfig, MADGRIX_AGENT_IDS: undefined },
+			configPath: fleetConfig,
+			fleetBin: bin.trim(),
+		});
+		const ids = expected.map((agent) => agent.id);
+		if (checked.join("\n") !== ids.join("\n")) {
+			throw new Error(`fleet validate roster is ${checked.join(", ")}; fork crew is ${ids.join(", ")}`);
+		}
+	}
+	return expected.map((agent) => agent.id);
 }
 
 /**
