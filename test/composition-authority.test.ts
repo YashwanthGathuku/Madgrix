@@ -284,8 +284,13 @@ describe("composition route", () => {
 		assert.equal(page.status, 200);
 		assert.match(page.headers.get("content-type") ?? "", /text\/html/);
 		assert.match(html, /CONFLICTED/);
+		assert.match(html, /Live work graph/);
+		assert.match(html, /Resolution state: unresolved/);
+		assert.match(html, /Offline verification: not executed in this view/);
 		assert.match(html, /&lt;script&gt;alert\(1\)&lt;\/script&gt;/);
 		assert.doesNotMatch(html, /<script>alert/);
+		assert.doesNotMatch(html, /Fixture\/demo input/);
+		assert.doesNotMatch(html, /class="edge /);
 
 		const ordinary = await call(h, "POST", `/tasks/${h.taskId}/composition`, {
 			token: TOKENS.control,

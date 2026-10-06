@@ -83,6 +83,7 @@ import { AGENT_ID_PATTERN, evaluationBases, resolveAgentBySecret, taskHashFor, t
 import type { PromotionResult, RebaseResult } from "../lib/git-promotion.ts";
 import { computePermitId, TaskAuthority } from "../do/TaskAuthority.ts";
 import { PromotionContainer } from "../do/PromotionContainer.ts";
+import { renderWorkGraphPage } from "./work-graph-page.ts";
 
 /** Re-exported so the runtime can register the Durable Object class from
  *  the entry module (classic DO wiring). */
@@ -919,76 +920,16 @@ export async function handleTaskContext(env: Env, taskId: string, request: Reque
 	});
 }
 
-function escapeHtml(value: string): string {
-	return value.replace(/[&<>"']/g, (ch) => {
-		if (ch === "&") return "&amp;";
-		if (ch === "<") return "&lt;";
-		if (ch === ">") return "&gt;";
-		if (ch === '"') return "&quot;";
-		return "&#39;";
-	});
-}
-
 /**
- * GET /tasks/:id/graph — a small HTML view of the same context the API returns.
- * It does not fetch other services and it does not include agent secrets.
+ * GET /tasks/:id/graph — one HTML page of task-authority state.
+ * Same auth as context. It does not classify claims or verify a bundle,
+ * and it does not include agent secrets.
  */
 export async function handleWorkGraph(env: Env, taskId: string, request: Request): Promise<Response> {
 	if (!(await requireAgentOrControl(request, env))) return json({ error: "task_context_auth_required" }, 401);
 	const read = await readTaskState(env, taskId);
 	if (!read.ok) return json(read.body, read.status);
-	const state = read.state;
-	const composition = state.composition;
-	const claims = state.claims
-		.map(
-			(claim) =>
-				`<li><code>${escapeHtml(claim.agent)}</code> ${escapeHtml(claim.work_id)} ` +
-				`<span>${escapeHtml(claim.status)}</span> ${escapeHtml(claim.scope.paths.join(", "))} ` +
-				`— ${escapeHtml(claim.intent.behavior.join("; "))}</li>`,
-		)
-		.join("");
-	const contenders = Object.values(state.contenders)
-		.map(
-			(row) =>
-				`<li><code>${escapeHtml(row.agent_id)}</code> ${escapeHtml(row.status)} ` +
-				`commit <code>${escapeHtml(row.latest_commit ?? "none")}</code></li>`,
-		)
-		.join("");
-	const conflicts = (state.conflict_reports ?? [])
-		.map(
-			(report) =>
-				`<li>${escapeHtml(report.risk)} ${escapeHtml(report.claim_a)} × ${escapeHtml(report.claim_b)} — ${escapeHtml(report.explanation)}</li>`,
-		)
-		.join("");
-	const files = (composition?.files ?? [])
-		.map((file) => {
-			const sides = file.sides
-				.map(
-					(side) =>
-						`<p><code>${escapeHtml(side.agent_id)}</code> ${escapeHtml(side.intent)}<pre>${escapeHtml(side.excerpt)}</pre></p>`,
-				)
-				.join("");
-			return `<section><h3>${escapeHtml(file.path)}</h3><p>${escapeHtml(file.classification)}</p>${sides}</section>`;
-		})
-		.join("");
-	const html = `<!doctype html>
-<html lang="en">
-<meta charset="utf-8">
-<title>${escapeHtml(state.task.task_id)} work graph</title>
-<style>
-  body { font: 16px/1.45 "Iowan Old Style", Palatino, serif; margin: 2.5rem auto; max-width: 42rem; color: #1c1915; background: #f6f1e7; }
-  code, pre { font-family: ui-monospace, monospace; font-size: 0.85em; }
-  pre { white-space: pre-wrap; background: #fff; padding: 0.6rem; }
-  h1 { font-weight: 500; letter-spacing: -0.02em; }
-</style>
-<h1>${escapeHtml(state.task.intent)}</h1>
-<p>Status ${escapeHtml(state.task_status)}. Composition ${escapeHtml(composition?.status ?? "none")}.
-Candidate <code>${escapeHtml(composition?.candidate_sha ?? "none")}</code>.</p>
-<h2>Claims</h2><ul>${claims || "<li>none</li>"}</ul>
-<h2>Contenders</h2><ul>${contenders || "<li>none</li>"}</ul>
-<h2>Potential conflicts</h2><ul>${conflicts || "<li>none</li>"}</ul>
-<h2>Composition files</h2>${files || "<p>none</p>"}
-</html>`;
+	const html = renderWorkGraphPage(read.state);
 	return new Response(html, { status: 200, headers: { "content-type": "text/html; charset=utf-8" } });
 }
 

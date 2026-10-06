@@ -197,7 +197,8 @@ describe("fork crew", () => {
 
 	it("runs the two sub-agent commands at the same time", async () => {
 		const repo = initFork();
-		const stamp = path.join(tmpdir(), `madgrix-stamp-${Date.now()}-${Math.random().toString(16).slice(2)}`);
+		// Forward slashes survive `bash -c` on Windows. See demo-composition.test.ts.
+		const stamp = path.join(tmpdir(), `madgrix-stamp-${Date.now()}-${Math.random().toString(16).slice(2)}`).replace(/\\/g, "/");
 		const crew = loadForkCrew();
 		for (const sub of crew.subs) {
 			const dir = sub.id === "sub-api" ? "src/api" : "src/ui";
