@@ -256,3 +256,5 @@ What this integration keeps:
 - The demo roster is `configs/git4agents-demo-composition.yaml` (`parent`, `sub-api`, `sub-ui`, `sub-test`). MADGRIX checks it. Agentfleet is an extra roster cross-check only when `MADGRIX_FLEET_BIN` is set. It does not execute the sub-agents. The sibling contender swarm still needs `summary.agent_ids` or `MADGRIX_AGENT_IDS`.
 
 The baseline risks that said typecheck was red, that the container image was unbuilt because Docker was absent, and that P0-G was open, describe `4d979059` and the passes named above them. They are not the status of this section. P0-G is closed locally by the composition record, the scan, and the container scan. It is **NOT VERIFIED** on Cloudflare.
+
+A later local `npm run build` from an LF archive of `d45a7296613f629bdf26af28c8b959d166c8c68f` produced image `cloudflare-build/0e7aaa6dd861/madgrix-promotion:63f515387052`. `docker image inspect` reported id `sha256:e39ad5e3cf0ca5ac02743156e51884ee1eb036cccdb3bd01132ebda3b07f84f6`. The image was not started and not deployed. Details are in `docs/FINAL_INTEGRATION_REPORT.md`.

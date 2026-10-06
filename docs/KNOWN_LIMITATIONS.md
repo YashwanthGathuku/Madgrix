@@ -8,7 +8,7 @@ Older counts stay with their SHAs. The 296-test record belongs to `git4agents/co
 
 ## Not a Cloudflare result
 
-Nothing in this SHA was deployed. `live:e2e` was not run. On 2026-10-06 a readiness session saw `GET https://madgrix.ygathuku96.workers.dev/` return 404 `not_found`. That response does not name a SHA. It is **NOT VERIFIED** for this tree. `npm run build` did not produce a container image. The Worker bundle step finished and the image step lost the Docker engine. That failure is in `docs/FINAL_INTEGRATION_REPORT.md`. It is not a Cloudflare run.
+Nothing in this SHA was deployed. `live:e2e` was not run. On 2026-10-06 a readiness session saw `GET https://madgrix.ygathuku96.workers.dev/` return 404 `not_found`. That response does not name a SHA. It is **NOT VERIFIED** for this tree. A later `npm run build` from an LF archive produced a local image, `cloudflare-build/0e7aaa6dd861/madgrix-promotion:63f515387052`. That image was not started. The command log is `docs/FINAL_INTEGRATION_REPORT.md`. A local image is not a Cloudflare run.
 
 ## Composition
 
