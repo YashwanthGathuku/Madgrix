@@ -335,17 +335,6 @@ export function combineSubagentBranches(repo, baseline, commits) {
 	return { sha, overlap, recordPath: RECORD_PATH, resolution: record.resolution };
 }
 
-/**
- * Run each sub-agent command on its own branch of `repo`, then combine.
- * `runSub` may record a claim_work_id on the sub object. It must not create
- * another repo.
- *
- * @param {string} repo
- * @param {ReturnType<typeof loadForkCrew>} crew
- * @param {(sub: ReturnType<typeof loadForkCrew>["subs"][number], repo: string) => void} [runSub]
- * @param {(repo: string, baseline: string) => void} [verify]
- */
-
 /** MIT commit of https://github.com/YashwanthGathuku/theustad branch claude/project-analysis-bugs-xdq0xz. */
 export const THEUSTAD_MIT_COMMIT = "7d021cbbfede6db8b37ae01e49cd89919f80535d";
 
@@ -403,6 +392,16 @@ export function verifyFrozenBaseline(repo, baseline) {
 	}
 }
 
+/**
+ * Run each sub-agent command on its own branch of `repo`, then combine.
+ * `runSub` may record a claim_work_id on the sub object. It must not create
+ * another repo.
+ *
+ * @param {string} repo
+ * @param {ReturnType<typeof loadForkCrew>} crew
+ * @param {(sub: ReturnType<typeof loadForkCrew>["subs"][number], repo: string) => void} [runSub]
+ * @param {(repo: string, baseline: string) => void} [verify]
+ */
 export function runCrewOnFork(repo, crew, runSub, verify = verifyFrozenBaseline) {
 	const baseline = git(repo, ["rev-parse", "HEAD"]).stdout.trim();
 	/** @type {Array<{ id: string, role: string, intent: string, paths: string[], sha: string, claim_work_id: string | null, files: string[] }>} */
