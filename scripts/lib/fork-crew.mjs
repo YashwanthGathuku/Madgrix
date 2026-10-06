@@ -5,13 +5,15 @@
  * calls `fleet validate` on configs/git4agents-fork-crew.yaml. Roles and file
  * areas come from configs/git4agents-fork-crew.json, which we own.
  *
- * Sub-agents do not get sibling repos. Each commits on a branch of the parent
- * fork. Disjoint edits become one merge commit that contains both. Overlapping
- * files are not silently resolved and neither intent is dropped: the combined
- * commit keeps conflict markers for those files and a record of both claims.
+ * Sub-agents do not get sibling repos. Each commits on its own worktree of the
+ * parent fork, and those commands run concurrently. Disjoint edits, including
+ * non-overlapping lines of one file, become one COMPOSED commit. Overlapping
+ * lines are CONFLICTED: no commit is written, neither side is dropped, and the
+ * result is not a candidate. A resolver may later write a new commit, which is
+ * a new candidate and still has to be evaluated.
  */
 
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -27,6 +29,7 @@ export const DEFAULT_FORK_CREW_FLEET_CONFIG = path.join(repoRoot, "configs/git4a
 
 const AGENT_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 const RECORD_PATH = ".madgrix/subagent-intents.json";
+const CONFLICT_PATH = ".madgrix/conflict.json";
 
 /**
  * @param {string} glob
@@ -251,31 +254,38 @@ function threeWayMerge(base, ours, theirs) {
 }
 
 /**
- * @param {{ id: string, intent: string, text: string }[]} parts
+ * @typedef {{ id: string, role: string, intent: string, paths: string[], sha: string, claim_work_id?: string | null, files?: string[] }} SubCommit
  */
-function conflictText(parts) {
-	const lines = parts.map((part, i) => {
-		const marker = i === 0 ? `<<<<<<< ${part.id}` : "=======";
-		return `${marker}\n# intent: ${part.intent}\n${part.text.endsWith("\n") ? part.text : `${part.text}\n`}`;
-	});
-	const last = parts[parts.length - 1];
-	return `${lines.join("")}>>>>>>> ${last.id}\n# intent: ${last.intent}\n`;
+
+/**
+ * @param {SubCommit[]} commits
+ */
+function claimRecord(commits) {
+	return commits.map((commit) => ({
+		id: commit.id,
+		role: commit.role,
+		intent: commit.intent,
+		paths: commit.paths,
+		commit: commit.sha,
+		claim_work_id: commit.claim_work_id ?? null,
+	}));
 }
 
 /**
  * @param {string} repo
  * @param {string} baseline
- * @param {Array<{ id: string, role: string, intent: string, paths: string[], sha: string, claim_work_id?: string | null, files?: string[] }>} commits
+ * @param {SubCommit[]} commits
+ * @returns {{ owners: Map<string, SubCommit[]>, conflicts: Array<{ path: string, group: SubCommit[] }> }}
  */
-export function combineSubagentBranches(repo, baseline, commits) {
+function classifyEdits(repo, baseline, commits) {
 	if (commits.length < 2) throw new Error("combine needs at least two sub-agent commits");
-	/** @type {Map<string, typeof commits>} */
+	/** @type {Map<string, SubCommit[]>} */
 	const owners = new Map();
 	for (const commit of commits) {
 		const names = git(repo, ["diff", "--name-only", baseline, commit.sha]).stdout.split("\n").filter(Boolean);
 		if (names.length === 0) throw new Error(`${commit.id} changed no files`);
 		for (const file of names) {
-			if (file === RECORD_PATH) continue;
+			if (file === RECORD_PATH || file === CONFLICT_PATH || file.startsWith(".madgrix/sides/")) continue;
 			if (!pathInScope(file, commit.paths)) {
 				throw new Error(`${commit.id} changed ${file}, which is outside its role scope`);
 			}
@@ -284,10 +294,123 @@ export function combineSubagentBranches(repo, baseline, commits) {
 			owners.set(file, list);
 		}
 	}
+	/** @type {Array<{ path: string, group: SubCommit[] }>} */
+	const conflicts = [];
+	for (const [file, group] of owners) {
+		if (group.length < 2) continue;
+		if (mergeDisjointEdits(repo, baseline, file, group) === null) conflicts.push({ path: file, group });
+	}
+	return { owners, conflicts };
+}
+
+/**
+ * Control-plane composition record. The runner writes it into the result
+ * file. live-e2e posts it with the control token. A coding agent never
+ * receives that token, and the resolver does not receive it either.
+ * Conflict side text is shortened to the display excerpt.
+ *
+ * @param {{ status: "COMPOSED" | "CONFLICTED" | "RESOLVED", baseline: string, commits: SubCommit[], conflict: { files: Array<{ path: string, classification: string, sides: Array<{ agent_id: string, role: string, intent: string, sha: string, text?: string }> }> } | null, sha: string | null, contender_id: string }} input
+ */
+export function authorityComposition(input) {
+	const files = (input.conflict?.files ?? []).map((file) => ({
+		path: file.path,
+		classification: file.classification,
+		sides: file.sides.map((side) => ({
+			agent_id: side.agent_id,
+			role: side.role,
+			intent: side.intent,
+			sha: side.sha,
+			excerpt: typeof side.text === "string" ? side.text.slice(0, 400) : "",
+		})),
+	}));
+	return {
+		status: input.status,
+		contender_id: input.contender_id,
+		baseline: input.baseline,
+		agents: input.commits.map((commit) => ({
+			id: commit.id,
+			role: commit.role,
+			intent: commit.intent,
+			sha: commit.sha,
+			paths: commit.paths,
+			claim_work_id: commit.claim_work_id ?? null,
+		})),
+		contributing_shas: input.commits.map((commit) => commit.sha),
+		files,
+		candidate_sha: input.status === "CONFLICTED" ? null : input.sha,
+	};
+}
+
+/**
+ * Resolver input. Side bodies stay here; the authority record keeps excerpts.
+ *
+ * @param {string} repo
+ * @param {string} baseline
+ * @param {SubCommit[]} commits
+ * @param {Array<{ path: string, group: SubCommit[] }>} conflicts
+ */
+function conflictRecord(repo, baseline, commits, conflicts) {
+	return {
+		status: /** @type {const} */ ("CONFLICTED"),
+		baseline,
+		agents: claimRecord(commits),
+		contributing_shas: commits.map((commit) => commit.sha),
+		files: conflicts.map((conflict) => ({
+			path: conflict.path,
+			classification: "textual-line-overlap",
+			sides: conflict.group.map((owner) => ({
+				agent_id: owner.id,
+				role: owner.role,
+				intent: owner.intent,
+				sha: owner.sha,
+				text: blobText(repo, owner.sha, conflict.path),
+			})),
+		})),
+	};
+}
+
+/**
+ * @param {string} repo
+ * @param {string} baseline
+ * @param {SubCommit[]} commits
+ * @param {Record<string, unknown>} record
+ * @param {string} message
+ */
+function commitIndex(repo, baseline, commits, record, message) {
+	mkdirSync(path.join(repo, ".madgrix"), { recursive: true });
+	writeFileSync(path.join(repo, RECORD_PATH), `${JSON.stringify(record, null, 2)}\n`);
+	git(repo, ["add", "--", RECORD_PATH]);
+	const tree = git(repo, ["write-tree"]).stdout.trim();
+	const parentArgs = ["-p", baseline, ...commits.flatMap((commit) => ["-p", commit.sha])];
+	const sha = git(repo, ["commit-tree", tree, ...parentArgs, "-m", message]).stdout.trim();
+	git(repo, ["checkout", "-B", "main", sha]);
+	return sha;
+}
+
+/**
+ * COMPOSED writes one commit whose parents are the baseline and every
+ * sub-agent commit. CONFLICTED writes nothing: main stays at the baseline,
+ * and the return value is the only conflict object.
+ *
+ * @param {string} repo
+ * @param {string} baseline
+ * @param {SubCommit[]} commits
+ */
+export function combineSubagentBranches(repo, baseline, commits) {
+	const { owners, conflicts } = classifyEdits(repo, baseline, commits);
+	if (conflicts.length > 0) {
+		const conflict = conflictRecord(repo, baseline, commits, conflicts);
+		return {
+			status: /** @type {const} */ ("CONFLICTED"),
+			sha: null,
+			overlap: conflicts.map((conflict) => conflict.path),
+			recordPath: null,
+			resolution: /** @type {const} */ ("CONFLICTED"),
+			conflict,
+		};
+	}
 	git(repo, ["checkout", "-B", "main", baseline]);
 	git(repo, ["read-tree", baseline]);
-	/** @type {string[]} */
-	const overlap = [];
 	for (const [file, group] of owners) {
 		mkdirSync(path.dirname(path.join(repo, file)), { recursive: true });
 		if (group.length === 1) {
@@ -295,44 +418,32 @@ export function combineSubagentBranches(repo, baseline, commits) {
 			continue;
 		}
 		const merged = mergeDisjointEdits(repo, baseline, file, group);
-		if (merged !== null) {
-			writeFileSync(path.join(repo, file), merged);
-			git(repo, ["add", "--", file]);
-			continue;
-		}
-		overlap.push(file);
-		const parts = group.map((owner) => ({
-			id: owner.id,
-			intent: owner.intent,
-			text: blobText(repo, owner.sha, file),
-		}));
-		writeFileSync(path.join(repo, file), conflictText(parts));
+		if (merged === null) throw new Error(`combine lost a conflict on ${file}`);
+		writeFileSync(path.join(repo, file), merged);
 		git(repo, ["add", "--", file]);
 	}
 	const record = {
 		parent_fork: true,
-		resolution: overlap.length === 0 ? "combined" : "conflict-both-intents-kept",
-		overlap,
-		claims: commits.map((commit) => ({
-			id: commit.id,
-			role: commit.role,
-			intent: commit.intent,
-			paths: commit.paths,
-			commit: commit.sha,
-			claim_work_id: commit.claim_work_id ?? null,
-		})),
+		status: "COMPOSED",
+		resolution: "COMPOSED",
+		overlap: /** @type {string[]} */ ([]),
+		claims: claimRecord(commits),
 	};
-	mkdirSync(path.join(repo, ".madgrix"), { recursive: true });
-	writeFileSync(path.join(repo, RECORD_PATH), `${JSON.stringify(record, null, 2)}\n`);
-	git(repo, ["add", "--", RECORD_PATH]);
-	const tree = git(repo, ["write-tree"]).stdout.trim();
-	const parentArgs = ["-p", baseline, ...commits.flatMap((commit) => ["-p", commit.sha])];
-	const message = overlap.length
-		? `MADGRIX conflict: both intents kept\n\n${commits.map((commit) => `${commit.id}: ${commit.intent}`).join("\n")}`
-		: `MADGRIX combine\n\n${commits.map((commit) => `${commit.id}: ${commit.intent}`).join("\n")}`;
-	const sha = git(repo, ["commit-tree", tree, ...parentArgs, "-m", message]).stdout.trim();
-	git(repo, ["checkout", "-B", "main", sha]);
-	return { sha, overlap, recordPath: RECORD_PATH, resolution: record.resolution };
+	const sha = commitIndex(
+		repo,
+		baseline,
+		commits,
+		record,
+		`MADGRIX compose\n\n${commits.map((commit) => `${commit.id}: ${commit.intent}`).join("\n")}`,
+	);
+	return {
+		status: /** @type {const} */ ("COMPOSED"),
+		sha,
+		overlap: /** @type {string[]} */ ([]),
+		recordPath: RECORD_PATH,
+		resolution: /** @type {const} */ ("COMPOSED"),
+		conflict: null,
+	};
 }
 
 /** MIT commit of https://github.com/YashwanthGathuku/theustad branch claude/project-analysis-bugs-xdq0xz. */
@@ -393,67 +504,155 @@ export function verifyFrozenBaseline(repo, baseline) {
 }
 
 /**
- * Run each sub-agent command on its own branch of `repo`, then combine.
- * `runSub` may record a claim_work_id on the sub object. It must not create
- * another repo.
+ * Run each sub-agent command in its own worktree of `repo`, concurrently,
+ * then combine. `runSub` may record a claim_work_id on the sub object. It
+ * must not create another repo. The worktree path is the directory it receives.
  *
  * @param {string} repo
  * @param {ReturnType<typeof loadForkCrew>} crew
- * @param {(sub: ReturnType<typeof loadForkCrew>["subs"][number], repo: string) => void} [runSub]
+ * @param {(sub: ReturnType<typeof loadForkCrew>["subs"][number], repo: string) => void | Promise<void>} [runSub]
  * @param {(repo: string, baseline: string) => void} [verify]
  */
-export function runCrewOnFork(repo, crew, runSub, verify = verifyFrozenBaseline) {
+export async function runCrewOnFork(repo, crew, runSub, verify = verifyFrozenBaseline) {
 	const baseline = git(repo, ["rev-parse", "HEAD"]).stdout.trim();
-	/** @type {Array<{ id: string, role: string, intent: string, paths: string[], sha: string, claim_work_id: string | null, files: string[] }>} */
-	const commits = [];
-	for (const sub of crew.subs) {
-		const branch = `madgrix/${sub.id}`;
-		git(repo, ["checkout", "-B", branch, baseline]);
-		if (runSub) runSub(sub, repo);
-		else runConfiguredCommand(sub, repo);
-		const files = porcelainPaths(git(repo, ["status", "--porcelain", "-uall"]).stdout);
-		if (files.length === 0) throw new Error(`${sub.id} produced no change on the parent fork`);
-		for (const file of files) {
-			if (!pathInScope(file, sub.paths)) {
-				throw new Error(`${sub.id} changed ${file}, which is outside its role scope`);
-			}
+	/** @type {Array<{ sub: ReturnType<typeof loadForkCrew>["subs"][number], wt: string }>} */
+	const prepared = crew.subs.map((sub) => {
+		const wt = mkdtempSync(path.join(os.tmpdir(), `madgrix-${sub.id}-`));
+		git(repo, ["worktree", "add", "--quiet", "-b", `madgrix/${sub.id}`, wt, baseline]);
+		return { sub, wt };
+	});
+	/** @type {SubCommit[]} */
+	let commits = [];
+	try {
+		await Promise.all(prepared.map(({ sub, wt }) => (runSub ? runSub(sub, wt) : runConfiguredCommand(sub, wt))));
+		commits = prepared.map(({ sub, wt }) => commitWorktree(sub, wt));
+	} finally {
+		for (const { wt } of prepared) {
+			git(repo, ["worktree", "remove", "--force", wt], { allowFailure: true });
+			rmSync(wt, { recursive: true, force: true });
 		}
-		git(repo, ["add", "-A"]);
-		git(repo, ["commit", "-m", `MADGRIX sub-agent ${sub.id}: ${sub.intent}`]);
-		const sha = git(repo, ["rev-parse", "HEAD"]).stdout.trim();
-		const claimed = /** @type {{ claim_work_id?: string | null }} */ (sub).claim_work_id ?? null;
-		commits.push({
-			id: sub.id,
-			role: sub.role,
-			intent: sub.intent,
-			paths: sub.paths,
-			sha,
-			claim_work_id: claimed,
-			files,
-		});
 	}
-	git(repo, ["checkout", "main"]);
 	verify(repo, baseline);
 	const combined = combineSubagentBranches(repo, baseline, commits);
 	return { baseline, commits, ...combined };
 }
 
 /**
- * @param {{ id: string, role: string, intent: string, paths: string[], command: string }} sub
+ * Apply a resolver command to a CONFLICTED crew result. The command sees the
+ * baseline tree, `.madgrix/conflict.json`, and `.madgrix/sides/<agent>/`.
+ * It does not receive a MADGRIX service token. The commit it produces is a
+ * new candidate; this function does not evaluate or promote it.
+ *
  * @param {string} repo
+ * @param {{ status: string, baseline: string, commits: SubCommit[], conflict: ReturnType<typeof conflictRecord> | null }} crewResult
+ * @param {string} command
  */
-function runConfiguredCommand(sub, repo) {
-	const result = spawnSync("bash", ["-c", sub.command], {
+export function resolveComposition(repo, crewResult, command) {
+	if (crewResult.status !== "CONFLICTED" || crewResult.conflict === null) {
+		throw new Error("resolveComposition requires a CONFLICTED result");
+	}
+	if (typeof command !== "string" || command.length === 0) throw new Error("resolver command is empty");
+	git(repo, ["checkout", "-B", "main", crewResult.baseline]);
+	git(repo, ["reset", "--hard", crewResult.baseline]);
+	mkdirSync(path.join(repo, ".madgrix"), { recursive: true });
+	writeFileSync(path.join(repo, CONFLICT_PATH), `${JSON.stringify(crewResult.conflict, null, 2)}\n`);
+	for (const file of crewResult.conflict.files) {
+		for (const side of file.sides) {
+			const dest = path.join(repo, ".madgrix", "sides", side.agent_id, file.path);
+			mkdirSync(path.dirname(dest), { recursive: true });
+			writeFileSync(dest, side.text);
+		}
+	}
+	const result = spawnSync("bash", ["-c", command], {
 		cwd: repo,
 		encoding: "utf8",
 		env: minimalEnv({
-			MADGRIX_AGENT_ID: sub.id,
-			MADGRIX_AGENT_ROLE: sub.role,
-			MADGRIX_SCOPE_PATHS: sub.paths.join(","),
-			MADGRIX_SUBAGENT_INTENT: sub.intent,
+			MADGRIX_CONFLICT_PATH: CONFLICT_PATH,
+			MADGRIX_BASELINE_SHA: crewResult.baseline,
 		}),
 	});
 	if (result.error || (result.status ?? 1) !== 0) {
-		throw new Error(`${sub.id} command exited ${result.status ?? "signal"}`);
+		throw new Error(`resolver exited ${result.status ?? "signal"}`);
 	}
+	const dirty = porcelainPaths(git(repo, ["status", "--porcelain", "-uall"]).stdout);
+	if (dirty.length === 0) throw new Error("resolver produced no change");
+	for (const file of crewResult.conflict.files) {
+		let onDisk = "";
+		try {
+			onDisk = readFileSync(path.join(repo, file.path), "utf8");
+		} catch {
+			throw new Error(`resolver left ${file.path} unresolved`);
+		}
+		if (onDisk.includes("<<<<<<<") || onDisk.includes(">>>>>>>")) {
+			throw new Error(`resolver left conflict markers in ${file.path}`);
+		}
+		if (!dirty.includes(file.path)) throw new Error(`resolver left ${file.path} unresolved`);
+	}
+	const record = {
+		parent_fork: true,
+		status: "RESOLVED",
+		resolution: "RESOLVED",
+		overlap: crewResult.conflict.files.map((file) => file.path),
+		claims: claimRecord(crewResult.commits),
+		resolved_from: crewResult.conflict.contributing_shas,
+	};
+	git(repo, ["add", "-A"]);
+	const sha = commitIndex(
+		repo,
+		crewResult.baseline,
+		crewResult.commits,
+		record,
+		`MADGRIX resolve\n\n${crewResult.commits.map((commit) => `${commit.id}: ${commit.intent}`).join("\n")}`,
+	);
+	return { status: /** @type {const} */ ("RESOLVED"), sha, resolution: /** @type {const} */ ("RESOLVED"), recordPath: RECORD_PATH };
+}
+
+/**
+ * @param {ReturnType<typeof loadForkCrew>["subs"][number]} sub
+ * @param {string} wt
+ * @returns {SubCommit}
+ */
+function commitWorktree(sub, wt) {
+	const files = porcelainPaths(git(wt, ["status", "--porcelain", "-uall"]).stdout);
+	if (files.length === 0) throw new Error(`${sub.id} produced no change on the parent fork`);
+	for (const file of files) {
+		if (!pathInScope(file, sub.paths)) {
+			throw new Error(`${sub.id} changed ${file}, which is outside its role scope`);
+		}
+	}
+	git(wt, ["add", "-A"]);
+	git(wt, ["commit", "-m", `MADGRIX sub-agent ${sub.id}: ${sub.intent}`]);
+	const sha = git(wt, ["rev-parse", "HEAD"]).stdout.trim();
+	const claimed = /** @type {{ claim_work_id?: string | null }} */ (sub).claim_work_id ?? null;
+	return {
+		id: sub.id,
+		role: sub.role,
+		intent: sub.intent,
+		paths: sub.paths,
+		sha,
+		claim_work_id: claimed,
+		files,
+	};
+}
+
+/**
+ * @param {{ id: string, role: string, intent: string, paths: string[], command: string }} sub
+ * @param {string} repo
+ * @returns {Promise<void>}
+ */
+function runConfiguredCommand(sub, repo) {
+	const env = minimalEnv({
+		MADGRIX_AGENT_ID: sub.id,
+		MADGRIX_AGENT_ROLE: sub.role,
+		MADGRIX_SCOPE_PATHS: sub.paths.join(","),
+		MADGRIX_SUBAGENT_INTENT: sub.intent,
+	});
+	return new Promise((resolve, reject) => {
+		const child = spawn("bash", ["-c", sub.command], { cwd: repo, env });
+		child.on("error", () => reject(new Error(`${sub.id} command failed to start`)));
+		child.on("close", (status) => {
+			if (status !== 0) reject(new Error(`${sub.id} command exited ${status ?? "signal"}`));
+			else resolve();
+		});
+	});
 }

@@ -914,7 +914,96 @@ export async function handleTaskContext(env: Env, taskId: string, request: Reque
 			latest_commit: x.latest_commit,
 			status: x.status,
 		})),
+		conflict_reports: state.conflict_reports ?? [],
+		composition: state.composition ?? null,
 	});
+}
+
+function escapeHtml(value: string): string {
+	return value.replace(/[&<>"']/g, (ch) => {
+		if (ch === "&") return "&amp;";
+		if (ch === "<") return "&lt;";
+		if (ch === ">") return "&gt;";
+		if (ch === '"') return "&quot;";
+		return "&#39;";
+	});
+}
+
+/**
+ * GET /tasks/:id/graph — a small HTML view of the same context the API returns.
+ * It does not fetch other services and it does not include agent secrets.
+ */
+export async function handleWorkGraph(env: Env, taskId: string, request: Request): Promise<Response> {
+	if (!(await requireAgentOrControl(request, env))) return json({ error: "task_context_auth_required" }, 401);
+	const read = await readTaskState(env, taskId);
+	if (!read.ok) return json(read.body, read.status);
+	const state = read.state;
+	const composition = state.composition;
+	const claims = state.claims
+		.map(
+			(claim) =>
+				`<li><code>${escapeHtml(claim.agent)}</code> ${escapeHtml(claim.work_id)} ` +
+				`<span>${escapeHtml(claim.status)}</span> ${escapeHtml(claim.scope.paths.join(", "))} ` +
+				`— ${escapeHtml(claim.intent.behavior.join("; "))}</li>`,
+		)
+		.join("");
+	const contenders = Object.values(state.contenders)
+		.map(
+			(row) =>
+				`<li><code>${escapeHtml(row.agent_id)}</code> ${escapeHtml(row.status)} ` +
+				`commit <code>${escapeHtml(row.latest_commit ?? "none")}</code></li>`,
+		)
+		.join("");
+	const conflicts = (state.conflict_reports ?? [])
+		.map(
+			(report) =>
+				`<li>${escapeHtml(report.risk)} ${escapeHtml(report.claim_a)} × ${escapeHtml(report.claim_b)} — ${escapeHtml(report.explanation)}</li>`,
+		)
+		.join("");
+	const files = (composition?.files ?? [])
+		.map((file) => {
+			const sides = file.sides
+				.map(
+					(side) =>
+						`<p><code>${escapeHtml(side.agent_id)}</code> ${escapeHtml(side.intent)}<pre>${escapeHtml(side.excerpt)}</pre></p>`,
+				)
+				.join("");
+			return `<section><h3>${escapeHtml(file.path)}</h3><p>${escapeHtml(file.classification)}</p>${sides}</section>`;
+		})
+		.join("");
+	const html = `<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<title>${escapeHtml(state.task.task_id)} work graph</title>
+<style>
+  body { font: 16px/1.45 "Iowan Old Style", Palatino, serif; margin: 2.5rem auto; max-width: 42rem; color: #1c1915; background: #f6f1e7; }
+  code, pre { font-family: ui-monospace, monospace; font-size: 0.85em; }
+  pre { white-space: pre-wrap; background: #fff; padding: 0.6rem; }
+  h1 { font-weight: 500; letter-spacing: -0.02em; }
+</style>
+<h1>${escapeHtml(state.task.intent)}</h1>
+<p>Status ${escapeHtml(state.task_status)}. Composition ${escapeHtml(composition?.status ?? "none")}.
+Candidate <code>${escapeHtml(composition?.candidate_sha ?? "none")}</code>.</p>
+<h2>Claims</h2><ul>${claims || "<li>none</li>"}</ul>
+<h2>Contenders</h2><ul>${contenders || "<li>none</li>"}</ul>
+<h2>Potential conflicts</h2><ul>${conflicts || "<li>none</li>"}</ul>
+<h2>Composition files</h2>${files || "<p>none</p>"}
+</html>`;
+	return new Response(html, { status: 200, headers: { "content-type": "text/html; charset=utf-8" } });
+}
+
+/** POST /tasks/:id/composition — control plane only. Coding agents cannot call this. */
+export async function handleComposition(env: Env, taskId: string, request: Request): Promise<Response> {
+	if (!(await requireControlPlane(request, env))) return json({ error: "control_plane_auth_required" }, 401);
+	const parsed = await readJsonBody(request);
+	if (!parsed.ok) return parsed.response;
+	const composition = parsed.body["composition"];
+	if (composition === null || typeof composition !== "object" || Array.isArray(composition)) {
+		return json({ error: "invalid_composition" }, 400);
+	}
+	const recorded = await doRpc(taskStub(env, taskId), "/composition", { body: { composition } });
+	if (!recorded.ok) return json(recorded.body, recorded.status);
+	return json(recorded.body, 200);
 }
 
 /**
@@ -1084,7 +1173,11 @@ export async function handleVerdict(env: Env, taskId: string, request: Request):
 	// The destination moved past the winner's base: no permit. The control
 	// plane rebases the candidate (POST /tasks/:id/rebase), which makes a new
 	// SHA to evaluate (specs/amendments/rebase-ancestry-v1.md).
-	if (pr.status === 409 && (pr.body as { outcome?: unknown } | null)?.outcome === "REBASE_REQUIRED") {
+	if (
+		pr.status === 409 &&
+		((pr.body as { outcome?: unknown } | null)?.outcome === "REBASE_REQUIRED" ||
+			(pr.body as { outcome?: unknown } | null)?.outcome === "UNRESOLVED_CONFLICT")
+	) {
 		return json({ verdict, permit: null, ...(pr.body as Record<string, unknown>) }, 409);
 	}
 	if (!pr.ok) return json({ verdict, error: "permit_issue_failed", detail: pr.body }, pr.status);
@@ -1126,6 +1219,17 @@ export async function runPromotion(env: Env, taskId: string, permit_id: string):
 	const quarantine = state.quarantine[permit.contender_id];
 	if (quarantine?.status === "QUARANTINED") {
 		return { status: 409, body: { outcome: "QUARANTINED_CANDIDATE" satisfies PromotionOutcome, permit_id } };
+	}
+	if (state.composition?.contender_id === permit.contender_id && state.composition.status === "CONFLICTED") {
+		return { status: 409, body: { outcome: "UNRESOLVED_CONFLICT" satisfies PromotionOutcome, permit_id } };
+	}
+	if (
+		state.composition?.contender_id === permit.contender_id &&
+		state.composition.candidate_sha !== null &&
+		permit.winner_candidate_sha !== state.composition.candidate_sha &&
+		state.composition.contributing_shas.includes(permit.winner_candidate_sha)
+	) {
+		return { status: 409, body: { outcome: "UNRESOLVED_CONFLICT" satisfies PromotionOutcome, permit_id } };
 	}
 	const contender = state.contenders[permit.contender_id];
 	if (!contender) return { status: 409, body: { error: "winner_contender_not_found", permit_id } };
@@ -1655,6 +1759,12 @@ async function route(request: Request, env: Env): Promise<Response> {
 		}
 		if (request.method === "GET" && action === "context" && parts.length === 3) {
 			return handleTaskContext(env, taskId, request);
+		}
+		if (request.method === "GET" && action === "graph" && parts.length === 3) {
+			return handleWorkGraph(env, taskId, request);
+		}
+		if (request.method === "POST" && action === "composition" && parts.length === 3) {
+			return handleComposition(env, taskId, request);
 		}
 		if (request.method === "POST" && action === "evaluator-credentials" && parts.length === 3) {
 			return handleEvaluatorCredentials(env, taskId, request);

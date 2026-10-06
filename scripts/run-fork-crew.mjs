@@ -30,7 +30,9 @@ import {
 	DEFAULT_FORK_CREW_CONFIG,
 	DEFAULT_FORK_CREW_FLEET_CONFIG,
 	assertFleetRoster,
+	authorityComposition,
 	loadForkCrew,
+	resolveComposition,
 	runCrewOnFork,
 } from "./lib/fork-crew.mjs";
 
@@ -274,10 +276,67 @@ try {
 		/** @type {{ claim_work_id?: string }} */ (sub).claim_work_id = claimed.work_id;
 		console.error(`[Git4agents] ${sub.id} (${sub.role}) claimed ${sub.paths.join(", ")} on ${forkRepo}`);
 	}
-	const crewRun = runCrewOnFork(dir, crew);
+	const crewRun = await runCrewOnFork(dir, crew);
+	/** @type {string | null} */
 	let candidateSha = crewRun.sha;
+	/** @type {string} */
+	let compositionStatus = crewRun.status;
+	/** @type {unknown} */
+	let conflict = crewRun.status === "CONFLICTED" ? crewRun.conflict : null;
+	/** @param {string} status @param {string | null} sha */
+	const compositionFor = (status, sha) =>
+		authorityComposition({
+			status: /** @type {"COMPOSED" | "CONFLICTED" | "RESOLVED"} */ (status),
+			baseline: crewRun.baseline,
+			commits: crewRun.commits,
+			conflict: crewRun.conflict,
+			sha,
+			contender_id: contenderId,
+		});
+	if (crewRun.status === "CONFLICTED") {
+		const resolver = process.env.MADGRIX_RESOLVER_COMMAND;
+		if (!resolver) {
+			const blocked = {
+				mode: "fork-crew",
+				status: "CONFLICTED",
+				fork_repo: forkRepo,
+				parent_agent: crew.parent.id,
+				resolution: "CONFLICTED",
+				overlap: crewRun.overlap,
+				conflict: crewRun.conflict,
+				composition: compositionFor("CONFLICTED", null),
+				candidate_sha: null,
+				subagent_commits: crewRun.commits.map((commit) => ({
+					id: commit.id,
+					role: commit.role,
+					intent: commit.intent,
+					sha: commit.sha,
+					claim_work_id: commit.claim_work_id,
+					paths: commit.paths,
+				})),
+			};
+			console.error("[Git4agents] CONFLICTED; not pushing a candidate");
+			if (process.env.MADGRIX_RESULT_PATH) {
+				await writeFile(process.env.MADGRIX_RESULT_PATH, `${JSON.stringify(blocked, null, 2)}\n`);
+			} else {
+				process.stdout.write(`${JSON.stringify(blocked)}\n`);
+			}
+			process.exitCode = 3;
+		} else {
+		const resolved = resolveComposition(dir, crewRun, resolver);
+		candidateSha = resolved.sha;
+		compositionStatus = resolved.status;
+		console.error(
+			`[Git4agents] resolved ${candidateSha.slice(0, 12)} from CONFLICTED; the new SHA still needs evaluation`,
+		);
+		}
+	}
+	if (process.exitCode !== 3) {
+	if (typeof candidateSha !== "string" || candidateSha.length === 0) {
+		throw new Error("fork crew produced no candidate SHA");
+	}
 	console.error(
-		`[Git4agents] combined ${candidateSha.slice(0, 12)} ` +
+		`[Git4agents] ${compositionStatus} ${candidateSha.slice(0, 12)} ` +
 			`(${crewRun.resolution}; sub-agents ${crewRun.commits.map((c) => c.sha.slice(0, 12)).join(", ")})`,
 	);
 	if (subscription === "created") {
@@ -310,10 +369,13 @@ try {
 	}
 	const result = {
 		mode: "fork-crew",
+		status: compositionStatus,
 		fork_repo: forkRepo,
 		parent_agent: crew.parent.id,
-		resolution: crewRun.resolution,
+		resolution: compositionStatus,
 		overlap: crewRun.overlap,
+		conflict,
+		composition: compositionFor(compositionStatus, candidateSha),
 		subagent_commits: crewRun.commits.map((commit) => ({
 			id: commit.id,
 			role: commit.role,
@@ -343,6 +405,7 @@ try {
 		await writeFile(process.env.MADGRIX_RESULT_PATH, `${JSON.stringify(result, null, 2)}\n`);
 	} else {
 		process.stdout.write(`${JSON.stringify(result)}\n`);
+	}
 	}
 } finally {
 	if (!keep) await rm(dir, { recursive: true, force: true });

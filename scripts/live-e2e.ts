@@ -136,6 +136,17 @@ function bearer(token: string): Record<string, string> {
 	return { authorization: `Bearer ${token}` };
 }
 
+/** Posts the runner's composition with the control token. The runner never sees that token. */
+async function recordForkComposition(run: { composition?: unknown }): Promise<void> {
+	if (!run.composition || typeof run.composition !== "object") {
+		throw new Error("fork crew result has no composition record for the control plane");
+	}
+	await requestJson(`${baseUrl}/tasks/${encodeURIComponent(taskId)}/composition`, {
+		token: controlToken,
+		body: { composition: run.composition },
+	});
+}
+
 async function requestJson(
 	url: string,
 	options: { method?: string; token?: string; body?: unknown } = {},
@@ -306,19 +317,46 @@ try {
 		MADGRIX_FLEET_BIN: env.MADGRIX_FLEET_BIN,
 		MADGRIX_FLEET_CONFIG: env.MADGRIX_FLEET_CONFIG,
 		MADGRIX_FORK_CREW_CONFIG: env.MADGRIX_FORK_CREW_CONFIG,
+		MADGRIX_RESOLVER_COMMAND: env.MADGRIX_RESOLVER_COMMAND,
 	};
-	await run("node", [forkCrew ? "scripts/run-fork-crew.mjs" : "scripts/run-contenders.mjs"], {
-		env: minimalEnv(
-			forkCrew
-				? childEnv
-				: {
-						...childEnv,
-						MADGRIX_AGENT_COMMAND: agentCommand,
-						MADGRIX_AGENT_IDS: agentIds.join(","),
-					},
-		),
-	});
+	try {
+		await run("node", [forkCrew ? "scripts/run-fork-crew.mjs" : "scripts/run-contenders.mjs"], {
+			env: minimalEnv(
+				forkCrew
+					? childEnv
+					: {
+							...childEnv,
+							MADGRIX_AGENT_COMMAND: agentCommand,
+							MADGRIX_AGENT_IDS: agentIds.join(","),
+						},
+			),
+		});
+	} catch (err) {
+		if (forkCrew) {
+			const blocked = await readFile(contenderResultPath, "utf8").catch(() => "");
+			let parsed: { status?: string; composition?: unknown } | null = null;
+			try {
+				parsed = JSON.parse(blocked);
+			} catch {
+				parsed = null;
+			}
+			if (parsed?.status === "CONFLICTED") {
+				await recordForkComposition(parsed);
+				throw new Error(
+					`fork crew is CONFLICTED and was not pushed. The control plane recorded the conflict. Refusing evaluation and promotion. ${err instanceof Error ? err.message : ""}`,
+				);
+			}
+		}
+		throw err;
+	}
 	const contenderRun = JSON.parse(await readFile(contenderResultPath, "utf8"));
+	if (forkCrew) {
+		if (contenderRun.status === "CONFLICTED") {
+			await recordForkComposition(contenderRun);
+			throw new Error("fork crew is CONFLICTED. The control plane recorded the conflict. Refusing evaluation and promotion.");
+		}
+		await recordForkComposition(contenderRun);
+	}
 	const candidates = contenderRun.candidates as Array<{
 		agent_id: string;
 		contender_id: string;

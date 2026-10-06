@@ -43,6 +43,7 @@ import {
 	enrollAgents,
 	ingestQueueEvent,
 	issuePermit,
+	recordComposition,
 	recordPromotionBundle,
 	recordRebase,
 	registerClaim,
@@ -61,6 +62,7 @@ import {
 import type {
 	AuthorityState,
 	CallerIdentity,
+	CompositionRecord,
 	ContenderRecord,
 	EvaluationBundle,
 	QueuePushEvent,
@@ -485,9 +487,39 @@ export class TaskAuthority {
 							409,
 						);
 					}
+					if (r.outcome === "UNRESOLVED_CONFLICT") {
+						return json(
+							{
+								outcome: "UNRESOLVED_CONFLICT",
+								winner_sha: body.winner_sha,
+								contender_id: r.contender_id,
+							},
+							409,
+						);
+					}
 					return json({ outcome: "ISSUED", permit: r.permit });
 				} catch (err) {
 					return json({ error: "permit_rejected", detail: (err as Error).message }, 422);
+				}
+			});
+		}
+
+		/* -- POST /composition — fork-crew COMPOSED / CONFLICTED / RESOLVED -- */
+		if (request.method === "POST" && path === "/composition") {
+			const parsed = await readJsonBody(request);
+			if (!parsed.ok) return parsed.response;
+			const composition = (parsed.body as { composition?: CompositionRecord }).composition;
+			if (!composition || typeof composition !== "object") return json({ error: "invalid_composition" }, 400);
+			const ctx = await productionCtx();
+			return this.doState.storage.transaction(async () => {
+				const state = await this.loadState();
+				if (state === null) return json({ error: "not_initialized" }, 404);
+				try {
+					const next = await recordComposition(state, composition, ctx);
+					if (next !== state) await this.doState.storage.put(STATE_KEY, next);
+					return json({ recorded: true, status: next.composition?.status ?? composition.status });
+				} catch (err) {
+					return json({ error: "composition_rejected", detail: (err as Error).message }, 422);
 				}
 			});
 		}

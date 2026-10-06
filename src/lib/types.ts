@@ -329,7 +329,30 @@ export type PromotionOutcome =
 	| "TREE_MISMATCH"
 	| "EVAL_BUNDLE_MISMATCH"
 	| "QUARANTINED_CANDIDATE"
+	| "UNRESOLVED_CONFLICT"
 	| "UNKNOWN_PERMIT";
+
+/**
+ * Fork-crew composition (specs/amendments/composition-result-v1.md).
+ * CONFLICTED is not a candidate. RESOLVED names a new SHA that still needs
+ * its own evaluation.
+ */
+export interface CompositionFile {
+	path: string;
+	classification: "textual-line-overlap";
+	sides: Array<{ agent_id: string; role: string; intent: string; sha: string; excerpt: string }>;
+}
+
+export interface CompositionRecord {
+	status: "COMPOSED" | "CONFLICTED" | "RESOLVED";
+	contender_id: string;
+	baseline: string;
+	agents: Array<{ id: string; role: string; intent: string; sha: string; paths: string[]; claim_work_id: string | null }>;
+	contributing_shas: string[];
+	files: CompositionFile[];
+	/** Null only while CONFLICTED. */
+	candidate_sha: string | null;
+}
 
 /* ------------------------------------------------------------------ */
 /* Quarantine (spec 1 §9.5, spec 3 §7 — FROZEN lifecycle)               */
@@ -389,6 +412,16 @@ export interface AuthorityState {
 	task_status: "frozen" | "verdict_reached" | "promoted" | "escalated" | "rejected";
 	contenders: Record<string, ContenderRecord>;
 	claims: WorkClaim[];
+	/**
+	 * Conflict reports from claim registration. Absent on authorities
+	 * created before the work-graph field existed.
+	 */
+	conflict_reports?: ConflictReport[];
+	/**
+	 * Fork-crew composition for this task. Absent until the control plane
+	 * records one. CONFLICTED blocks evidence and promotion for that contender.
+	 */
+	composition?: CompositionRecord;
 	/** Keyed by candidate_sha. */
 	evaluations: Record<string, EvaluationBundle>;
 	/** Keyed by verifier_id. */

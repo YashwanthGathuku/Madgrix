@@ -67,6 +67,7 @@ import type {
 	VerifierPublicKey,
 	TrustZone,
 	WorkClaim,
+	CompositionRecord,
 } from "./types.ts";
 
 /** Claim fields the contender supplies (work_id/status/version assigned here). */
@@ -465,7 +466,11 @@ export async function registerClaim(
 	const live = state.claims.filter((c) => c.status === "claimed" || c.status === "active");
 	const reports = live.map((c) => classifyPair(claim, c));
 	const s2 = await appendLedger(
-		{ ...state, claims: [...state.claims, claim] },
+		{
+			...state,
+			claims: [...state.claims, claim],
+			conflict_reports: [...(state.conflict_reports ?? []), ...reports],
+		},
 		"claim_registered",
 		{ work_id: claim.work_id, agent: claim.agent, risk: reports.map((r) => r.risk) },
 		ctx,
@@ -633,6 +638,14 @@ export async function submitEvaluation(
 		: undefined;
 	if (contender === undefined)
 		throw new Error(`evaluation rejected: unknown contender ${JSON.stringify(bundle.contender_id)}`);
+	if (compositionBlocks(state, bundle.contender_id, bundle.candidate_sha)) {
+		const composition = state.composition;
+		throw new Error(
+			composition?.status === "CONFLICTED"
+				? `evaluation rejected: contender ${bundle.contender_id} is CONFLICTED — an unresolved composition is not a candidate`
+				: `evaluation rejected: ${bundle.candidate_sha} is a contributing SHA, not the composition candidate ${composition?.candidate_sha ?? "none"}`,
+		);
+	}
 	if (contender.latest_commit !== bundle.candidate_sha)
 		throw new Error(
 			`evaluation rejected: candidate ${bundle.candidate_sha} is not the latest observed commit of ` +
@@ -1029,6 +1042,127 @@ export function evaluationBases(contender: ContenderRecord): string[] {
 	return bases;
 }
 
+/**
+ * CONFLICTED blocks every evidence submission and permit for that contender.
+ * A permit for a contributing SHA is also blocked once a COMPOSED or RESOLVED
+ * candidate exists, so an earlier side cannot ship in place of the new SHA.
+ * A later SHA (an empty republish of the composed tree, for example) is not
+ * in `contributing_shas` and is not blocked here; it still needs its own evaluation.
+ */
+export function compositionBlocks(state: AuthorityState, contenderId: string, sha?: string): boolean {
+	const composition = state.composition;
+	if (!composition || composition.contender_id !== contenderId) return false;
+	if (composition.status === "CONFLICTED") return true;
+	if (sha === undefined) return false;
+	return sha !== composition.candidate_sha && composition.contributing_shas.includes(sha);
+}
+
+function normalizeComposition(input: CompositionRecord): CompositionRecord {
+	if (input.status !== "COMPOSED" && input.status !== "CONFLICTED" && input.status !== "RESOLVED") {
+		throw new Error("recordComposition: status must be COMPOSED, CONFLICTED, or RESOLVED");
+	}
+	if (typeof input.contender_id !== "string" || input.contender_id === "") {
+		throw new Error("recordComposition: contender_id is required");
+	}
+	if (typeof input.baseline !== "string" || input.baseline === "") {
+		throw new Error("recordComposition: baseline is required");
+	}
+	if (!Array.isArray(input.contributing_shas) || input.contributing_shas.length < 2) {
+		throw new Error("recordComposition: at least two contributing SHAs are required");
+	}
+	if (!Array.isArray(input.agents) || input.agents.length < 2) {
+		throw new Error("recordComposition: at least two agents are required");
+	}
+	if (input.status === "CONFLICTED") {
+		if (input.candidate_sha !== null) throw new Error("recordComposition: CONFLICTED has no candidate SHA");
+		if (!Array.isArray(input.files) || input.files.length === 0) {
+			throw new Error("recordComposition: CONFLICTED names no files");
+		}
+	} else if (typeof input.candidate_sha !== "string" || input.candidate_sha === "") {
+		throw new Error("recordComposition: COMPOSED and RESOLVED require a candidate SHA");
+	} else if (input.contributing_shas.includes(input.candidate_sha)) {
+		throw new Error("recordComposition: the candidate SHA must be new, not a contributing SHA");
+	}
+	const files = (input.files ?? []).map((file) => {
+		if (typeof file.path !== "string" || file.path === "" || file.path.includes("..")) {
+			throw new Error("recordComposition: conflict path is invalid");
+		}
+		if (file.classification !== "textual-line-overlap") {
+			throw new Error("recordComposition: unknown conflict classification");
+		}
+		return {
+			path: file.path,
+			classification: "textual-line-overlap" as const,
+			sides: file.sides.map((side) => ({
+				agent_id: side.agent_id,
+				role: side.role,
+				intent: side.intent,
+				sha: side.sha,
+				excerpt: typeof side.excerpt === "string" ? side.excerpt.slice(0, 400) : "",
+			})),
+		};
+	});
+	return {
+		status: input.status,
+		contender_id: input.contender_id,
+		baseline: input.baseline,
+		agents: input.agents.map((agent) => ({
+			id: agent.id,
+			role: agent.role,
+			intent: agent.intent,
+			sha: agent.sha,
+			paths: agent.paths,
+			claim_work_id: agent.claim_work_id,
+		})),
+		contributing_shas: [...input.contributing_shas],
+		files,
+		candidate_sha: input.status === "CONFLICTED" ? null : input.candidate_sha,
+	};
+}
+
+/**
+ * Record a fork-crew composition. Only the control plane calls this.
+ * CONFLICTED cannot be replaced by COMPOSED. The same record is an idempotent no-op.
+ */
+export async function recordComposition(
+	state: AuthorityState,
+	input: CompositionRecord,
+	ctx: Ctx,
+): Promise<AuthorityState> {
+	const composition = normalizeComposition(input);
+	const contender = state.contenders[composition.contender_id];
+	if (!contender) throw new Error(`recordComposition: unknown contender ${composition.contender_id}`);
+	if (composition.baseline !== state.task.baseline_commit) {
+		throw new Error("recordComposition: baseline is not the frozen task baseline");
+	}
+	const current = state.composition;
+	if (current) {
+		if (current.contender_id !== composition.contender_id) {
+			throw new Error("recordComposition: this task already has a composition for another contender");
+		}
+		if (canonicalJson(current) === canonicalJson(composition)) return state;
+		if (current.status === "CONFLICTED" && composition.status !== "RESOLVED") {
+			throw new Error("recordComposition: CONFLICTED cannot become an ordinary candidate");
+		}
+		if (current.status !== "CONFLICTED" && composition.status === "CONFLICTED") {
+			throw new Error("recordComposition: a candidate cannot be turned back into CONFLICTED");
+		}
+		if (
+			current.status !== "CONFLICTED" &&
+			composition.candidate_sha !== current.candidate_sha
+		) {
+			throw new Error("recordComposition: the candidate SHA is already bound");
+		}
+	}
+	return appendLedger({ ...state, composition }, "composition_recorded", {
+		status: composition.status,
+		contender_id: composition.contender_id,
+		candidate_sha: composition.candidate_sha,
+		contributing_shas: composition.contributing_shas,
+		files: composition.files.map((file) => file.path),
+	}, ctx);
+}
+
 export type IssuePermitResult =
 	| { state: AuthorityState; outcome: "ISSUED"; permit: PermitRecord }
 	| {
@@ -1038,6 +1172,12 @@ export type IssuePermitResult =
 			contender_id: string;
 			/** The heads a permit for this candidate could bind. */
 			bases: string[];
+	  }
+	| {
+			state: AuthorityState;
+			outcome: "UNRESOLVED_CONFLICT";
+			permit: null;
+			contender_id: string;
 	  };
 
 /**
@@ -1073,6 +1213,15 @@ export async function issuePermit(
 	if (!ev) throw new Error(`issuePermit: no evaluation bundle for winner ${winner_sha}`);
 	const contender = Object.hasOwn(state.contenders, ev.contender_id) ? state.contenders[ev.contender_id] : undefined;
 	if (!contender) throw new Error(`issuePermit: the winner's contender ${ev.contender_id} is unknown`);
+	if (compositionBlocks(state, ev.contender_id, winner_sha)) {
+		const refused = await appendLedger(
+			state,
+			"permit_refused",
+			{ outcome: "UNRESOLVED_CONFLICT", winner_sha, contender_id: ev.contender_id },
+			ctx,
+		);
+		return { state: refused, outcome: "UNRESOLVED_CONFLICT", permit: null, contender_id: ev.contender_id };
+	}
 	const bases = permitBases(contender, winner_sha);
 	if (!bases.includes(destination_head)) {
 		const refused = await appendLedger(
@@ -1163,6 +1312,15 @@ export async function attemptPromotion(
 	if (permit.consumed) {
 		// Single-consume idempotency: a second presentation is a no-op ACK.
 		return { state, outcome: "ALREADY_CONSUMED", effects: [] };
+	}
+	if (compositionBlocks(state, permit.contender_id, permit.winner_candidate_sha)) {
+		const blocked = await appendLedger(
+			state,
+			"promotion_aborted",
+			{ permit_id, error: "UNRESOLVED_CONFLICT", winner_sha: permit.winner_candidate_sha },
+			ctx,
+		);
+		return { state: blocked, outcome: "UNRESOLVED_CONFLICT", effects: [] };
 	}
 	const winnerQuarantined = state.quarantine[permit.contender_id]?.status === "QUARANTINED";
 	const check = checkPromotion(permit, current_head, tree_sha256, winnerQuarantined);
