@@ -49,6 +49,8 @@ Node 24 is required. Node 22.17 does not strip TypeScript types unless `NODE_OPT
 
 `scripts/live-e2e.ts` is **IMPLEMENTED** and **NOT YET VERIFIED** against Cloudflare for this SHA.
 
-When it is run, the operator supplies the deployed base URL and the zone tokens in the parent process. The parent posts composition with `MADGRIX_CONTROL_SERVICE_TOKEN`. The fork-crew child receives the agent token only. A CONFLICTED result is posted, then evaluation and promotion are refused. A resolved or composed SHA is posted, then the existing evaluation, verdict, promotion, and offline verify steps run. Set `MADGRIX_RESOLVER_COMMAND` to `node scripts/demo-resolve.mjs` only for the demo config. Do not put a service token in that command's environment.
+When it is run, the operator supplies the deployed base URL and the zone tokens in the parent process. The parent posts composition with `MADGRIX_CONTROL_SERVICE_TOKEN`. The fork-crew child receives the agent token only. A CONFLICTED result is posted, then evaluation and promotion are refused. A resolved or composed SHA is posted, then the existing evaluation, verdict, promotion, and offline verify steps run. Do not put a service token in the resolver environment.
+
+The local demo test calls `loadForkCrew` and `runCrewOnFork` directly. It does not call `fleet validate`. The live runner does. `configs/git4agents-fork-crew.yaml` lists `parent`, `sub-api`, and `sub-ui` only. Pointing `MADGRIX_FORK_CREW_CONFIG` at `configs/demo-composition.json` fails that roster check until a fleet manifest lists `parent`, `sub-api`, `sub-ui`, and `sub-test` in that order and `fleet validate` accepts it. That manifest is not in this commit, and `fleet` was not run here.
 
 Do not treat a green local test as a live Artifact, Queue, Workflow, or Container result.

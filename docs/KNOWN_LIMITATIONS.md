@@ -22,6 +22,7 @@ Nothing in this SHA was deployed. `live:e2e` was not run. The public worker root
 
 - `submitEvaluation` does not recompute `bundle_hash`. The verdict seam does. A stored bundle with a bad hash is ineligible. The evaluation domain is the trust point for admission flags.
 - The demo fixture's authority check refuses a contributing SHA. It does not execute `test/integration/check.js`.
+- The live runner requires `fleet validate` to list the same agent ids as the crew config. The demo JSON has `sub-test`. The shipped fleet manifest does not. The local demo test does not call `fleet`. A live run of that JSON is **NOT YET VERIFIED** and will fail the roster check until a matching manifest exists.
 - Queue idempotency is tested with in-memory delivery. A live redelivery was not observed.
 - Canonical writes in tests are local git or FakeArtifacts. The live fork token's inability to push the canonical repo was not observed on Artifacts.
 - Offline verify trusts the pinned key the operator passes. A bundle that carries a different key does not select that key. This was tested locally, including the slice harness.
