@@ -70,7 +70,9 @@ describe("demo composition fixture", () => {
 
 		const repo = initFork();
 		const head = git(repo, ["rev-parse", "HEAD"]);
-		const stamp = path.join(tmpdir(), `madgrix-demo-stamp-${Date.now()}-${Math.random().toString(16).slice(2)}`);
+		// Forward slashes survive `bash -c` on Windows. A backslash is eaten and the
+		// stamp file lands inside the worktree, outside the agent's role scope.
+		const stamp = path.join(tmpdir(), `madgrix-demo-stamp-${Date.now()}-${Math.random().toString(16).slice(2)}`).replace(/\\/g, "/");
 		for (const sub of crew.subs) {
 			sub.command += ` && node -e ${JSON.stringify(
 				`const fs=require("fs"); const stamp=${JSON.stringify(stamp)}; fs.appendFileSync(stamp, process.env.MADGRIX_AGENT_ID+":s:"+Date.now()+"\\n"); Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,500); fs.appendFileSync(stamp, process.env.MADGRIX_AGENT_ID+":e:"+Date.now()+"\\n");`,

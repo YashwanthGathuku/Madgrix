@@ -483,8 +483,12 @@ export function verifyFrozenBaseline(repo, baseline) {
 	const root = process.env.MADGRIX_THEUSTAD_ROOT || path.join(repoRoot, "third_party/theustad");
 	const script = path.join(root, "theustad.py");
 	const python = process.env.MADGRIX_PYTHON || "python3";
-	const claim = path.join(repoRoot, "scripts/theustad-baseline-claim.py");
-	const check = path.join(repoRoot, "scripts/theustad-baseline-check.py");
+	// TheUstad splits --cmd and --verifier with shlex, which treats "\" as an
+	// escape. Forward slashes keep the same scripts addressable on Windows.
+	/** @param {string} file */
+	const slash = (file) => file.replaceAll("\\", "/");
+	const claim = slash(path.join(repoRoot, "scripts/theustad-baseline-claim.py"));
+	const check = slash(path.join(repoRoot, "scripts/theustad-baseline-check.py"));
 	const stateDir = mkdtempSync(path.join(os.tmpdir(), "madgrix-theustad-state-"));
 	const logDir = mkdtempSync(path.join(os.tmpdir(), "madgrix-theustad-logs-"));
 	const result = spawnSync(

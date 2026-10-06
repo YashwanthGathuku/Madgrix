@@ -353,10 +353,15 @@ describe("composition route", () => {
 		assert.equal(page.status, 200);
 		assert.match(page.headers.get("content-type") ?? "", /text\/html/);
 		assert.match(html, /CONFLICTED/);
+		assert.match(html, /Live work graph/);
+		assert.match(html, /Resolution state: unresolved/);
+		assert.match(html, /Offline verification: not executed in this view/);
 		assert.match(html, /&lt;script&gt;alert\(1\)&lt;\/script&gt;/);
 		assert.doesNotMatch(html, /<script>alert/);
 		assert.match(html, /sub-api/);
 		assert.match(html, /src\/shared\.js/);
+		assert.doesNotMatch(html, /Fixture\/demo input/);
+		assert.doesNotMatch(html, /class="edge /);
 
 		const data = await worker.fetch(new Request(`https://madgrix.test/tasks/${h.taskId}/graph?format=json`, {
 			headers: { authorization: `Bearer ${TOKENS.control}` },
