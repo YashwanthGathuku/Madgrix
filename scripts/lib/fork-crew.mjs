@@ -314,7 +314,7 @@ function classifyEdits(repo, baseline, commits) {
 export function authorityComposition(input) {
 	const files = (input.conflict?.files ?? []).map((file) => ({
 		path: file.path,
-		classification: file.classification,
+		classification: /** @type {const} */ ("textual-line-overlap"),
 		sides: file.sides.map((side) => ({
 			agent_id: side.agent_id,
 			role: side.role,
