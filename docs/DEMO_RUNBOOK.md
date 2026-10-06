@@ -1,12 +1,12 @@
 # Demo runbook
 
-Status words: **IMPLEMENTED**, **TESTED LOCALLY**, **TESTED ON CLOUDFLARE**, **NOT YET VERIFIED**.
+Status words for this integration: **TESTED ON FINAL SHA LOCALLY**, **TESTED ON CLOUDFLARE**, **NOT VERIFIED**.
 
-This runbook matches `git4agents/combined` at `4a8c4cc7b521688f839f0f332605dcefa3984c38`. It does not describe a Cloudflare run. `npm run live:e2e` was not executed for this SHA.
+This runbook describes the integrated tree. The fixture steps below were written against `424b2b15425a65a25a230e949dea0f4d94192d9e` and were not repeated in the Cloudflare readiness session (`99adfa9d89ee42536667bfb8e618e4a9af92374e`). They are **NOT VERIFIED** as a result of this integration until the final Linux suite says otherwise. `npm run live:e2e` was not executed. The live command, the queue, and the deploy boundary are in `docs/CLOUDFLARE_LIVE_READINESS.md`. That note records the readiness session. It is not a Cloudflare run of this tree.
 
 ## What the local fixture does
 
-**IMPLEMENTED. TESTED LOCALLY** by `node --test test/demo-composition.test.ts` (1 pass, WSL Node v24.21.0, 2026-10-06).
+**NOT VERIFIED** in this session. The parent record for this history says `node --test test/demo-composition.test.ts` passed once on WSL Node v24.21.0, 2026-10-06. That command was not repeated here.
 
 `configs/demo-composition.json` has three sub-agents on one parent fork:
 
@@ -27,7 +27,7 @@ The resolved commit is a new SHA. It is not one of the three contributing SHAs. 
 - It does not call TheUstad on the resolved tree. TheUstad runs on the baseline before combine, as in the fork-crew tests.
 - It does not talk to Cloudflare.
 
-The promotion path that is **TESTED LOCALLY** is the existing slice and head-move harnesses, on other fixtures:
+The promotion path recorded by the parent, and **NOT VERIFIED** again in this session, is the existing slice and head-move harnesses, on other fixtures:
 
 - `node src/harness/slice.ts` printed `SLICE OK` and `VERIFIED` for its own bundle.
 - `node src/harness/head-move.ts` printed `HEAD-MOVE OK`.
@@ -43,14 +43,18 @@ export PATH="$HOME/node24/bin:/usr/bin:/bin"
 node --test test/demo-composition.test.ts test/fork-crew.test.ts test/composition-authority.test.ts
 ```
 
-Node 24 is required. Node 22.17 does not strip TypeScript types unless `NODE_OPTIONS=--experimental-strip-types` is set for the parent and every child.
+Node >= 24 is required. Node 22.17 does not strip TypeScript types unless `NODE_OPTIONS=--experimental-strip-types` is set for the parent and every child. Node 22 is not the competition suite.
 
-## Live path, not run
+## Live path
 
-`scripts/live-e2e.ts` is **IMPLEMENTED** and **NOT YET VERIFIED** against Cloudflare for this SHA.
+`scripts/live-e2e.ts` is **NOT VERIFIED** against Cloudflare.
 
 When it is run, the operator supplies the deployed base URL and the zone tokens in the parent process. The parent posts composition with `MADGRIX_CONTROL_SERVICE_TOKEN`. The fork-crew child receives the agent token only. A CONFLICTED result is posted, then evaluation and promotion are refused. A resolved or composed SHA is posted, then the existing evaluation, verdict, promotion, and offline verify steps run. Do not put a service token in the resolver environment.
 
-The local demo test calls `loadForkCrew` and `runCrewOnFork` directly. It does not call `fleet validate`. The live runner does. `configs/git4agents-demo-composition.yaml` is the manifest for `configs/demo-composition.json`. Its agents are `parent`, `sub-api`, `sub-ui`, `sub-test`, in that order. `scripts/run-fork-crew.mjs` selects that manifest when `MADGRIX_FORK_CREW_CONFIG` points at the demo JSON and `MADGRIX_FLEET_CONFIG` is unset. `configs/git4agents-fork-crew.yaml` remains the two-sub-agent roster. `node --test test/fleet-manifest.test.ts` runs `fleet validate --config <manifest> --json` and reads `summary.agent_ids`. That command needs Agentfleet `paper-hardening` `49032db` or newer (`MADGRIX_FLEET_BIN` when the `fleet` on PATH is older). It was not run on Cloudflare.
+The local demo test calls `loadForkCrew` and `runCrewOnFork` directly. It does not call `fleet validate`. The live runner does. `configs/git4agents-demo-composition.yaml` is the manifest for `configs/demo-composition.json`. Its agents are `parent`, `sub-api`, `sub-ui`, `sub-test`, in that order. `scripts/run-fork-crew.mjs` selects that manifest when `MADGRIX_FORK_CREW_CONFIG` points at the demo JSON and `MADGRIX_FLEET_CONFIG` is unset. `configs/git4agents-fork-crew.yaml` remains the three-id roster (`parent`, `sub-api`, `sub-ui`) and is not the demo manifest.
 
-Do not treat a green local test as a live Artifact, Queue, Workflow, or Container result.
+On the readiness session, `fleet 0.3.0` validate of `configs/git4agents-fork-crew.yaml` returned `is_valid: true` and `summary.total_agents: 3`, and `summary` had no `agent_ids`. At this commit, `assertFleetRoster` still reads `summary.agent_ids`, so that older binary fails the live runner before a push. `node --test test/fleet-manifest.test.ts` runs `fleet validate` and needs Agentfleet `paper-hardening` `49032db` or newer, or `MADGRIX_FLEET_BIN` pointed at such a binary. Agentfleet validates the roster. It does not execute the sub-agents. A live run of the demo JSON is **NOT VERIFIED**.
+
+The sibling live command that does not call `fleet` sets `MADGRIX_AGENT_IDS`. It is written in `docs/CLOUDFLARE_LIVE_READINESS.md`. It was not run. Success still requires a real Artifacts push through the queue. A green local test is not that result.
+
+On 2026-10-06 the readiness session observed `GET https://madgrix.ygathuku96.workers.dev/` → `404` `{"error":"not_found","path":"/"}`. That response does not name a SHA. It is **NOT VERIFIED** as a result for this tree. Nothing here is **TESTED ON CLOUDFLARE**.
