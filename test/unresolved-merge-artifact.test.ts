@@ -355,11 +355,11 @@ describe("unrecorded conflict markers never become a candidate", () => {
 		await assert.rejects(issuePermit(seam.state, sha, "acme/api", baseline, c), /no ACCEPT verdict/);
 		const missing = await attemptPromotion(seam.state, "ab".repeat(32), baseline, bundle.tree_sha256, c);
 		assert.equal(missing.outcome, "UNKNOWN_PERMIT");
-		assert.deepEqual(missing.effects, []);
 		assert.equal(
 			missing.effects.some((effect) => effect.kind === "canonical_write"),
 			false,
 		);
+		assert.deepEqual(missing.effects, []);
 
 		const forced: VerdictRecord = {
 			state: "ACCEPT",
@@ -540,8 +540,8 @@ async function assertNoPermit(label: string, bundle: EvaluationBundle, gate: str
 	assert.deepEqual(Object.keys(refused.state.permits), [], label);
 	const promoted = await attemptPromotion(refused.state, "cd".repeat(32), BOUND_BASE, BOUND_TREE, got.c);
 	assert.equal(promoted.outcome, "UNKNOWN_PERMIT", label);
-	assert.deepEqual(promoted.effects, [], label);
 	assert.equal(promoted.effects.some((effect) => effect.kind === "canonical_write"), false, label);
+	assert.deepEqual(promoted.effects, [], label);
 }
 
 describe("merge-artifact scan completeness is an evaluation-integrity input", () => {
