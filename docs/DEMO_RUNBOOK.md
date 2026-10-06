@@ -2,7 +2,7 @@
 
 Status words: **IMPLEMENTED**, **TESTED LOCALLY**, **TESTED ON CLOUDFLARE**, **NOT YET VERIFIED**.
 
-This runbook matches `git4agents/combined` at `4a8c4cc7b521688f839f0f332605dcefa3984c38`. It does not describe a Cloudflare run. `npm run live:e2e` was not executed for this SHA.
+The fixture section matches `git4agents/combined` at `4a8c4cc7b521688f839f0f332605dcefa3984c38`. The live-path fleet paragraph matches `competition/collaboration` at `49e53c3205ceccebeb4ae84df84ecd591e966bc2`, which is on `origin` (https://github.com/YashwanthGathuku/Madgrix). It does not describe a Cloudflare run. `npm run live:e2e` was not executed for either SHA. That commit was not merged to `main`.
 
 ## What the local fixture does
 

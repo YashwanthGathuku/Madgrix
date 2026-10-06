@@ -4,6 +4,8 @@ Research-and-fix plan. Only problems that showed up in this project. Contest dea
 
 Branch of record: Madgrix `git4agents/combined`, tip `0d6cd1307a15120fe35dd2acf046128187a78577` (4 October 2026, 12:14 PM ET) when this plan was written. Do not deploy. Do not change billing. Do not print tokens. Do not force-push. Do not add a second worker.
 
+The demo roster fix in section 5 is on `competition/collaboration` at `49e53c3205ceccebeb4ae84df84ecd591e966bc2`, pushed to `origin` on 2026-10-06 (https://github.com/YashwanthGathuku/Madgrix). It was not merged to `main` and was not run on Cloudflare.
+
 ## 1. A new Artifacts subscription drops the first push
 
 What happened. A subscription the API has just accepted does not emit the first `pushed` event. An earlier live run subscribed and pushed within a few seconds, and the queue never saw those pushes. An already-live subscription does deliver. The queue consumer also batches for up to 30 seconds.

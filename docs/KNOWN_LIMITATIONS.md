@@ -37,4 +37,6 @@ Nothing in this SHA was deployed. `live:e2e` was not run. The public worker root
 
 ## Deliberately not done
 
-No merge to `main`. No push. No new paid Cloudflare resource. No edit to `PROMOTION_PROTOCOL.md`, `EVALUATION_THREAT_MODEL.md`, or `CLOUDFLARE_RUNTIME_MODEL.md`.
+No merge to `main`. No force-push. No new paid Cloudflare resource. No edit to `PROMOTION_PROTOCOL.md`, `EVALUATION_THREAT_MODEL.md`, or `CLOUDFLARE_RUNTIME_MODEL.md`.
+
+`competition/collaboration` is on `origin` at https://github.com/YashwanthGathuku/Madgrix. The collaboration-plane commit is `49e53c3205ceccebeb4ae84df84ecd591e966bc2` (`Let the demo crew validate as one contender.`). This note is a later commit on the same branch. That SHA was not merged to `main` and was not run on Cloudflare.

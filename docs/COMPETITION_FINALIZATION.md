@@ -202,3 +202,22 @@ The authority refuses a conflict only after the control plane records it. The ru
 An empty republish after a push is still a new SHA. It is not a contributing SHA, so the composition gate does not treat it as the recorded candidate. It needs its own evaluation.
 
 TheUstad still checks the frozen baseline before combine. It does not evaluate the composed or resolved tree.
+
+## Pushed at `49e53c3`
+
+The baseline and the `4a8c4cc` section above stay the record of those SHAs. This section records the push. It is not a Cloudflare run.
+
+| Item | Value |
+|---|---|
+| Repository | https://github.com/YashwanthGathuku/Madgrix |
+| Branch | `competition/collaboration` |
+| Remote | `origin/competition/collaboration` |
+| Collaboration-plane SHA | `49e53c3205ceccebeb4ae84df84ecd591e966bc2` |
+| Subject | Let the demo crew validate as one contender. |
+| Parent | `424b2b15425a65a25a230e949dea0f4d94192d9e` |
+| Push | First push of this branch, 2026-10-06. The remote tracking ref matched that SHA before this note was written. |
+| Merge to `main` | not done |
+| Deploy | not done |
+| Cloudflare | not run. `live:e2e` was not executed. |
+
+`49e53c3` adds the demo fleet manifest (`parent`, `sub-api`, `sub-ui`, `sub-test`), the crew contender, the six composition states, and the work-graph data. Only `COMPOSED` and `RESOLVED` name a promotable SHA. The local LF suite on WSL Node v24.21.0 for that tree was 300 passed and 0 failed. `npm run slice`, `npm run head-move`, and `npm run bench` were not re-run as standalone commands for that SHA. A `fleet` binary older than Agentfleet `paper-hardening` `49032db` still omits `summary.agent_ids`.
