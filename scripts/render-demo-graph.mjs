@@ -192,9 +192,16 @@ try {
 	if (!conflictedHtml.includes("CONFLICTED") || !conflictedHtml.includes("Resolution state: unresolved")) {
 		throw new Error("conflicted page did not show the unresolved record");
 	}
+	if (!conflictedHtml.includes("PROMOTABLE CANDIDATE: NONE")) {
+		throw new Error("conflicted page did not leave the candidate empty");
+	}
 	if (conflictedHtml.includes("New candidate")) throw new Error("conflicted page invented a candidate");
-	if (!resolvedHtml.includes("RESOLVED") || !resolvedHtml.includes("New candidate")) {
+	if (conflictedHtml.includes(resolved.sha)) throw new Error("conflicted page included the resolver SHA");
+	if (!resolvedHtml.includes("RESOLVED") || !resolvedHtml.includes("New candidate") || !resolvedHtml.includes(resolved.sha)) {
 		throw new Error("resolved page did not show the new candidate");
+	}
+	if (!resolvedHtml.includes(`PROMOTABLE CANDIDATE: <code>${resolved.sha}</code>`)) {
+		throw new Error("resolved page did not place the new SHA in the candidate position");
 	}
 
 	const dest = process.argv[2] ? path.resolve(process.argv[2]) : tmpdir();

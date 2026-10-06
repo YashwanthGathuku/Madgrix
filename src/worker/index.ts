@@ -922,8 +922,10 @@ export async function handleTaskContext(env: Env, taskId: string, request: Reque
 
 /**
  * GET /tasks/:id/graph — one HTML page of task-authority state.
- * Same auth as context. It does not classify claims or verify a bundle,
- * and it does not include agent secrets.
+ * Same auth as context. Presentation only: it does not classify overlaps,
+ * advance composition, choose a verdict, or verify a bundle, and it does
+ * not include agent secrets. A caller may pass the collaboration work-graph
+ * object into the renderer. This route does not invent that object.
  */
 export async function handleWorkGraph(env: Env, taskId: string, request: Request): Promise<Response> {
 	if (!(await requireAgentOrControl(request, env))) return json({ error: "task_context_auth_required" }, 401);

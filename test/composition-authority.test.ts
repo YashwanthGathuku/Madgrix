@@ -286,7 +286,10 @@ describe("composition route", () => {
 		assert.match(html, /CONFLICTED/);
 		assert.match(html, /Live work graph/);
 		assert.match(html, /Resolution state: unresolved/);
-		assert.match(html, /Offline verification: not executed in this view/);
+		assert.match(html, /PROMOTABLE CANDIDATE: NONE/);
+		assert.match(html, /Offline verification/);
+		assert.match(html, /Not run/);
+		assert.doesNotMatch(html, /\bVERIFIED\b/);
 		assert.match(html, /&lt;script&gt;alert\(1\)&lt;\/script&gt;/);
 		assert.doesNotMatch(html, /<script>alert/);
 		assert.doesNotMatch(html, /Fixture\/demo input/);

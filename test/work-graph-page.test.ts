@@ -209,22 +209,31 @@ describe("work graph page", () => {
 		state.promotion_bundles = { "permit-1": promotion("resolved-sha") };
 
 		const html = renderWorkGraphPage(state);
+		assert.match(html, /CrewContender/);
 		assert.match(html, /parent <code>parent<\/code>/);
 		assert.match(html, /API agent <code>sub-api<\/code>/);
 		assert.match(html, /UI agent <code>sub-ui<\/code>/);
 		assert.match(html, /test\/integration agent <code>sub-test<\/code>/);
 		assert.match(html, /name the contract api/);
 		assert.match(html, /add an integration check/);
-		assert.match(html, /class="edge risk-GREEN"/);
-		assert.match(html, /class="edge risk-AMBER"/);
-		assert.match(html, /class="edge risk-RED"/);
+		assert.match(html, /class="dep"/);
+		assert.match(html, />baseline</);
+		assert.match(html, />overlap</);
+		assert.match(html, />claim-conflict</);
+		assert.match(html, /Recorded risk GREEN/);
+		assert.match(html, /Recorded risk AMBER/);
+		assert.match(html, /Recorded risk RED/);
 		assert.match(html, /L2 dependency analysis unavailable/);
+		assert.doesNotMatch(html, /class="[^"]*risk-/);
 		assert.match(html, /class="overlap"/);
-		assert.doesNotMatch(html, /class="overlap[^"]*risk-/);
 		assert.match(html, /textual-line-overlap/);
+		assert.match(html, /Member contribution SHAs/);
 		assert.match(html, /New candidate/);
-		assert.match(html, /resolved-sha/);
+		assert.match(html, /id="promotable">PROMOTABLE CANDIDATE: <code>resolved-sha<\/code>/);
 		assert.match(html, /side-a/);
+		const parent = html.match(/<article class="agent parent">[\s\S]*?<\/article>/);
+		assert.ok(parent);
+		assert.doesNotMatch(parent[0], /resolved-sha/);
 		assert.match(html, />ACCEPT</);
 		assert.match(html, /QUARANTINED/);
 		assert.match(html, /eval_file_modification/);
@@ -240,8 +249,9 @@ describe("work graph page", () => {
 		assert.match(html, /Canonical destination<\/dt><dd><code>demo\/canonical<\/code>/);
 		assert.match(html, /1 of 1 envelopes include a signature field/);
 		assert.match(html, /prefix <code>abcdef123456<\/code>/);
-		assert.match(html, /Offline verification: not executed in this view/);
-		assert.match(html, /Stored bundle. Not the composition candidate./);
+		assert.match(html, /Offline verification/);
+		assert.match(html, /Not run/);
+		assert.match(html, /Stored bundle. Not the promotable candidate./);
 		assert.match(html, /&lt;script&gt;alert\(1\)&lt;\/script&gt;/);
 		assert.doesNotMatch(html, /<script>alert/);
 		assert.doesNotMatch(html, new RegExp(TOKEN_ID));
@@ -282,15 +292,23 @@ describe("work graph page", () => {
 		};
 		const html = renderWorkGraphPage(state);
 		assert.match(html, /class="stamp">CONFLICTED</);
+		assert.match(html, /class="state now">CONFLICTED/);
 		assert.match(html, /Resolution state: unresolved/);
-		assert.match(html, /Candidate SHA<\/p><p>none/);
+		assert.match(html, /id="promotable">PROMOTABLE CANDIDATE: NONE/);
 		assert.match(html, /No conflict reports are stored/);
 		assert.match(html, /No evaluation bundle is stored/);
 		assert.match(html, /No verdict is recorded/);
 		assert.match(html, /No permit is recorded/);
 		assert.match(html, /No promotion is recorded/);
+		assert.match(html, /Not run/);
+		assert.doesNotMatch(html, /resolved-sha/);
 		assert.doesNotMatch(html, /New candidate/);
 		assert.doesNotMatch(html, /class="edge /);
+		assert.doesNotMatch(html, /\bundefined\b/);
+		assert.doesNotMatch(html, /\bnull\b/);
+		const plate = html.slice(html.indexOf('id="promotable"'), html.indexOf('id="promotable"') + 80);
+		assert.match(plate, /NONE/);
+		assert.doesNotMatch(plate, /side-a/);
 		assert.doesNotMatch(html, />ACCEPT</);
 		assert.doesNotMatch(html, />REJECT</);
 		assert.doesNotMatch(html, />ABSTAIN</);
@@ -312,8 +330,10 @@ describe("work graph page", () => {
 			candidate_sha: "side-a",
 		};
 		const html = renderWorkGraphPage(state);
-		assert.match(html, /Candidate SHA is one of the contributing SHAs/);
+		assert.match(html, /id="promotable">PROMOTABLE CANDIDATE: NONE/);
+		assert.match(html, /member contribution/);
 		assert.doesNotMatch(html, /New candidate/);
+		assert.doesNotMatch(html, /id="promotable">PROMOTABLE CANDIDATE: <code>side-a/);
 	});
 
 	it("escapes a risk word that is not one of the stored four", () => {
@@ -329,16 +349,128 @@ describe("work graph page", () => {
 			},
 		];
 		const html = renderWorkGraphPage(state);
-		assert.match(html, /class="edge"/);
-		assert.doesNotMatch(html, /class="edge risk-/);
+		assert.match(html, /class="dep"/);
+		assert.doesNotMatch(html, /class="[^"]*RED/);
 		assert.doesNotMatch(html, /<script>alert/);
+		assert.match(html, /Recorded risk RED&quot;&gt;&lt;script&gt;alert\(1\)&lt;\/script&gt;/);
 		assert.match(html, /&lt;b&gt;explanation&lt;\/b&gt;/);
 	});
 
 	it("shows a fixture banner only when the caller passes one", () => {
 		const state = base();
-		assert.doesNotMatch(renderWorkGraphPage(state), /Fixture\/demo input/);
+		const bare = renderWorkGraphPage(state);
+		assert.doesNotMatch(bare, /Fixture\/demo input/);
+		assert.match(bare, /No CrewContender is recorded/);
+		assert.match(bare, /No composition is recorded/);
+		assert.match(bare, /No evaluation bundle is stored/);
+		assert.match(bare, /Not run/);
+		assert.doesNotMatch(bare, /\bundefined\b/);
+		assert.doesNotMatch(bare, /\bnull\b/);
 		const html = renderWorkGraphPage(state, { fixtureBanner: "Fixture/demo input. Local git." });
 		assert.match(html, /Fixture\/demo input\. Local git\./);
+	});
+
+	it("leaves the candidate empty unless the recorded state is COMPOSED or RESOLVED", () => {
+		for (const status of ["PENDING", "COMPOSING", "CONFLICTED", "RESOLVING"]) {
+			const state = base();
+			state.composition = {
+				status: status as NonNullable<AuthorityState["composition"]>["status"],
+				contender_id: "contender-demo",
+				baseline: "baseline-sha",
+				agents: [
+					{ id: "sub-api", role: "api", intent: "api", sha: "side-a", paths: ["src/a"], claim_work_id: null },
+					{ id: "sub-ui", role: "ui", intent: "ui", sha: "side-b", paths: ["src/b"], claim_work_id: null },
+				],
+				contributing_shas: ["side-a", "side-b"],
+				files: [],
+				candidate_sha: "sneaky-sha",
+			};
+			const html = renderWorkGraphPage(state);
+			assert.match(html, new RegExp(`class="stamp">${status}`));
+			assert.match(html, /id="promotable">PROMOTABLE CANDIDATE: NONE/);
+			assert.doesNotMatch(html, /sneaky-sha/);
+			assert.doesNotMatch(html, /New candidate/);
+		}
+
+		const composed = base();
+		composed.composition = {
+			status: "COMPOSED",
+			contender_id: "contender-demo",
+			baseline: "baseline-sha",
+			agents: [
+				{ id: "sub-api", role: "api", intent: "api", sha: "side-a", paths: ["src/a"], claim_work_id: null },
+				{ id: "sub-ui", role: "ui", intent: "ui", sha: "side-b", paths: ["src/b"], claim_work_id: null },
+			],
+			contributing_shas: ["side-a", "side-b"],
+			files: [],
+			candidate_sha: "composed-sha",
+		};
+		const composedHtml = renderWorkGraphPage(composed);
+		assert.match(composedHtml, /id="promotable">PROMOTABLE CANDIDATE: <code>composed-sha<\/code>/);
+		assert.match(composedHtml, /Resolution state: COMPOSED/);
+		assert.doesNotMatch(composedHtml, /New candidate/);
+	});
+
+	it("prints a passed-in work graph and still refuses a member SHA as the candidate", () => {
+		const state = base();
+		state.composition = {
+			status: "CONFLICTED",
+			contender_id: "contender-demo",
+			baseline: "baseline-sha",
+			agents: [
+				{ id: "sub-api", role: "api", intent: "stored intent", sha: "side-a", paths: ["src/contract.js"], claim_work_id: null },
+				{ id: "sub-ui", role: "ui", intent: "stored ui", sha: "side-b", paths: ["src/contract.js"], claim_work_id: null },
+			],
+			contributing_shas: ["side-a", "side-b"],
+			files: [],
+			candidate_sha: null,
+		};
+		const shown = renderWorkGraphPage(state, {
+			graph: {
+				task: { intent: "graph intent" },
+				composition_state: "RESOLVED",
+				candidate_sha: "graph-sha",
+				crew: {
+					contender_id: "contender-demo",
+					parent: { agent_id: "parent", contender_id: "contender-demo", fork_repo: "fork-demo" },
+					baseline: "baseline-sha",
+					outcome: "RESOLVED",
+					members: [
+						{
+							agent_id: "sub-api",
+							role: "api",
+							intent: "from graph",
+							scope: ["src/contract.js"],
+							claim_work_id: "W-api",
+							commit_sha: "side-a",
+							status: "committed",
+						},
+					],
+				},
+				dependencies: [{ from: "side-a", to: "baseline-sha", relation: "baseline" }],
+				overlaps: [{ path: "src/contract.js", classification: "textual-line-overlap", agents: ["sub-api", "sub-ui"] }],
+			},
+		});
+		assert.match(shown, /<h1>graph intent<\/h1>/);
+		assert.match(shown, /class="stamp">RESOLVED/);
+		assert.match(shown, /id="promotable">PROMOTABLE CANDIDATE: <code>graph-sha<\/code>/);
+		assert.match(shown, /New candidate/);
+		assert.match(shown, /from graph/);
+		assert.match(shown, /side-a/);
+
+		const hidden = renderWorkGraphPage(state, {
+			graph: {
+				composition_state: "RESOLVED",
+				candidate_sha: "side-a",
+				crew: {
+					parent: { agent_id: "parent", contender_id: "contender-demo", fork_repo: "fork-demo" },
+					baseline: "baseline-sha",
+					members: [{ agent_id: "sub-api", role: "api", intent: "api", scope: ["src/a"], commit_sha: "side-a", status: "committed" }],
+				},
+			},
+		});
+		assert.match(hidden, /id="promotable">PROMOTABLE CANDIDATE: NONE/);
+		assert.match(hidden, /member contribution/);
+		assert.doesNotMatch(hidden, /New candidate/);
 	});
 });
