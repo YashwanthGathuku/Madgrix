@@ -2,8 +2,11 @@
  * One parent fork, role-scoped sub-agents, one combined SHA.
  *
  * Agentfleet is proprietary. This module does not vendor it. The live runner
- * calls `fleet validate` on configs/git4agents-fork-crew.yaml. Roles and file
- * areas come from configs/git4agents-fork-crew.json, which we own.
+ * calls `fleet validate` on the manifest paired with the crew config.
+ * configs/git4agents-fork-crew.yaml lists parent, sub-api, and sub-ui.
+ * configs/git4agents-demo-composition.yaml lists parent, sub-api, sub-ui,
+ * and sub-test, in that order. Roles and file areas come from the JSON
+ * config, which we own. `MADGRIX_FLEET_CONFIG` overrides the pair.
  *
  * Sub-agents do not get sibling repos. Each commits on its own worktree of the
  * parent fork, and those commands run concurrently. Disjoint edits, including
@@ -26,6 +29,25 @@ const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../
 
 export const DEFAULT_FORK_CREW_CONFIG = path.join(repoRoot, "configs/git4agents-fork-crew.json");
 export const DEFAULT_FORK_CREW_FLEET_CONFIG = path.join(repoRoot, "configs/git4agents-fork-crew.yaml");
+export const DEMO_COMPOSITION_CONFIG = path.join(repoRoot, "configs/demo-composition.json");
+export const DEMO_COMPOSITION_FLEET_CONFIG = path.join(repoRoot, "configs/git4agents-demo-composition.yaml");
+
+/**
+ * The fleet manifest whose summary.agent_ids must equal the crew, in order.
+ * The demo JSON pairs with the four-agent manifest. Any other crew config
+ * pairs with the two-sub-agent manifest. An explicit MADGRIX_FLEET_CONFIG
+ * still wins at the call site.
+ *
+ * @param {string} [crewConfig]
+ * @returns {string}
+ */
+export function fleetConfigForCrew(crewConfig = DEFAULT_FORK_CREW_CONFIG) {
+	const resolved = path.resolve(crewConfig);
+	if (resolved === path.resolve(DEMO_COMPOSITION_CONFIG) || path.basename(resolved) === "demo-composition.json") {
+		return DEMO_COMPOSITION_FLEET_CONFIG;
+	}
+	return DEFAULT_FORK_CREW_FLEET_CONFIG;
+}
 
 const AGENT_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 const RECORD_PATH = ".madgrix/subagent-intents.json";

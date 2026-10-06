@@ -12,11 +12,18 @@ A fork crew that has a known unresolved textual overlap is not an admissible can
 
 ## (2) The result
 
-`scripts/lib/fork-crew.mjs` classifies the sub-agent commits:
+The authority accepts only these composition states:
 
+- **PENDING.** The crew is recorded and has not started. `candidate_sha` is null.
+- **COMPOSING.** Members are running. `candidate_sha` is null.
 - **COMPOSED.** Disjoint edits, including non-overlapping lines of one file, become one merge commit. Its parents are the frozen baseline and each sub-agent commit. `candidate_sha` is that commit.
-- **CONFLICTED.** Overlapping lines produce no commit. The parent checkout stays at the baseline. The result carries the baseline, the agents and their intents, the contributing SHAs, the paths, the classification `textual-line-overlap`, and a short excerpt of each side. `candidate_sha` is null. The runner does not push.
+- **CONFLICTED.** Overlapping lines produce no commit. The parent checkout stays at the baseline. The result carries the baseline, the agents and their intents, the contributing SHAs, the paths, the classification `textual-line-overlap`, and a short excerpt of each side. `candidate_sha` is null. The runner does not push. Conflict markers are not a candidate.
+- **RESOLVING.** A resolver may be running. `candidate_sha` is null. This is not promotable.
 - **RESOLVED.** A resolver command may read the baseline tree, `.madgrix/conflict.json`, and `.madgrix/sides/<agent>/`. It receives `MADGRIX_CONFLICT_PATH` and `MADGRIX_BASELINE_SHA` only. It does not receive `CONTROL_SERVICE_TOKEN`, `EVALUATION_SERVICE_TOKEN`, or the agent service token. The commit it writes is a new SHA. That SHA is not one of the contributing SHAs. It still needs its own evaluation, verdict, and permit.
+
+PENDING may become COMPOSING, COMPOSED, or CONFLICTED. COMPOSING may become COMPOSED or CONFLICTED. CONFLICTED may become RESOLVING or RESOLVED. RESOLVING may become RESOLVED, or return to CONFLICTED. COMPOSED and RESOLVED do not change their candidate SHA. A contributing SHA cannot be recorded as the COMPOSED or RESOLVED candidate.
+
+A crew contender is the parent fork plus those member agents. The permit still names one exact candidate SHA. The crew record is not a second promotion unit.
 
 ## (3) The authority
 
@@ -26,7 +33,7 @@ The control plane records the result with `POST /tasks/:id/composition` (`CONTRO
 
 - The baseline must be the frozen task baseline.
 - CONFLICTED cannot be replaced by COMPOSED. RESOLVED may follow CONFLICTED. A recorded candidate SHA cannot be rebound. The same canonical record is an idempotent no-op.
-- While the record is CONFLICTED, `submitEvaluation`, `issuePermit`, and `attemptPromotion` fail closed for that contender (`UNRESOLVED_CONFLICT` for the permit and promotion paths; evidence throws). No permit is stored. A refused promotion does not consume a permit and returns no canonical-write effect.
+- While the record is PENDING, COMPOSING, CONFLICTED, or RESOLVING, `submitEvaluation`, `issuePermit`, and `attemptPromotion` fail closed for that contender (`UNRESOLVED_CONFLICT` for the permit and promotion paths; evidence throws). No permit is stored. A refused promotion does not consume a permit and returns no canonical-write effect.
 - After COMPOSED or RESOLVED, a contributing SHA is not evidence for the new candidate and cannot be permitted or promoted in its place. A later SHA that is not a contributing SHA (an empty republish of the composed commit, for example) is a different candidate and needs its own evaluation. It is not treated as the already-recorded SHA.
 
 The Worker `runPromotion` applies the same refusal before it asks the promotion container to write.

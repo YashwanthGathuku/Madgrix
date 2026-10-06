@@ -640,10 +640,11 @@ export async function submitEvaluation(
 		throw new Error(`evaluation rejected: unknown contender ${JSON.stringify(bundle.contender_id)}`);
 	if (compositionBlocks(state, bundle.contender_id, bundle.candidate_sha)) {
 		const composition = state.composition;
+		const promotable = composition?.status === "COMPOSED" || composition?.status === "RESOLVED";
 		throw new Error(
-			composition?.status === "CONFLICTED"
-				? `evaluation rejected: contender ${bundle.contender_id} is CONFLICTED — an unresolved composition is not a candidate`
-				: `evaluation rejected: ${bundle.candidate_sha} is a contributing SHA, not the composition candidate ${composition?.candidate_sha ?? "none"}`,
+			promotable
+				? `evaluation rejected: ${bundle.candidate_sha} is a contributing SHA, not the composition candidate ${composition?.candidate_sha ?? "none"}`
+				: `evaluation rejected: contender ${bundle.contender_id} is ${composition?.status ?? "CONFLICTED"} — an unresolved composition is not a candidate`,
 		);
 	}
 	if (contender.latest_commit !== bundle.candidate_sha)
@@ -1043,23 +1044,46 @@ export function evaluationBases(contender: ContenderRecord): string[] {
 }
 
 /**
- * CONFLICTED blocks every evidence submission and permit for that contender.
- * A permit for a contributing SHA is also blocked once a COMPOSED or RESOLVED
- * candidate exists, so an earlier side cannot ship in place of the new SHA.
- * A later SHA (an empty republish of the composed tree, for example) is not
- * in `contributing_shas` and is not blocked here; it still needs its own evaluation.
+ * A composition blocks promotion of this contender unless it is COMPOSED or
+ * RESOLVED and the SHA is that candidate. PENDING, COMPOSING, CONFLICTED, and
+ * RESOLVING have no promotable candidate. A contributing SHA cannot stand in
+ * for the COMPOSED or RESOLVED candidate. A later SHA that is not a
+ * contributing SHA (an empty republish, for example) is not blocked here; it
+ * still needs its own evaluation.
  */
 export function compositionBlocks(state: AuthorityState, contenderId: string, sha?: string): boolean {
 	const composition = state.composition;
 	if (!composition || composition.contender_id !== contenderId) return false;
-	if (composition.status === "CONFLICTED") return true;
+	if (composition.status !== "COMPOSED" && composition.status !== "RESOLVED") return true;
 	if (sha === undefined) return false;
 	return sha !== composition.candidate_sha && composition.contributing_shas.includes(sha);
 }
 
+const COMPOSITION_NEXT: Record<CompositionRecord["status"], CompositionRecord["status"][]> = {
+	PENDING: ["COMPOSING", "COMPOSED", "CONFLICTED"],
+	COMPOSING: ["COMPOSED", "CONFLICTED"],
+	COMPOSED: [],
+	CONFLICTED: ["RESOLVING", "RESOLVED"],
+	RESOLVING: ["RESOLVED", "CONFLICTED"],
+	RESOLVED: [],
+};
+
+function compositionPromotable(status: CompositionRecord["status"]): boolean {
+	return status === "COMPOSED" || status === "RESOLVED";
+}
+
 function normalizeComposition(input: CompositionRecord): CompositionRecord {
-	if (input.status !== "COMPOSED" && input.status !== "CONFLICTED" && input.status !== "RESOLVED") {
-		throw new Error("recordComposition: status must be COMPOSED, CONFLICTED, or RESOLVED");
+	if (
+		input.status !== "PENDING" &&
+		input.status !== "COMPOSING" &&
+		input.status !== "COMPOSED" &&
+		input.status !== "CONFLICTED" &&
+		input.status !== "RESOLVING" &&
+		input.status !== "RESOLVED"
+	) {
+		throw new Error(
+			"recordComposition: status must be PENDING, COMPOSING, COMPOSED, CONFLICTED, RESOLVING, or RESOLVED",
+		);
 	}
 	if (typeof input.contender_id !== "string" || input.contender_id === "") {
 		throw new Error("recordComposition: contender_id is required");
@@ -1067,21 +1091,31 @@ function normalizeComposition(input: CompositionRecord): CompositionRecord {
 	if (typeof input.baseline !== "string" || input.baseline === "") {
 		throw new Error("recordComposition: baseline is required");
 	}
-	if (!Array.isArray(input.contributing_shas) || input.contributing_shas.length < 2) {
+	if (!Array.isArray(input.contributing_shas) || input.contributing_shas.some((sha) => typeof sha !== "string")) {
+		throw new Error("recordComposition: contributing_shas must be a list of SHAs");
+	}
+	if (!Array.isArray(input.agents)) {
+		throw new Error("recordComposition: agents must be a list");
+	}
+	const open = input.status === "PENDING" || input.status === "COMPOSING";
+	if (!open && input.contributing_shas.length < 2) {
 		throw new Error("recordComposition: at least two contributing SHAs are required");
 	}
-	if (!Array.isArray(input.agents) || input.agents.length < 2) {
+	if (!open && input.agents.length < 2) {
 		throw new Error("recordComposition: at least two agents are required");
 	}
-	if (input.status === "CONFLICTED") {
-		if (input.candidate_sha !== null) throw new Error("recordComposition: CONFLICTED has no candidate SHA");
-		if (!Array.isArray(input.files) || input.files.length === 0) {
-			throw new Error("recordComposition: CONFLICTED names no files");
+	const promotable = compositionPromotable(input.status);
+	if (!promotable) {
+		if (input.candidate_sha !== null && input.candidate_sha !== undefined) {
+			throw new Error(`recordComposition: ${input.status} has no candidate SHA`);
 		}
 	} else if (typeof input.candidate_sha !== "string" || input.candidate_sha === "") {
 		throw new Error("recordComposition: COMPOSED and RESOLVED require a candidate SHA");
 	} else if (input.contributing_shas.includes(input.candidate_sha)) {
 		throw new Error("recordComposition: the candidate SHA must be new, not a contributing SHA");
+	}
+	if (input.status === "CONFLICTED" && (!Array.isArray(input.files) || input.files.length === 0)) {
+		throw new Error("recordComposition: CONFLICTED names no files");
 	}
 	const files = (input.files ?? []).map((file) => {
 		if (typeof file.path !== "string" || file.path === "" || file.path.includes("..")) {
@@ -1116,13 +1150,16 @@ function normalizeComposition(input: CompositionRecord): CompositionRecord {
 		})),
 		contributing_shas: [...input.contributing_shas],
 		files,
-		candidate_sha: input.status === "CONFLICTED" ? null : input.candidate_sha,
+		candidate_sha: promotable ? input.candidate_sha : null,
 	};
 }
 
 /**
  * Record a fork-crew composition. Only the control plane calls this.
- * CONFLICTED cannot be replaced by COMPOSED. The same record is an idempotent no-op.
+ * CONFLICTED cannot be replaced by COMPOSED. PENDING and COMPOSING may become
+ * COMPOSED or CONFLICTED. CONFLICTED may become RESOLVING, then RESOLVED.
+ * COMPOSED and RESOLVED keep the candidate SHA they named. The same record is
+ * an idempotent no-op.
  */
 export async function recordComposition(
 	state: AuthorityState,
@@ -1141,17 +1178,20 @@ export async function recordComposition(
 			throw new Error("recordComposition: this task already has a composition for another contender");
 		}
 		if (canonicalJson(current) === canonicalJson(composition)) return state;
-		if (current.status === "CONFLICTED" && composition.status !== "RESOLVED") {
-			throw new Error("recordComposition: CONFLICTED cannot become an ordinary candidate");
-		}
-		if (current.status !== "CONFLICTED" && composition.status === "CONFLICTED") {
-			throw new Error("recordComposition: a candidate cannot be turned back into CONFLICTED");
-		}
 		if (
-			current.status !== "CONFLICTED" &&
+			compositionPromotable(current.status) &&
 			composition.candidate_sha !== current.candidate_sha
 		) {
 			throw new Error("recordComposition: the candidate SHA is already bound");
+		}
+		if (current.status === "CONFLICTED" && composition.status !== "RESOLVED" && composition.status !== "RESOLVING") {
+			throw new Error("recordComposition: CONFLICTED cannot become an ordinary candidate");
+		}
+		if (compositionPromotable(current.status) && composition.status === "CONFLICTED") {
+			throw new Error("recordComposition: a candidate cannot be turned back into CONFLICTED");
+		}
+		if (!COMPOSITION_NEXT[current.status].includes(composition.status)) {
+			throw new Error(`recordComposition: ${current.status} cannot become ${composition.status}`);
 		}
 	}
 	return appendLedger({ ...state, composition }, "composition_recorded", {

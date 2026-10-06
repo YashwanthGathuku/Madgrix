@@ -2,7 +2,7 @@
 
 Status words: **IMPLEMENTED**, **TESTED LOCALLY**, **TESTED ON CLOUDFLARE**, **NOT YET VERIFIED**.
 
-Recorded against `git4agents/combined` `4a8c4cc7b521688f839f0f332605dcefa3984c38` on 2026-10-06. Local suite: LF `git archive` of that SHA, WSL Node v24.21.0, 296 passed, slice OK, head-move OK, benchmark `zero_tolerance_ok: true`.
+The 296-test record belongs to `git4agents/combined` `4a8c4cc7b521688f839f0f332605dcefa3984c38` (LF archive, WSL Node v24.21.0, slice OK, head-move OK, benchmark `zero_tolerance_ok: true`). After the demo fleet manifest, the LF copy of this working tree on the same Node was 300 passed and 0 failed. `npm run slice`, `npm run head-move`, and `npm run bench` were not re-run as standalone commands. Nothing in that run was on Cloudflare.
 
 ## Not a Cloudflare result
 
@@ -22,7 +22,7 @@ Nothing in this SHA was deployed. `live:e2e` was not run. The public worker root
 
 - `submitEvaluation` does not recompute `bundle_hash`. The verdict seam does. A stored bundle with a bad hash is ineligible. The evaluation domain is the trust point for admission flags.
 - The demo fixture's authority check refuses a contributing SHA. It does not execute `test/integration/check.js`.
-- The live runner requires `fleet validate` to list the same agent ids as the crew config. The demo JSON has `sub-test`. The shipped fleet manifest does not. The local demo test does not call `fleet`. A live run of that JSON is **NOT YET VERIFIED** and will fail the roster check until a matching manifest exists.
+- The live runner requires `fleet validate` to list the same agent ids as the crew config. `configs/git4agents-demo-composition.yaml` lists `parent`, `sub-api`, `sub-ui`, `sub-test`. The runner pairs it with `configs/demo-composition.json`. A `fleet` binary older than Agentfleet `paper-hardening` `49032db` omits `summary.agent_ids`, so set `MADGRIX_FLEET_BIN`. A live run of that JSON is **NOT YET VERIFIED** on Cloudflare.
 - Queue idempotency is tested with in-memory delivery. A live redelivery was not observed.
 - Canonical writes in tests are local git or FakeArtifacts. The live fork token's inability to push the canonical repo was not observed on Artifacts.
 - Offline verify trusts the pinned key the operator passes. A bundle that carries a different key does not select that key. This was tested locally, including the slice harness.
@@ -33,7 +33,7 @@ Nothing in this SHA was deployed. `live:e2e` was not run. The public worker root
 - This Windows checkout has `core.autocrlf=true`. Git blobs are LF. WSL `bash` on the working tree fails `set -o pipefail` because of a trailing CR. Run container tests from an LF archive or a Linux checkout.
 - Windows Node is v22.17.0. `tsc` works. `node --test` on TypeScript needs Node 24, or `NODE_OPTIONS=--experimental-strip-types` on every spawned child.
 - WSL `npx tsc` fails closed: the installed `node_modules` has `@typescript/typescript-win32-x64` and not the linux package.
-- `docs/DEMO_SCRIPT.md` and `docs/GIT_PROBLEMS.md` still describe older test counts and the old "keep conflict markers" behavior. The current behavior is this file, `docs/COMPETITION_FINALIZATION.md`, and `specs/amendments/composition-result-v1.md`.
+- `docs/DEMO_SCRIPT.md` narrates 300 tests and 93 suites from the local LF run. The fork-crew overlap behavior in that file, in `docs/GIT_PROBLEMS.md`, and in `specs/amendments/composition-result-v1.md` is CONFLICTED with no candidate commit. Conflict-marker commits are not ordinary output. That suite was not run on Cloudflare.
 
 ## Deliberately not done
 

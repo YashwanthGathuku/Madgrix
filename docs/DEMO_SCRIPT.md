@@ -30,8 +30,8 @@ npm install   # if not already done
 npm test
 ```
 
-**Say:** "74 tests, 20 suites, all green — including the slice itself as an integration
-test." **Expected:** `ℹ tests 74 / ℹ pass 74 / ℹ fail 0`.
+**Say:** "300 tests, 93 suites, all green — including the slice itself as an integration
+test." **Expected:** `ℹ tests 300 / ℹ pass 300 / ℹ fail 0`. That count is the local LF suite on Node 24. It is not a Cloudflare run. `npm test` needs a `fleet` that prints `summary.agent_ids` (Agentfleet `paper-hardening` `49032db` or newer, or `MADGRIX_FLEET_BIN`).
 
 ## 1:30–5:30 — The money: the full loop
 
@@ -115,12 +115,14 @@ zero false promotions, zero stale promotions, zero duplicate effects, 100% fail-
 **Close:** "Forks are commodity. Adjudication plus enforcement plus verifiable
 promotion — that's Verdict Seam."
 
+The slice above is one contender per fork. The fork-crew path is separate. When two sub-agents change the same lines, the result is CONFLICTED: no commit, no candidate SHA, and no conflict-marker file promoted as ordinary output. A resolver writes a new SHA, and that SHA still goes through evaluation. Do not narrate a marker commit as the crew's candidate.
+
 ---
 
 ## Pre-flight checklist (day before)
 
 - [ ] Fresh clone/machine: `npm install` works with no cache.
-- [ ] `npm test` → 74/74. `npm run slice` → ends `SLICE OK`.
+- [ ] `npm test` → 300/300 on Node 24 with a fleet that prints `summary.agent_ids`. `npm run slice` → ends `SLICE OK`.
 - [ ] Screen-record one clean full run; keep the file as the live-failure backup.
 - [ ] Terminal font large enough to read on video; clear scrollback before each command.
 - [ ] If showing the tamper scene, rehearse the `node -e` one-liner once.

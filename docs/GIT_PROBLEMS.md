@@ -48,19 +48,21 @@ Smallest next change. Do not redeploy. Do not run a full production `live:e2e` u
 
 What happened. Git4agents needed a way to name agents without hardcoding three ids. Agentfleet (`agent-orchestration-os`, branch `paper-hardening`, `49032db`) is proprietary. Its source must not be copied into this MIT repo.
 
-What is already fixed. The crew runner shells out to `fleet validate` on `configs/git4agents-fork-crew.yaml` and requires the ids `parent`, `sub-api`, `sub-ui`. Roles and path globs live in the JSON config, which this repo owns. `fleet run` is not called, because it would invoke a model.
+What is already fixed. The crew runner shells out to `fleet validate` and requires `summary.agent_ids` to equal the crew, in order. `configs/git4agents-fork-crew.yaml` lists `parent`, `sub-api`, `sub-ui`. `configs/git4agents-demo-composition.yaml` lists `parent`, `sub-api`, `sub-ui`, `sub-test`. The runner pairs `configs/demo-composition.json` with that second manifest unless `MADGRIX_FLEET_CONFIG` is set. Roles and path globs live in the JSON config, which this repo owns. `fleet run` is not called, because it would invoke a model.
 
-What is still open. Agentfleet is not executing the sub-agents. The file split is the JSON commands. That is intentional.
+What is still open. Agentfleet is not executing the sub-agents. The file split is the JSON commands. That is intentional. `fleet` 0.3.0 on a PATH that predates Agentfleet `paper-hardening` `49032db` does not print `summary.agent_ids`. The live runner needs that build, or `MADGRIX_FLEET_BIN` pointed at it. This was not run on Cloudflare.
 
-Smallest next change. None before the demo. Keep `fleet validate`. Do not call `fleet run`. Do not vendor Agentfleet.
+Smallest next change. Keep `fleet validate`. Do not call `fleet run`. Do not vendor Agentfleet.
 
-## 6. Same-file overlap keeps markers, not both edits
+## 6. Same-file overlap is not a candidate commit
 
-What happened. If two sub-agents touch the same file, the combine must not silent-merge and must not drop a loser. The current combine writes git conflict markers containing both bodies, and writes both claims to `.madgrix/subagent-intents.json`. The unit test checks that `api-body` and `ui-body` are both inside `src/shared.js`, and that neither body is chosen by itself.
+What happened. An earlier combine wrote git conflict markers into the file and committed that tree. The runner then pushed the marker commit as an ordinary candidate SHA. A judge who opened the file saw markers, and the promotion path could treat that SHA as reviewed work.
 
-What is still open. Both intents are recorded. They are not applied as a clean file when the two edits do not textually overlap inside that file. Markers are correct only when the same lines actually collide. A judge who opens the file today sees a conflict, not the surviving work of both edits.
+What is already fixed. Disjoint edits, including non-overlapping lines of one file, become one COMPOSED commit. Both claims stay in `.madgrix/subagent-intents.json`. Overlapping lines are CONFLICTED: no commit is written, HEAD stays on the baseline, and there is no candidate SHA. A resolver may later write a new SHA. That SHA is not one of the contributing SHAs, and it still needs evaluation. Conflict markers are not ordinary output.
 
-Smallest next change. Before writing markers, diff the two versions against the parent-fork baseline. If the changed lines do not overlap, write one file that contains both edits, and still record both claims in `.madgrix/subagent-intents.json`. If the changed lines do overlap, keep today's markers and the same record. Add a unit test with two edits in different parts of one file (clean result, both claims) and the existing same-line case (markers, both claims). Do not pick a winner.
+What is still open. This behavior is tested locally. It has not been run on Cloudflare.
+
+Smallest next change. Do not put the marker commit back. Keep the CONFLICTED result with no candidate.
 
 ## 7. TheUstad is not wired
 
@@ -76,12 +78,12 @@ Smallest next change. After the three judge moments below work, and only if the 
 
 Build in this order. Stop if a step is not proven by a local test. Do not deploy, and do not redeploy the worker, unless a step changes worker code. None of the steps below should.
 
-1. Same-file combine. Apply both intents when their lines do not overlap. Keep conflict markers and both claims when they do. Test both cases in `test/fork-crew.test.ts`.
+1. Same-file combine. Done locally. Non-overlapping lines become one COMPOSED commit. Overlapping lines produce no commit and no candidate. Do not restore conflict-marker commits.
 
 2. Judge-visible dry run of the fork crew, after step 1, with the workspace deleted at the end. Show three things and nothing else:
    - Context after the agent is gone: task context from the worker if you already have a local or recorded run, and `.madgrix/subagent-intents.json` read from the combined SHA, not from the deleted workspace.
    - Side-by-side review: the two sub-agent diffs, then the combined SHA.
-   - Same-file overlap: one file where both intents are in the surviving SHA (clean apply if the lines differ, markers if they collide), with both claims still in the intents record.
+   - Same-file overlap: non-overlapping lines are both in the COMPOSED SHA. Overlapping lines leave no candidate commit. Both claims stay on the conflict record. Do not show a marker commit as the result.
 
 3. Narrate the subscription pause if the demo is live. Keep the `f2346ed4` wait. Budget 30 seconds for a new subscription and up to 30 seconds for the queue batch. If an empty republish is created, say so, and show that its tree is the combined work.
 
