@@ -162,9 +162,15 @@ interface Evaluation {
 	result: any;
 }
 
+/** Node 22.17 does not strip types unless asked. 22.18 and 24 do. The flag is on argv so it is not part of the child's environment. */
+function nodeScriptArgs(script: string): string[] {
+	const [major, minor] = process.versions.node.split(".").map(Number);
+	return major < 22 || (major === 22 && minor < 18) ? ["--experimental-strip-types", script] : [script];
+}
+
 function runNode(script: string, env: Record<string, string>): Promise<{ code: number | null; stderr: string }> {
 	return new Promise((resolve, reject) => {
-		const child = spawn(process.execPath, [script], { cwd: REPO_ROOT, env, stdio: ["ignore", "ignore", "pipe"] });
+		const child = spawn(process.execPath, nodeScriptArgs(script), { cwd: REPO_ROOT, env, stdio: ["ignore", "ignore", "pipe"] });
 		let stderr = "";
 		child.stderr.on("data", (b) => (stderr += b));
 		child.on("error", reject);
@@ -191,7 +197,7 @@ function evaluate(candidate: { contenderId: string; sha: string }, extra: Record
 		...extra,
 	};
 	return new Promise((resolve, reject) => {
-		const child = spawn(process.execPath, ["scripts/evaluate-candidate.ts"], {
+		const child = spawn(process.execPath, nodeScriptArgs("scripts/evaluate-candidate.ts"), {
 			cwd: REPO_ROOT,
 			env,
 			stdio: ["ignore", "pipe", "pipe"],

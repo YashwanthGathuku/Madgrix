@@ -200,6 +200,7 @@ describe("promote: the container's answers, as the PromotionWorkflow sees them",
 	for (const [outcome, exit] of [
 		["PUSH_REJECTED", 44],
 		["UNSUPPORTED_TREE_ENTRY", 46],
+		["UNRESOLVED_CONFLICT", 48],
 	] as const) {
 		it(`a terminal ${outcome} (promote.sh exit ${exit}) completes the instance with the 409, unretried; the permit stays unconsumed`, async () => {
 			const { h, permit } = await issuedPermit();

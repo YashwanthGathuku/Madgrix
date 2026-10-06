@@ -34,6 +34,7 @@ import {
 	type Signer,
 } from "./attestation.ts";
 import { classifyPair, validateClaim, type ClaimInput } from "./claims.ts";
+import { hasUnresolvedMergeArtifacts } from "./merge-artifacts.ts";
 import { verifyReveal } from "./verifiers.ts";
 import {
 	importEd25519PublicKey,
@@ -625,6 +626,11 @@ export async function submitEvaluation(
 	)
 		throw new Error("evaluation rejected: evaluation_config_sha256 is not a SHA-256 hex digest");
 	const evalFileChanges = bundle.eval_file_changes;
+	const mergeArtifacts = bundle.unresolved_merge_artifacts;
+	if (mergeArtifacts !== undefined) {
+		if (!Array.isArray(mergeArtifacts) || !mergeArtifacts.every((p) => typeof p === "string" && p !== ""))
+			throw new Error("evaluation rejected: unresolved_merge_artifacts must be a list of paths");
+	}
 	if (evalFileChanges !== undefined) {
 		if (!Array.isArray(evalFileChanges) || !evalFileChanges.every((p) => typeof p === "string" && p !== ""))
 			throw new Error("evaluation rejected: eval_file_changes must be a list of paths");
@@ -1213,11 +1219,16 @@ export async function issuePermit(
 	if (!ev) throw new Error(`issuePermit: no evaluation bundle for winner ${winner_sha}`);
 	const contender = Object.hasOwn(state.contenders, ev.contender_id) ? state.contenders[ev.contender_id] : undefined;
 	if (!contender) throw new Error(`issuePermit: the winner's contender ${ev.contender_id} is unknown`);
-	if (compositionBlocks(state, ev.contender_id, winner_sha)) {
+	if (compositionBlocks(state, ev.contender_id, winner_sha) || hasUnresolvedMergeArtifacts(ev)) {
 		const refused = await appendLedger(
 			state,
 			"permit_refused",
-			{ outcome: "UNRESOLVED_CONFLICT", winner_sha, contender_id: ev.contender_id },
+			{
+				outcome: "UNRESOLVED_CONFLICT",
+				winner_sha,
+				contender_id: ev.contender_id,
+				paths: ev.unresolved_merge_artifacts ?? [],
+			},
 			ctx,
 		);
 		return { state: refused, outcome: "UNRESOLVED_CONFLICT", permit: null, contender_id: ev.contender_id };
@@ -1313,11 +1324,20 @@ export async function attemptPromotion(
 		// Single-consume idempotency: a second presentation is a no-op ACK.
 		return { state, outcome: "ALREADY_CONSUMED", effects: [] };
 	}
-	if (compositionBlocks(state, permit.contender_id, permit.winner_candidate_sha)) {
+	const recordedBundle = state.evaluations[permit.winner_candidate_sha];
+	if (
+		compositionBlocks(state, permit.contender_id, permit.winner_candidate_sha) ||
+		hasUnresolvedMergeArtifacts(recordedBundle)
+	) {
 		const blocked = await appendLedger(
 			state,
 			"promotion_aborted",
-			{ permit_id, error: "UNRESOLVED_CONFLICT", winner_sha: permit.winner_candidate_sha },
+			{
+				permit_id,
+				error: "UNRESOLVED_CONFLICT",
+				winner_sha: permit.winner_candidate_sha,
+				paths: recordedBundle?.unresolved_merge_artifacts ?? [],
+			},
 			ctx,
 		);
 		return { state: blocked, outcome: "UNRESOLVED_CONFLICT", effects: [] };

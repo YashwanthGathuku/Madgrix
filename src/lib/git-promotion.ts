@@ -20,6 +20,7 @@
  * Pure: no I/O beyond the injected git.
  */
 
+import { unresolvedMergeArtifacts } from "./merge-artifacts.ts";
 import { treeDigestV1, type TreeDigestEntry } from "./tree-digest.ts";
 
 /** A script run: what the container's exec reports. */
@@ -38,6 +39,8 @@ export const PROMOTE_EXIT = {
 	CANDIDATE_MISMATCH: 45,
 	UNSUPPORTED_TREE_ENTRY: 46,
 	BASELINE_MISMATCH: 47,
+	/** Blob conflict-marker pair. Not a semantic-conflict detector. Checked before any fast-forward, including ALREADY_WRITTEN. */
+	UNRESOLVED_CONFLICT: 48,
 } as const;
 
 /** rebase.sh's exit statuses. */
@@ -103,6 +106,7 @@ export type PromotionResultOutcome =
 	| "PUSH_REJECTED"
 	| "UNSUPPORTED_TREE_ENTRY"
 	| "BASELINE_MISMATCH"
+	| "UNRESOLVED_CONFLICT"
 	| "GIT_ERROR";
 
 export interface PromotionResult {
@@ -163,6 +167,16 @@ export function promotionHttpResult(exit: number, stdout: string, stderr: string
 			return {
 				status: 409,
 				body: { outcome: "BASELINE_MISMATCH", detail: "reviewed candidate is not a descendant of the permit-bound destination head" },
+			};
+		case PROMOTE_EXIT.UNRESOLVED_CONFLICT:
+			return {
+				status: 409,
+				body: {
+					outcome: "UNRESOLVED_CONFLICT",
+					detail: f.PATHS
+						? `unresolved merge artifacts: ${f.PATHS}`
+						: "unresolved merge artifacts in the candidate tree",
+				},
 			};
 		default:
 			return gitError(exit, stderr, "git promotion");
@@ -257,13 +271,25 @@ export async function runPromoteModel(input: PromoteInput, git: PromoteGit): Pro
 	if (fetched === null) return run(GIT_FATAL, "", `fatal: remote error: upload-pack: not our ref ${input.candidate_sha}\n`);
 	if (fetched !== input.candidate_sha) return run(PROMOTE_EXIT.CANDIDATE_MISMATCH, "", "candidate SHA mismatch\n");
 
-	const digest = await treeDigestV1(await git.treeEntries(input.candidate_sha));
+	const entries = await git.treeEntries(input.candidate_sha);
+	const digest = await treeDigestV1(entries);
 	if (!digest.ok) {
 		return run(
 			PROMOTE_EXIT.UNSUPPORTED_TREE_ENTRY,
 			"OUTCOME=UNSUPPORTED_TREE_ENTRY\n",
 			`unsupported non-blob tree entry: ${digest.unsupported.type} ${digest.unsupported.path}\n`,
 		);
+	}
+	// A fetched commit has no unmerged index. The blob scan is the check,
+	// and it runs before ALREADY_WRITTEN and before the fast-forward.
+	const artifacts = unresolvedMergeArtifacts({
+		blobs: entries.filter((entry) => entry.type === "blob" && entry.bytes !== undefined).map((entry) => ({
+			path: entry.path,
+			bytes: entry.bytes as Uint8Array,
+		})),
+	});
+	if (artifacts.length > 0) {
+		return run(PROMOTE_EXIT.UNRESOLVED_CONFLICT, `OUTCOME=UNRESOLVED_CONFLICT\nPATHS=${artifacts.join(",")}\n`);
 	}
 	if (digest.digest !== input.winning_tree_sha256) {
 		return run(PROMOTE_EXIT.TREE_MISMATCH, `OUTCOME=TREE_MISMATCH\nTREE_DIGEST=${digest.digest}\n`);

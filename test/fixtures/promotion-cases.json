@@ -200,6 +200,38 @@
 			}
 		},
 		{
+			"name": "promote: unresolved merge markers are refused before fast-forward, even when the tree digest matches",
+			"commits": {
+				"B": {"parents": [], "files": {"README.md": "base\n", "docs/note.md": "a rule\n=======\nstill a rule\n"}},
+				"X": {"parents": ["B"], "files": {"README.md": "base\n", "docs/note.md": "a rule\n=======\nstill a rule\n", "src/end-only.js": ">>>>>>> topic\n", "src/shared.js": "<<<<<<< HEAD\nours\n=======\ntheirs\n>>>>>>> topic\n"}}
+			},
+			"destination": "B",
+			"fork": "X",
+			"promote": {"candidate": "X", "expected_head": "B", "winning_tree": "candidate"},
+			"expect": {
+				"exit": 48,
+				"fields": {"OUTCOME": "UNRESOLVED_CONFLICT", "PATHS": "src/shared.js"},
+				"destination_after": "B",
+				"http": {"status": 409, "outcome": "UNRESOLVED_CONFLICT"}
+			}
+		},
+		{
+			"name": "promote: a conflicted tree already on the destination is not ALREADY_WRITTEN",
+			"commits": {
+				"B": {"parents": [], "files": {"README.md": "base\n"}},
+				"X": {"parents": ["B"], "files": {"README.md": "base\n", "src/shared.js": "<<<<<<< HEAD\nours\n=======\ntheirs\n>>>>>>> topic\n"}}
+			},
+			"destination": "X",
+			"fork": "X",
+			"promote": {"candidate": "X", "expected_head": "B", "winning_tree": "candidate"},
+			"expect": {
+				"exit": 48,
+				"fields": {"OUTCOME": "UNRESOLVED_CONFLICT", "PATHS": "src/shared.js"},
+				"destination_after": "X",
+				"http": {"status": 409, "outcome": "UNRESOLVED_CONFLICT"}
+			}
+		},
+		{
 			"name": "promote: a gitlink in the candidate tree -> UNSUPPORTED_TREE_ENTRY (terminal)",
 			"commits": {
 				"B": {"parents": [], "files": {"README.md": "base\n"}},

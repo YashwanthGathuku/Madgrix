@@ -227,9 +227,16 @@ interface RunResult {
 	stderr: string;
 }
 
+/** Node 22.17 does not strip types unless asked. 22.18 and 24 do. The flag is argv, not part of the child's environment. */
+function nodeScriptArgs(script: string): string[] {
+	if (!script.endsWith(".ts")) return [script];
+	const [major, minor] = process.versions.node.split(".").map(Number);
+	return major < 22 || (major === 22 && minor < 18) ? ["--experimental-strip-types", script] : [script];
+}
+
 function runScript(script: string, env: Record<string, string>): Promise<RunResult> {
 	return new Promise((resolve, reject) => {
-		const child = spawn(process.execPath, [script], { cwd: REPO_ROOT, env, stdio: ["ignore", "pipe", "pipe"] });
+		const child = spawn(process.execPath, nodeScriptArgs(script), { cwd: REPO_ROOT, env, stdio: ["ignore", "pipe", "pipe"] });
 		let stdout = "";
 		let stderr = "";
 		child.stdout.on("data", (b) => (stdout += b));

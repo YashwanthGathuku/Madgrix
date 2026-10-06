@@ -197,8 +197,38 @@ P0-A through P0-F and P0-H are unchanged in claim from the baseline. The same lo
 
 ### Residual on P0-G
 
+This paragraph is the tree before the unresolved-merge scan. The current fact is the section "Update after the unrecorded-marker scan" below.
+
 The authority refuses a conflict only after the control plane records it. The runner no longer writes a marker commit. A commit someone else builds, with markers, and that nobody records as CONFLICTED, is still an ordinary candidate. `live-e2e` records the runner's composition and then refuses a CONFLICTED result. A run that never calls `POST /composition` does not arm the authority gate.
 
 An empty republish after a push is still a new SHA. It is not a contributing SHA, so the composition gate does not treat it as the recorded candidate. It needs its own evaluation.
 
 TheUstad still checks the frozen baseline before combine. It does not evaluate the composed or resolved tree.
+
+## Update after the unrecorded-marker scan
+
+Parent of the working tree when this section was written: `424b2b15425a65a25a230e949dea0f4d94192d9e` on `competition/security`. The scan is the commit that adds this section. It was not deployed and not merged. It was not run on Cloudflare.
+
+Amendment: `specs/amendments/unresolved-merge-artifact-v1.md`. Attack log: `docs/COMPETITION_RED_TEAM.md`. Boundary map: `docs/SECURITY_BOUNDARIES.md`. Frozen spec files were not edited.
+
+A blob is an unresolved merge artifact when a line is N `>` characters, N ≥ 7, and an earlier line in the same blob is N `<` characters. The marker starts the line. The rest of the line is empty or a space and a label. A line of `=` alone is not a marker. This is not a semantic-conflict detector. Git will not commit an unmerged index, so a submitted SHA is judged by its blobs.
+
+The trusted evaluator (`scripts/evaluate-candidate.ts`) records the paths on `unresolved_merge_artifacts`. Eligibility fails `no_unresolved_merge_artifacts` when that list is non-empty, including when tests passed and nobody called `POST /tasks/:id/composition`. `issuePermit`, `attemptPromotion`, and `runPromotion` return `UNRESOLVED_CONFLICT` with no permit and no canonical write. `container/promote.sh` scans the fetched blobs and exits 48 before any fast-forward, including before `ALREADY_WRITTEN`.
+
+### Commands on this pass
+
+Host: Windows, Node v22.17.0 with `--experimental-strip-types`, Git Bash 5.2.37. Container scripts were LF when bash ran them. `node_modules` was not installed, so `tsc` was not run.
+
+| Command | Result |
+|---|---|
+| `node --experimental-strip-types --test test/unresolved-merge-artifact.test.ts` | **7 pass, 0 fail.** The test creates the commit directly, does not call composition, and does not import `run-fork-crew`. |
+| `node --experimental-strip-types --test test/promotion-fixtures.test.ts` under Git Bash | **54 pass, 2 fail.** The two new marker rows passed for bash and the TypeScript model, including a conflicted tree already on the destination (not `ALREADY_WRITTEN`). Both failures are the existing rebase path `weird\nname.txt`, which Git Bash omitted. The model still reports it. `container/rebase.sh` was not logically changed. |
+| Authority suites named in `docs/COMPETITION_RED_TEAM.md` | Contender binding, enrollment, eval gates, evidence auth, forged bundles, promotion attacks, head move, rebase ancestry, quarantine review, white-box boundary, composition, rebase route, and verdict seam passed. |
+| `test/evaluator-isolation.test.ts` under Git Bash | **11 pass.** Tamper, hidden tests, tool log, rebase base, and evaluation-config digest. |
+| `test/env-isolation.test.ts` under Git Bash | Allowlist refusal of the control and evaluation tokens passed (exit 2, no Worker call). Agent and evaluator dumps had no credential-named variable. Git Bash then failed the stricter "no other variables" check by injecting MSYS names (`USERNAME`, `USERPROFILE`, `SYSTEMROOT`, and others). `live-e2e.ts`'s per-child zone split did not finish: Node v22.17.0 cannot load `evaluate-candidate.ts` from that script's own spawn. The git argv shim recorded 0 calls because Git for Windows finds `git.exe` first. |
+
+### What this scan does not close
+
+**P1.** A bundle that omits `unresolved_merge_artifacts`, or sends `[]`, can still be eligible and can still receive a permit. The container then returns HTTP 409 `UNRESOLVED_CONFLICT`. The permit is not consumed and canonical HEAD does not move. That case is in `test/unresolved-merge-artifact.test.ts`. The evaluation zone can lie about this measurement the same way it can lie about any other gate.
+
+An empty republish is still a new SHA and still needs its own evaluation. TheUstad still does not score the composed tree. Nothing in this section was run on Cloudflare.

@@ -17,10 +17,77 @@
 #   45 the fetched candidate is not CANDIDATE_SHA
 #   46 OUTCOME=UNSUPPORTED_TREE_ENTRY (tree-digest/v1 has no gitlinks)
 #   47 OUTCOME=BASELINE_MISMATCH     EXPECTED_HEAD is not an ancestor of the candidate
+#   48 OUTCOME=UNRESOLVED_CONFLICT   a blob contains a git conflict-marker pair
+#      (N>=7 '<' at the start of a line, and a later line of N '>'). Not a
+#      semantic-conflict detector. Checked before any fast-forward, including
+#      ALREADY_WRITTEN. A fetched commit has no unmerged index.
 #   anything else: a git failure (retryable)
 # src/lib/git-promotion.ts models this script step for step; the two are
 # held together by test/fixtures/promotion-cases.json.
 set -euo pipefail
+
+# True (exit 0) when stdin contains a conflict-marker pair. A line of '='
+# alone is not one. See src/lib/merge-artifacts.ts; the two must agree.
+blob_has_conflict_markers() {
+  # Associative, not indexed: a long run of '<' must not allocate a sparse array.
+  local -A start=()
+  local line ch i n rest width
+  while IFS= read -r line || [ -n "$line" ]; do
+    line="${line%$'\r'}"
+    case "${line:0:1}" in
+      "<") ch="<" ;;
+      ">") ch=">" ;;
+      *) continue ;;
+    esac
+    n=${#line}
+    i=0
+    while [ "$i" -lt "$n" ] && [ "${line:i:1}" = "$ch" ]; do
+      i=$((i + 1))
+    done
+    if [ "$i" -lt 7 ]; then
+      continue
+    fi
+    if [ "$i" -lt "$n" ] && [ "${line:i:1}" != " " ]; then
+      continue
+    fi
+    width=$i
+    if [ "$ch" = "<" ]; then
+      start[$width]=1
+    elif [ -n "${start[$width]:-}" ]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Print one path per line for every blob with a conflict-marker pair.
+# Reads NUL-terminated `git ls-tree -rz` records on stdin.
+# The blob is written to a file before the scan. Piping it would let the
+# scanner's early return deliver SIGPIPE to git cat-file (exit 141) and
+# hide a marker hit behind a retryable git failure. A cat-file failure
+# is not swallowed: set -e exits this pipeline, and the caller exits too.
+unresolved_marker_paths() {
+  local entry meta path rest type object scan
+  while IFS= read -r -d '' entry; do
+    [ -n "$entry" ] || continue
+    meta="${entry%%$'\t'*}"
+    path="${entry#*$'\t'}"
+    rest="${meta#* }"
+    type="${rest%% *}"
+    object="${rest##* }"
+    [ "$type" = "blob" ] || continue
+    git cat-file blob "$object" > "$WORK/blob"
+    set +e
+    blob_has_conflict_markers < "$WORK/blob"
+    scan=$?
+    set -e
+    if [ "$scan" -eq 0 ]; then
+      printf '%s\n' "$path"
+    elif [ "$scan" -ne 1 ]; then
+      return "$scan"
+    fi
+  done
+}
 
 WORK="${TMPDIR:-/tmp}/madgrix-${PERMIT_ID}"
 rm -rf "$WORK"
@@ -70,6 +137,16 @@ if [ "$DIGEST_STATUS" -eq 46 ]; then
 fi
 if [ "$DIGEST_STATUS" -ne 0 ]; then
   exit "$DIGEST_STATUS"
+fi
+
+# Before the digest comparison and before ALREADY_WRITTEN. A matching
+# digest must not fast-forward a tree that still contains merge markers.
+git ls-tree -rz --full-tree "$CANDIDATE_SHA" > "$WORK/lstree"
+MARKER_PATHS="$(unresolved_marker_paths < "$WORK/lstree" | LC_ALL=C sort)" || exit $?
+if [ -n "$MARKER_PATHS" ]; then
+  joined="$(printf '%s\n' "$MARKER_PATHS" | paste -sd, -)"
+  printf 'OUTCOME=UNRESOLVED_CONFLICT\nPATHS=%s\n' "$joined"
+  exit 48
 fi
 
 if [ "$TREE_DIGEST" != "$WINNING_TREE_SHA256" ]; then

@@ -2,7 +2,7 @@
 
 Status words: **IMPLEMENTED**, **TESTED LOCALLY**, **TESTED ON CLOUDFLARE**, **NOT YET VERIFIED**.
 
-Recorded against `git4agents/combined` `4a8c4cc7b521688f839f0f332605dcefa3984c38` on 2026-10-06. Local suite: LF `git archive` of that SHA, WSL Node v24.21.0, 296 passed, slice OK, head-move OK, benchmark `zero_tolerance_ok: true`.
+Recorded against `git4agents/combined` `4a8c4cc7b521688f839f0f332605dcefa3984c38` on 2026-10-06, then updated on `competition/security` after the unrecorded-marker scan. The older local suite was an LF `git archive` of `4a8c4cc`, WSL Node v24.21.0, 296 passed, slice OK, head-move OK, benchmark `zero_tolerance_ok: true`. The scan's own commands are in `docs/COMPETITION_RED_TEAM.md` and `docs/COMPETITION_FINALIZATION.md`. They were not a Cloudflare run.
 
 ## Not a Cloudflare result
 
@@ -10,7 +10,8 @@ Nothing in this SHA was deployed. `live:e2e` was not run. The public worker root
 
 ## Composition
 
-- The authority learns about CONFLICTED only from `POST /tasks/:id/composition` (control token). A marker commit that is never recorded is still an ordinary candidate. The fork-crew runner no longer creates that commit.
+- A fork-crew `CONFLICTED` record still comes only from `POST /tasks/:id/composition` (control token). The runner does not create a marker commit. A commit someone else builds is no longer an ordinary candidate when its blobs contain a conflict-marker pair: the trusted evaluator lists the paths, eligibility fails, and `container/promote.sh` exits 48 before fast-forward. See `specs/amendments/unresolved-merge-artifact-v1.md`.
+- **P1.** An evaluation bundle that omits `unresolved_merge_artifacts`, or sends `[]`, can still be eligible and can still be permitted. The container does not trust that field and does not fast-forward. Absence of markers is not proof that the edits agree.
 - The resolver does not evaluate, permit, or promote. `live-e2e` is the control-plane caller, and it was not executed.
 - An empty republish, used when the first push is not observed, is a new SHA. The composition record's candidate SHA is updated to that republish in the runner result. If a record was stored for the pre-republish SHA, the republish is a different candidate and needs its own evaluation.
 - Sub-agents share one machine and one fork. Worktrees stop them editing one directory at the same time. They are not separate microVMs. A sub-agent command can still read the parent repo's objects.
@@ -33,8 +34,8 @@ Nothing in this SHA was deployed. `live:e2e` was not run. The public worker root
 - This Windows checkout has `core.autocrlf=true`. Git blobs are LF. WSL `bash` on the working tree fails `set -o pipefail` because of a trailing CR. Run container tests from an LF archive or a Linux checkout.
 - Windows Node is v22.17.0. `tsc` works. `node --test` on TypeScript needs Node 24, or `NODE_OPTIONS=--experimental-strip-types` on every spawned child.
 - WSL `npx tsc` fails closed: the installed `node_modules` has `@typescript/typescript-win32-x64` and not the linux package.
-- `docs/DEMO_SCRIPT.md` and `docs/GIT_PROBLEMS.md` still describe older test counts and the old "keep conflict markers" behavior. The current behavior is this file, `docs/COMPETITION_FINALIZATION.md`, and `specs/amendments/composition-result-v1.md`.
+- `docs/DEMO_SCRIPT.md` and `docs/GIT_PROBLEMS.md` still describe older test counts and the old "keep conflict markers" behavior. The current behavior is this file, `docs/COMPETITION_FINALIZATION.md`, `docs/COMPETITION_RED_TEAM.md`, `docs/SECURITY_BOUNDARIES.md`, and `specs/amendments/composition-result-v1.md` plus `specs/amendments/unresolved-merge-artifact-v1.md`.
 
 ## Deliberately not done
 
-No merge to `main`. No push. No new paid Cloudflare resource. No edit to `PROMOTION_PROTOCOL.md`, `EVALUATION_THREAT_MODEL.md`, or `CLOUDFLARE_RUNTIME_MODEL.md`.
+No merge to `main`. No deploy. No new paid Cloudflare resource. No edit to `PROMOTION_PROTOCOL.md`, `EVALUATION_THREAT_MODEL.md`, or `CLOUDFLARE_RUNTIME_MODEL.md`. The unrecorded-marker scan is pushed on `competition/security` only.

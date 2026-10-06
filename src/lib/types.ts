@@ -244,6 +244,15 @@ export interface EvaluationBundle {
 	 * scripts/evaluate-candidate.ts always sets it.
 	 */
 	eval_file_changes?: string[];
+	/**
+	 * Paths of known unresolved merge artifacts in the candidate: a
+	 * conflict-marker pair in a blob, or an unmerged index path when the
+	 * evaluator had an index (specs/amendments/unresolved-merge-artifact-v1.md).
+	 * This is not a semantic-conflict scan. scripts/evaluate-candidate.ts
+	 * always sets it (empty when the scan found none). A bundle that omits
+	 * it was not scanned. A non-empty list is ineligible.
+	 */
+	unresolved_merge_artifacts?: string[];
 }
 
 /* ------------------------------------------------------------------ */

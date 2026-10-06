@@ -79,6 +79,7 @@ import type {
 } from "../lib/types.ts";
 import { SELECTOR_POLICY_VERSION } from "../lib/types.ts";
 import type { Effect } from "../lib/task-state.ts";
+import { hasUnresolvedMergeArtifacts } from "../lib/merge-artifacts.ts";
 import { AGENT_ID_PATTERN, evaluationBases, resolveAgentBySecret, taskHashFor, type RebaseReport } from "../lib/task-state.ts";
 import type { PromotionResult, RebaseResult } from "../lib/git-promotion.ts";
 import { computePermitId, TaskAuthority } from "../do/TaskAuthority.ts";
@@ -1245,6 +1246,9 @@ export async function runPromotion(env: Env, taskId: string, permit_id: string):
 	if (recomputed !== permit_id) return { status: 409, body: { error: "permit_id_invalid", permit_id } };
 
 	const storedBundle = state.evaluations[permit.winner_candidate_sha];
+	if (hasUnresolvedMergeArtifacts(storedBundle)) {
+		return { status: 409, body: { outcome: "UNRESOLVED_CONFLICT" satisfies PromotionOutcome, permit_id } };
+	}
 	if (!storedBundle || storedBundle.bundle_hash !== permit.evaluation_bundle_hash) {
 		return {
 			status: 409,
@@ -1292,7 +1296,8 @@ export async function runPromotion(env: Env, taskId: string, permit_id: string):
 		if (!promoRes.ok) {
 			// The container answers 409 for every terminal refusal
 			// (EXPIRED_HEAD_MOVED, TREE_MISMATCH, PUSH_REJECTED,
-			// UNSUPPORTED_TREE_ENTRY, BASELINE_MISMATCH): the step does not
+			// UNSUPPORTED_TREE_ENTRY, BASELINE_MISMATCH, UNRESOLVED_CONFLICT):
+			// the step does not
 			// retry those. Its 503s (not running, deadline) stay 503; anything
 			// else is a git failure, 502. The step retries both.
 			const status = promoRes.status === 409 ? 409 : promoRes.status === 503 ? 503 : 502;

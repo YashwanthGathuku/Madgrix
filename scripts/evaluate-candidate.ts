@@ -54,6 +54,13 @@
  * in the candidate tree. The model id is the log's; no environment variable
  * supplies it.
  *
+ * Unresolved merge artifacts (specs/amendments/unresolved-merge-artifact-v1.md):
+ * every blob is scanned for a git conflict-marker pair, and the clone's
+ * index is read with `git ls-files --unmerged` when it has one. The paths
+ * are `unresolved_merge_artifacts` on the bundle. An empty list means this
+ * scan found none. It is not a semantic-conflict detector. The authority
+ * refuses a non-empty list whether or not composition was recorded.
+ *
  * White-box caveat: candidate code and test processes share this disposable
  * evaluator host. This protects evaluator credentials/authority and destroys
  * persistence after the run; it does NOT claim hidden test contents are secret
@@ -71,6 +78,7 @@ import path from "node:path";
 import { spawn } from "node:child_process";
 
 import { canonicalJson, sha256Hex } from "../src/lib/canonical.ts";
+import { blobHasConflictMarkers, unresolvedMergeArtifacts } from "../src/lib/merge-artifacts.ts";
 import {
 	DEFAULT_TEST_GLOBS,
 	TOOL_STATUS_LOG_MAX_BYTES,
@@ -165,9 +173,10 @@ async function postJson(url: string, body: unknown, auth = true): Promise<any> {
 	return data;
 }
 
-async function treeDigestV1(repoDir: string, sha: string): Promise<string> {
+async function treeDigestV1(repoDir: string, sha: string): Promise<{ digest: string; artifactPaths: string[] }> {
 	const raw = await capture("git", ["ls-tree", "-rz", "--full-tree", sha], repoDir);
 	const records: Buffer[] = [];
+	const artifactPaths: string[] = [];
 	let start = 0;
 	for (let i = 0; i <= raw.length; i++) {
 		if (i !== raw.length && raw[i] !== 0) continue;
@@ -185,6 +194,7 @@ async function treeDigestV1(repoDir: string, sha: string): Promise<string> {
 		if (type !== "blob") throw new Error(`tree-digest/v1: unsupported non-blob entry ${type}`);
 		const pathBytes = entry.subarray(tab + 1);
 		const blob = await capture("git", ["cat-file", "blob", objectId], repoDir);
+		if (blobHasConflictMarkers(blob)) artifactPaths.push(pathBytes.toString("utf8"));
 		const blobHash = createHash("sha256").update(blob).digest("hex");
 		records.push(
 			Buffer.from(mode, "ascii"),
@@ -195,7 +205,16 @@ async function treeDigestV1(repoDir: string, sha: string): Promise<string> {
 			Buffer.from([0]),
 		);
 	}
-	return createHash("sha256").update(Buffer.concat(records)).digest("hex");
+	return { digest: createHash("sha256").update(Buffer.concat(records)).digest("hex"), artifactPaths };
+}
+
+/** `git ls-files --unmerged` on the clone's index, or empty when there is no index. */
+async function readUnmergedIndex(repoDir: string): Promise<string> {
+	try {
+		return (await capture("git", ["ls-files", "--unmerged"], repoDir)).toString("utf8");
+	} catch {
+		return "";
+	}
 }
 
 /** Every blob and submodule entry of `sha`'s tree (`git ls-tree -r`). */
@@ -378,7 +397,15 @@ try {
 	}
 	const baseAvailable = evaluationBase === baselineCommit ? baselineAvailable : true;
 	// Everything read from the clone is read before any candidate code runs.
-	const tree_sha256 = await treeDigestV1(dir, candidateSha);
+	const scanned = await treeDigestV1(dir, candidateSha);
+	const tree_sha256 = scanned.digest;
+	// Blob markers from the commit, plus an unmerged index when this clone
+	// has one. A commit cannot store an unmerged index; the index half is
+	// empty for an ordinary candidate SHA. Neither half is a semantic-conflict scan.
+	const unresolved_merge_artifacts = unresolvedMergeArtifacts({
+		paths: scanned.artifactPaths,
+		unmergedIndex: await readUnmergedIndex(dir),
+	});
 	const candidateTree = await lsTree(dir, candidateSha);
 	const baseTree = baseAvailable ? await lsTree(dir, evaluationBase) : [];
 	const changed = changedPaths(baseTree, candidateTree);
@@ -442,6 +469,8 @@ try {
 		evaluation_base: evaluationBase,
 		// Non-empty: the authority quarantines the contender (tamper-quarantine-v1).
 		eval_file_changes: gates.evalFileChanges,
+		// Empty means this scan found none. It is not a semantic-conflict claim.
+		unresolved_merge_artifacts,
 	};
 	const bundle_hash = await sha256Hex(canonicalJson(withoutHash));
 	const bundle = { ...withoutHash, bundle_hash };
