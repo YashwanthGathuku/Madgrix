@@ -23,11 +23,11 @@ Terminal font large. Browser at a width where the page is one column. No network
 ## What you must not claim
 
 - This branch was exercised on Cloudflare. It was not.
-- The page classified a pair. It prints `conflict_reports` stored by the authority. With no dependency map, `registerClaim` stores **AMBER**, including for the test agent. It does not store GREEN. GREEN is what the classifier stores when dependency analysis ran and the layers are empty. RED is a shared symbol or contract. BLOCKED is shared state.
-- That the line collision is the claim-graph color RED. The combine step stores `textual-line-overlap`. While the record is CONFLICTED, there is no candidate SHA.
-- The resolver SHA is one of the three contributing SHAs. The page says **New candidate** only when the stored candidate is not in `contributing_shas`.
+- The page colored an overlap. It prints recorded relations: baseline, overlap, and claim-conflict. A stored claim-report risk word is text from that report. The page does not choose green, amber, or red.
+- That the line collision is a claim-report color. The combine step stores `textual-line-overlap`. While the record is CONFLICTED, the plate says **PROMOTABLE CANDIDATE: NONE**. A member SHA stays with that member.
+- The resolver SHA is one of the three member commits. The page says **New candidate** only for RESOLVED, and only when that SHA is not a member contribution.
 - A section that says "not recorded" or "No evaluation bundle is stored" is a pass that has not happened. Do not fill it.
-- The graph verified a bundle. It says **Offline verification: not executed in this view.** The check is `npm run verify` with an out-of-band trust key. A key named inside the bundle is not that check.
+- The graph verified a bundle. Offline verification says **Not run**. The check is `npm run verify` with an out-of-band trust key. A key named inside the bundle is not that check.
 - The live runner accepts `configs/demo-composition.json`. `configs/git4agents-fork-crew.yaml` lists `parent`, `sub-api`, and `sub-ui` only. `fleet validate` rejects this demo until a manifest lists `sub-test` in that roster. The HTML is local git.
 
 ## Why Artifacts is the point
@@ -42,7 +42,7 @@ The fixture below uses local git so the recording does not depend on a deploy. T
 
 Screen: the resolved graph, banner visible, not scrolled.
 
-> "Agents already write code in parallel. What they cannot do is share one git checkout and one push credential and still tell you which commit was reviewed. MADGRIX is the record between those agents and the canonical repository. One task. The intent is frozen. Everything under it is state the authority stored, or it is absent. The page does not invent it."
+> "Agents already write code in parallel. What they cannot do is share one git checkout and one push credential and still tell you which commit was reviewed. MADGRIX is the product that records which exact state may become canonical. Git4Agents is the collaboration protocol underneath it: one CrewContender, the parent and its members, working at the same time. One task. The intent is frozen. Everything under it is state the authority stored, or it is absent. The page does not invent it."
 
 Point at the banner, then the intent.
 
@@ -52,47 +52,47 @@ Point at the banner, then the intent.
 
 Stay on the task header. Do not open a diagram with fake boxes.
 
-> "A person resolves a merge by editing the conflict markers and committing. That commit has one author. In a fleet, the API agent and the UI agent both wrote `src/contract.js`, on purpose, at the same time. The integration agent wrote a different path. If those three share a working tree, the last writer wins and the overlap becomes an ordinary commit. If they share a credential that can push main, the test agent can ship."
+> "Git records a completed state. A person resolves a merge by editing the conflict markers and committing, and that commit has one author. Git4Agents has to coordinate the work while it is still happening. The API agent and the UI agent both write `src/contract.js`, on purpose, at the same time. The integration agent writes a different path. If those three share a working tree, the last writer wins and the overlap becomes an ordinary commit. If they share a credential that can push main, the test agent can ship."
 
 > "Artifacts is the split. The parent holds one fork. Sub-agents do not get a canonical credential. Their commits are real git SHAs. Pushes arrive on Queue, at least once, and the Durable Object dedupes them. The canonical repository is a different Artifact. Nothing on this page is allowed to move it."
 
 ## 1:15 — Live work graph
 
-Scroll to **Live work graph**. Read the key, then one edge.
+Scroll to **Live work graph**. Point at a dependency, then an overlap. Do not invent a color for either.
 
-> "These colors are stored conflict reports. The page does not classify. GREEN means the authority's classifier found no conflict on the layers it had. AMBER means a shared dependency, or dependency analysis was not available, or a claim was amended. RED means a shared symbol or a shared contract. BLOCKED means shared state."
+> "These are recorded relations. A member commit points at the baseline. An overlap names two agents and a path. A claim-conflict line, when one is stored, is a claim report and its explanation. The page does not turn any of that into green, amber, or red."
 
-Point at an AMBER line. Read the explanation that says dependency analysis was unavailable, and, on the API/UI pair, the path overlap.
+Point at the API and UI overlap on `src/contract.js`.
 
-> "There is no dependency map on this fixture, so the authority will not store GREEN. Missing analysis is not a clean pair. The test agent is AMBER for that reason. It is not a green badge we painted because its files look separate."
+> "The line collision is not a color on this graph. Composition stores the classification textual-line-overlap. That is the overlap. A stored risk word, if you see one under a claim-conflict line, is the claim report's own word. It is not a label this page chose, and it is not the line overlap."
 
 ## 2:00 — Concurrent crew
 
-Scroll to **Crew**.
+Scroll to **CrewContender**.
 
-> "Four rows, from the record. Parent is the fork holder. API agent, UI agent, test and integration agent. Each row is an intent, a scope, a status, and a commit. The three sub-agent intents are the ones the composition record stored. The parent row's intent says not recorded when the claim did not carry a separate sentence. We do not copy the crew file in to fill that gap."
+> "This is one CrewContender. Git4Agents treats the parent and the members as one collaborative promotion unit. Parent is the fork holder. Its commit on this card is none: the parent row is not a member contribution, and it is not the promotable candidate. API agent, UI agent, test and integration agent. Each member shows the intent, the scope, the status, the claim, and the member commit the record stored. The parent intent says not recorded. We do not copy the crew file in to fill that gap."
 
-> "The three commands ran in separate git worktrees of that one fork, overlapping in time. The test agent's scope is `test/integration/**`. It does not receive the control token or the evaluation token. Its commit is its own SHA."
+> "The three commands ran in separate git worktrees of that one fork, overlapping in time. The test agent's scope is `test/integration/**`. It does not receive the control token or the evaluation token. Its commit is its own SHA. Those three SHAs are contribution SHAs."
 
-Point at the three side commits. Do not read them aloud.
+Point at the three member commits. Do not read them aloud. Do not call any of them the candidate.
 
 ## 3:00 — Conflict
 
 Switch to the conflicted HTML. Stamp **CONFLICTED**. Scroll to the overlap.
 
-> "Both the API agent and the UI agent wrote `src/contract.js`. The combine step stored the classification textual-line-overlap. That is not the claim-graph color. It is the file the merger refused to hide inside a commit."
+> "Both the API agent and the UI agent wrote `src/contract.js`. The combine step stored the classification textual-line-overlap. That is the overlap record. It is the file the merger refused to hide inside a commit."
 
-Point at the two sides: agent, intent, contributing SHA, excerpt.
+Point at the plate, then the two sides: agent, intent, contributing SHA, excerpt.
 
-> "Resolution state: unresolved. Candidate: none. HEAD stayed on the baseline. There is no candidate to evaluate, permit, or promote. A contributing SHA cannot stand in for one."
+> "Composition: CONFLICTED. Promotable candidate: none. The member SHAs stay on the crew and on the sides of the file. They are not in that plate. HEAD stayed on the baseline. There is no candidate to evaluate, permit, or promote."
 
 ## 3:45 — Resolution
 
 Switch to the resolved HTML. **Resolution**.
 
-> "A resolver got the baseline, the conflict file, and each side. It did not get a service token. It wrote one new commit: the API file, the UI file, the integration check, and a contract both sides can live with. That SHA is not any of the three contributing SHAs. The page says new candidate because that is what the record shows. It is not a rename of an old side. It still needs its own evaluation, its own verdict, and its own permit."
+> "A resolver got the baseline, the conflict file, and each side. It did not get a service token. It wrote one new commit: the API file, the UI file, the integration check, and a contract both sides can live with. The state is RESOLVED. The member contribution SHAs stay on the left. The promotable candidate on the right is a new SHA. It is not any of the three member commits. Resolution created a new software state. It still has to pass evaluation, the verdict seam, and a permit. The page does not skip that."
 
-Point at the arrow. Contributing SHAs on the left, the new candidate on the right.
+Point at the arrow. Member contribution SHAs on the left, the new candidate on the right. Read the plate: promotable candidate, then that SHA.
 
 ## 4:20 — Independent evaluation
 
@@ -106,7 +106,7 @@ Cut to the slice terminal. Start it before the recording if you need the clock.
 npm run slice
 ```
 
-> "This is a different task, the token-expiry slice, so you can see the rest of the loop on a run that actually evaluates. The evaluator is a separate domain. It does not hold the canonical write. A candidate that touches the tests or the runner config is quarantined. The composition candidate you just saw is not this slice, and it is not promoted in this video."
+> "This is a different task, the token-expiry slice, so you can see the rest of the loop on a run that actually evaluates. The evaluator is a separate domain. It does not hold the canonical write. The verdict seam is the decision boundary: accept, reject, abstain, escalate, or quarantine. A candidate that touches the tests or the runner config is quarantined. The composition candidate you just saw is not this slice, and it is not promoted in this video."
 
 Let the harness reach the evaluation and verdict lines. Read the words ACCEPT, QUARANTINE, or REJECT that it prints. Do not read hashes.
 
@@ -132,7 +132,7 @@ When the slice prints VERIFIED, run the verifier on the bundle it wrote. Use the
 npm run verify -- --trust-key .slice-output/authority.pub .slice-output/promotion.bundle
 ```
 
-> "The graph named a bundle if one was stored, counted signature fields, and showed a prefix of the key label. It did not say verified. This command does. The trust key is the one you pin out of band. The key inside the bundle has to match it, and every signature is checked with the key you passed. No network. Subject, candidate, chain, hidden evaluation, policy, destination base, authority key, signature, permit id, ledger. The last line is VERIFIED, or it is not."
+> "On the task page, offline verification says not run. The page can show that a signature field is present, and a prefix of the key label. It does not check them. This command does. The trust key is the one you pin out of band. The key inside the bundle has to match it, and every signature is checked with the key you passed. No network. Subject, candidate, chain, hidden evaluation, policy, destination base, authority key, signature, permit id, ledger. The last line is VERIFIED, or it is not."
 
 If you have time, flip one signature character and show NOT VERIFIED. Skip it rather than rush.
 
@@ -140,8 +140,10 @@ If you have time, flip one signature character and show NOT VERIFIED. Skip it ra
 
 Back to the resolved graph, top of the page, banner still visible.
 
-> "Agents produce commits. Artifacts holds the forks and the canonical repository. The Durable Object holds the intent, the crew, the conflict, the new candidate, the gates, the verdict, and the permit. The container is the only thing that moves the destination, and only to the SHA the permit names. Anyone with the bundle and the pinned key can check that offline."
+> "Artifacts holds each fork and the canonical repository as separate repositories. The Durable Object holds the task, the CrewContender, the overlap, and, only when the state is COMPOSED or RESOLVED, the one candidate SHA. The verdict seam is the decision boundary. The container is the only writer that moves the destination, and only to the SHA the permit names."
 
-> "What you saw in the browser is local fixture state. The live fleet manifest on this branch does not yet list the test agent, so the deployed runner would reject this crew config. The architecture does not depend on hiding that. Forks are commodity. The part Artifacts makes possible is a fleet of real repositories whose canonical branch moves only by a checked, single-use, exact-state promotion."
+> "What you saw in the browser is local fixture state. The live fleet manifest on this branch does not yet list the test agent, so the deployed runner would reject this crew config. The collaboration branch is what adds that manifest and the work-graph object this page is ready to render. This recording did not merge that branch, and it did not run on Cloudflare."
+
+> "Git records completed states. Git4Agents coordinates autonomous work while it is happening. MADGRIX determines which exact resulting state earns authority to become canonical."
 
 Stop. Do not add a metric, a timeline, or a second product name.

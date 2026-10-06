@@ -1,9 +1,12 @@
 /**
  * HTML for GET /tasks/:id/graph.
  *
- * Reads task-authority state and prints it. This file does not classify
- * claims, score gates, choose a verdict, or verify a bundle. Risk colors
- * are the stored conflict-report words. A missing record stays missing.
+ * Prints one task. Crew, dependencies, overlaps, and the composition
+ * state come from the authority record, or from a work-graph object the
+ * caller passes through. A SHA is placed in the promotable-candidate
+ * position only when that state is COMPOSED or RESOLVED and the SHA is
+ * not a member contribution. This file does not advance composition,
+ * classify overlaps, score gates, choose a verdict, or verify a bundle.
  *
  * The route accepts the agent bearer, so this page does not print token
  * ids, agent secrets, permit nonces, DSSE signatures, hidden-test names,
@@ -11,14 +14,34 @@
  */
 
 import type { PromotionBundle } from "../lib/attestation.ts";
-import type {
-	AuthorityState,
-	CompositionRecord,
-	ConflictRisk,
-	EvaluationBundle,
-	PermitRecord,
-	WorkClaim,
-} from "../lib/types.ts";
+import type { AuthorityState, CompositionRecord, EvaluationBundle, PermitRecord } from "../lib/types.ts";
+
+export interface WorkGraphMemberInput {
+	agent_id?: string;
+	role?: string;
+	intent?: string;
+	scope?: string[];
+	claim_work_id?: string | null;
+	commit_sha?: string | null;
+	status?: string;
+}
+
+export interface WorkGraphInput {
+	task?: { task_id?: string; intent?: string; status?: string; baseline_commit?: string };
+	crew?: {
+		contender_id?: string;
+		parent?: { agent_id?: string; authority?: string; contender_id?: string; fork_repo?: string };
+		members?: WorkGraphMemberInput[];
+		baseline?: string;
+		outcome?: string;
+		candidate_sha?: string | null;
+	} | null;
+	members?: WorkGraphMemberInput[];
+	dependencies?: Array<{ from?: string; to?: string; relation?: string }>;
+	overlaps?: Array<{ path?: string; classification?: string; agents?: string[] }>;
+	composition_state?: string | null;
+	candidate_sha?: string | null;
+}
 
 export interface WorkGraphViewOptions {
 	/**
@@ -26,9 +49,70 @@ export interface WorkGraphViewOptions {
 	 * route does not set this. Live task state is not described as a fixture.
 	 */
 	fixtureBanner?: string;
+	/**
+	 * Collaboration work graph. When set, it supplies the crew, dependencies,
+	 * overlaps, composition state, and candidate. The page still applies the
+	 * display rule: no candidate position unless the state is COMPOSED or
+	 * RESOLVED, and a member SHA never fills that position.
+	 */
+	graph?: WorkGraphInput;
 }
 
-const RISKS: readonly ConflictRisk[] = ["GREEN", "AMBER", "RED", "BLOCKED"];
+interface MemberView {
+	agent_id: string;
+	role: string;
+	intent: string;
+	scope: string[];
+	claim_work_id: string | null;
+	commit_sha: string | null;
+	status: string;
+}
+
+interface CrewView {
+	contender_id: string;
+	parent: { agent_id: string; contender_id: string; fork_repo: string };
+	members: MemberView[];
+	baseline: string;
+	outcome: string;
+}
+
+interface DepView {
+	from: string;
+	to: string;
+	relation: string;
+	detail: string | null;
+	risk: string | null;
+}
+
+interface OverlapView {
+	path: string;
+	classification: string;
+	agents: string[];
+}
+
+interface PageView {
+	intent: string;
+	taskId: string;
+	taskStatus: string;
+	baselineCommit: string;
+	crew: CrewView | null;
+	dependencies: DepView[];
+	overlaps: OverlapView[];
+	excerpts: CompositionRecord["files"];
+	compositionState: string | null;
+	promotableSha: string | null;
+	memberShaHidden: boolean;
+	contributionShas: string[];
+}
+
+const STATE_NOTES: Record<string, string> = {
+	PENDING: "no candidate",
+	COMPOSING: "no candidate",
+	COMPOSED: "candidate only while this state is recorded",
+	CONFLICTED: "no candidate",
+	RESOLVING: "no candidate",
+	RESOLVED: "new candidate only while this state is recorded",
+};
 
 function esc(value: string): string {
 	return value.replace(/[&<>"']/g, (ch) => {
@@ -50,227 +134,349 @@ function num(value: unknown): string {
 	return typeof value === "number" && Number.isFinite(value) ? String(value) : "not recorded";
 }
 
+function strings(value: unknown): string[] {
+	if (!Array.isArray(value)) return [];
+	return value.map((item) => text(item)).filter((item): item is string => item !== null);
+}
+
 function roleLabel(role: string, id: string): string {
 	if (role === "parent" || id === "parent") return "parent";
 	if (role === "api") return "API agent";
 	if (role === "ui") return "UI agent";
 	if (role === "test") return "test/integration agent";
-	const named = text(role);
-	return named ?? id;
+	return text(role) ?? id;
 }
 
-interface CrewRow {
-	id: string;
-	label: string;
-	intent: string | null;
-	compositionScope: string | null;
-	claimScope: string | null;
-	contenderStatus: string | null;
-	claimStatus: string | null;
-	forkCommit: string | null;
-	sideCommit: string | null;
+function promotableState(status: string | null): boolean {
+	return status === "COMPOSED" || status === "RESOLVED";
 }
 
-function crewRows(state: AuthorityState): CrewRow[] {
-	const map = new Map<string, CrewRow>();
-	const ensure = (id: string): CrewRow => {
-		let row = map.get(id);
-		if (!row) {
-			row = {
-				id,
-				label: roleLabel("", id),
-				intent: null,
-				compositionScope: null,
-				claimScope: null,
-				contenderStatus: null,
-				claimStatus: null,
-				forkCommit: null,
-				sideCommit: null,
-			};
-			map.set(id, row);
-		}
-		return row;
+function decideCandidate(status: string | null, raw: string | null, members: Set<string>): { sha: string | null; hidden: boolean } {
+	if (!promotableState(status) || !raw) return { sha: null, hidden: false };
+	if (members.has(raw)) return { sha: null, hidden: true };
+	return { sha: raw, hidden: false };
+}
+
+function memberView(input: {
+	agent_id?: unknown;
+	role?: unknown;
+	intent?: unknown;
+	scope?: unknown;
+	claim_work_id?: unknown;
+	commit_sha?: unknown;
+	status?: unknown;
+}): MemberView {
+	const sha = text(input.commit_sha);
+	return {
+		agent_id: text(input.agent_id) ?? "not recorded",
+		role: text(input.role) ?? "",
+		intent: text(input.intent) ?? "",
+		scope: strings(input.scope),
+		claim_work_id: text(input.claim_work_id),
+		commit_sha: sha,
+		status: text(input.status) ?? (sha ? "committed" : "pending"),
 	};
-
-	for (const agent of state.composition?.agents ?? []) {
-		const id = text(agent.id);
-		if (!id) continue;
-		const row = ensure(id);
-		row.label = roleLabel(text(agent.role) ?? "", id);
-		row.intent = text(agent.intent);
-		const paths = Array.isArray(agent.paths) ? agent.paths.filter((p) => text(p)).join(", ") : "";
-		row.compositionScope = text(paths);
-		row.sideCommit = text(agent.sha);
-	}
-
-	for (const claim of state.claims ?? []) {
-		const id = text(claim.agent);
-		if (!id) continue;
-		const row = ensure(id);
-		if (!row.intent) row.intent = text(claim.intent?.behavior?.join("; ") ?? "");
-		const paths = claim.scope?.paths?.filter((p) => text(p)).join(", ") ?? "";
-		const scope = text(paths);
-		row.claimScope = row.claimScope && scope ? `${row.claimScope}, ${scope}` : (row.claimScope ?? scope);
-		const status = text(claim.status);
-		row.claimStatus = row.claimStatus && status ? `${row.claimStatus}, ${status}` : (row.claimStatus ?? status);
-	}
-
-	for (const contender of Object.values(state.contenders ?? {})) {
-		const id = text(contender.agent_id);
-		if (!id) continue;
-		const row = ensure(id);
-		row.contenderStatus = text(contender.status);
-		row.forkCommit = text(contender.latest_commit);
-	}
-
-	const order = new Map<string, number>();
-	let n = 0;
-	for (const row of map.values()) {
-		if (row.id === "parent" || row.label === "parent") order.set(row.id, n++);
-	}
-	for (const agent of state.composition?.agents ?? []) {
-		const id = text(agent.id);
-		if (id && !order.has(id)) order.set(id, n++);
-	}
-	for (const id of map.keys()) if (!order.has(id)) order.set(id, n++);
-	return [...map.values()].sort((a, b) => (order.get(a.id) ?? 0) - (order.get(b.id) ?? 0));
 }
 
-function scopeLine(row: CrewRow): string {
-	const composition = row.compositionScope;
-	const claim = row.claimScope;
-	if (composition && claim && composition !== claim) {
-		return `composition ${esc(composition)} · claim ${esc(claim)}`;
-	}
-	if (composition) return esc(composition);
-	if (claim) return esc(claim);
-	return "not recorded";
+function crewFromState(state: AuthorityState): CrewView | null {
+	const composition = state.composition;
+	if (!composition) return null;
+	const contender = state.contenders?.[composition.contender_id];
+	if (!contender) return null;
+	const members = (composition.agents ?? []).map((agent) => {
+		const claim = agent.claim_work_id ? state.claims.find((row) => row.work_id === agent.claim_work_id) : undefined;
+		const sha = text(agent.sha);
+		return memberView({
+			agent_id: agent.id,
+			role: agent.role,
+			intent: agent.intent,
+			scope: agent.paths,
+			claim_work_id: agent.claim_work_id,
+			commit_sha: sha,
+			status: text(claim?.status) ?? (sha ? "committed" : "pending"),
+		});
+	});
+	return {
+		contender_id: text(contender.contender_id) ?? text(composition.contender_id) ?? "not recorded",
+		parent: {
+			agent_id: text(contender.agent_id) ?? "not recorded",
+			contender_id: text(contender.contender_id) ?? "not recorded",
+			fork_repo: text(contender.fork_repo) ?? "not recorded",
+		},
+		members,
+		baseline: text(composition.baseline) ?? "not recorded",
+		outcome: text(composition.status) ?? "not recorded",
+	};
 }
 
-function statusLine(row: CrewRow): string {
-	if (row.contenderStatus && row.claimStatus && row.contenderStatus !== row.claimStatus) {
-		return `contender ${esc(row.contenderStatus)} · claim ${esc(row.claimStatus)}`;
-	}
-	const one = row.contenderStatus ?? row.claimStatus;
-	return one ? esc(one) : "not recorded";
+function crewFromGraph(graph: NonNullable<WorkGraphInput["crew"]>, fallbackMembers: WorkGraphMemberInput[] | undefined): CrewView {
+	const parent = graph.parent ?? {};
+	const own = Array.isArray(graph.members) ? graph.members : [];
+	const listed = own.length > 0 ? own : (fallbackMembers ?? []);
+	return {
+		contender_id: text(graph.contender_id) ?? text(parent.contender_id) ?? "not recorded",
+		parent: {
+			agent_id: text(parent.agent_id) ?? "not recorded",
+			contender_id: text(parent.contender_id) ?? text(graph.contender_id) ?? "not recorded",
+			fork_repo: text(parent.fork_repo) ?? "not recorded",
+		},
+		members: listed.map((member) => memberView(member)),
+		baseline: text(graph.baseline) ?? "not recorded",
+		outcome: text(graph.outcome) ?? "not recorded",
+	};
 }
 
-function commitLine(row: CrewRow): string {
-	if (row.forkCommit && row.sideCommit && row.forkCommit !== row.sideCommit) {
-		return `fork <code>${esc(row.forkCommit)}</code> · side <code>${esc(row.sideCommit)}</code>`;
-	}
-	const sha = row.sideCommit ?? row.forkCommit;
-	return sha ? `<code>${esc(sha)}</code>` : "none";
+function reportDetail(state: AuthorityState, from: string, to: string): { detail: string | null; risk: string | null } {
+	const report = (state.conflict_reports ?? []).find((row) => row.claim_a === from && row.claim_b === to);
+	if (!report) return { detail: null, risk: null };
+	return { detail: text(report.explanation), risk: text(report.risk) };
 }
 
-function crewSection(state: AuthorityState): string {
-	const rows = crewRows(state);
-	if (rows.length === 0) return `<section id="crew"><h2>Crew</h2><p>No agents are recorded.</p></section>`;
-	const cards = rows
-		.map(
-			(row) => `<article class="agent">
-<h3>${esc(row.label)} <code>${esc(row.id)}</code></h3>
+function depsFromState(state: AuthorityState, crew: CrewView | null, overlaps: OverlapView[]): DepView[] {
+	const dependencies: DepView[] = [];
+	if (crew) {
+		for (const member of crew.members) {
+			if (member.commit_sha) dependencies.push({ from: member.commit_sha, to: crew.baseline, relation: "baseline", detail: null, risk: null });
+		}
+	}
+	for (const file of overlaps) {
+		for (let i = 0; i < file.agents.length; i += 1) {
+			for (let j = i + 1; j < file.agents.length; j += 1) {
+				dependencies.push({ from: file.agents[i] ?? "", to: file.agents[j] ?? "", relation: "overlap", detail: null, risk: null });
+			}
+		}
+	}
+	for (const report of state.conflict_reports ?? []) {
+		const from = text(report.claim_a) ?? "not recorded";
+		const to = text(report.claim_b) ?? "not recorded";
+		dependencies.push({ from, to, relation: "claim-conflict", detail: text(report.explanation), risk: text(report.risk) });
+	}
+	return dependencies;
+}
+
+function overlapsFromFiles(files: CompositionRecord["files"] | undefined): OverlapView[] {
+	return (files ?? []).map((file) => ({
+		path: text(file.path) ?? "not recorded",
+		classification: text(file.classification) ?? "not recorded",
+		agents: (file.sides ?? []).map((side) => text(side.agent_id)).filter((id): id is string => id !== null),
+	}));
+}
+
+function viewFromState(state: AuthorityState): PageView {
+	const crew = crewFromState(state);
+	const overlaps = overlapsFromFiles(state.composition?.files);
+	const outcome = crew?.outcome ?? text(state.composition?.status) ?? null;
+	const members = new Set<string>();
+	for (const member of crew?.members ?? []) if (member.commit_sha) members.add(member.commit_sha);
+	for (const sha of state.composition?.contributing_shas ?? []) {
+		const value = text(sha);
+		if (value) members.add(value);
+	}
+	const decision = decideCandidate(outcome, text(state.composition?.candidate_sha), members);
+	return {
+		intent: text(state.task.intent) ?? "not recorded",
+		taskId: text(state.task.task_id) ?? "not recorded",
+		taskStatus: text(state.task_status) ?? "not recorded",
+		baselineCommit: text(state.task.baseline_commit) ?? "not recorded",
+		crew,
+		dependencies: depsFromState(state, crew, overlaps),
+		overlaps,
+		excerpts: state.composition?.files ?? [],
+		compositionState: outcome,
+		promotableSha: decision.sha,
+		memberShaHidden: decision.hidden,
+		contributionShas: [...members],
+	};
+}
+
+function viewFromGraph(state: AuthorityState, graph: WorkGraphInput): PageView {
+	const crew = graph.crew ? crewFromGraph(graph.crew, graph.members) : null;
+	const outcome = text(graph.composition_state) ?? crew?.outcome ?? null;
+	if (crew && text(graph.composition_state)) crew.outcome = outcome ?? crew.outcome;
+	const overlaps = (graph.overlaps ?? []).map((file) => ({
+		path: text(file.path) ?? "not recorded",
+		classification: text(file.classification) ?? "not recorded",
+		agents: strings(file.agents),
+	}));
+	const dependencies = (graph.dependencies ?? []).map((edge) => {
+		const from = text(edge.from) ?? "not recorded";
+		const to = text(edge.to) ?? "not recorded";
+		const relation = text(edge.relation) ?? "not recorded";
+		const stored = relation === "claim-conflict" ? reportDetail(state, from, to) : { detail: null, risk: null };
+		return { from, to, relation, detail: stored.detail, risk: stored.risk };
+	});
+	const sameRecord = !state.composition || state.composition.status === outcome;
+	const members = new Set<string>();
+	for (const member of crew?.members ?? []) if (member.commit_sha) members.add(member.commit_sha);
+	if (sameRecord) {
+		for (const sha of state.composition?.contributing_shas ?? []) {
+			const value = text(sha);
+			if (value) members.add(value);
+		}
+	}
+	const raw = text(graph.candidate_sha) ?? (sameRecord ? text(state.composition?.candidate_sha) : null);
+	const decision = decideCandidate(outcome, raw, members);
+	const task = graph.task ?? {};
+	const paths = new Set(overlaps.map((file) => file.path));
+	return {
+		intent: text(task.intent) ?? text(state.task.intent) ?? "not recorded",
+		taskId: text(task.task_id) ?? text(state.task.task_id) ?? "not recorded",
+		taskStatus: text(task.status) ?? text(state.task_status) ?? "not recorded",
+		baselineCommit: text(task.baseline_commit) ?? text(state.task.baseline_commit) ?? "not recorded",
+		crew,
+		dependencies,
+		overlaps,
+		excerpts: (state.composition?.files ?? []).filter((file) => paths.has(file.path)),
+		compositionState: outcome,
+		promotableSha: decision.sha,
+		memberShaHidden: decision.hidden,
+		contributionShas: [...members],
+	};
+}
+
+function pageView(state: AuthorityState, options: WorkGraphViewOptions): PageView {
+	return options.graph ? viewFromGraph(state, options.graph) : viewFromState(state);
+}
+
+function crewSection(view: PageView): string {
+	if (!view.crew) return `<section id="crew"><h2>CrewContender</h2><p>No CrewContender is recorded.</p></section>`;
+	const parent = view.crew.parent;
+	const parentCard = `<article class="agent parent">
+<h3>parent <code>${esc(parent.agent_id)}</code></h3>
 <dl>
-<div><dt>Intent</dt><dd>${row.intent ? esc(row.intent) : "not recorded"}</dd></div>
-<div><dt>Scope</dt><dd>${scopeLine(row)}</dd></div>
-<div><dt>Status</dt><dd>${statusLine(row)}</dd></div>
-<div><dt>Commit</dt><dd>${commitLine(row)}</dd></div>
+<div><dt>Intent</dt><dd>not recorded</dd></div>
+<div><dt>Scope</dt><dd>not recorded</dd></div>
+<div><dt>Status</dt><dd>authority parent</dd></div>
+<div><dt>Commit</dt><dd>none</dd></div>
+<div><dt>Contender</dt><dd><code>${esc(parent.contender_id)}</code></dd></div>
+<div><dt>Fork</dt><dd><code>${esc(parent.fork_repo)}</code></dd></div>
 </dl>
-</article>`,
-		)
+</article>`;
+	const members = view.crew.members
+		.map((member) => {
+			const scope = member.scope.length > 0 ? esc(member.scope.join(", ")) : "not recorded";
+			const commit = member.commit_sha ? `<code>${esc(member.commit_sha)}</code>` : "none";
+			return `<article class="agent">
+<h3>${esc(roleLabel(member.role, member.agent_id))} <code>${esc(member.agent_id)}</code></h3>
+<dl>
+<div><dt>Intent</dt><dd>${member.intent ? esc(member.intent) : "not recorded"}</dd></div>
+<div><dt>Scope</dt><dd>${scope}</dd></div>
+<div><dt>Status</dt><dd>${member.status ? esc(member.status) : "not recorded"}</dd></div>
+<div><dt>Commit</dt><dd>${commit}</dd></div>
+<div><dt>Claim</dt><dd>${member.claim_work_id ? `<code>${esc(member.claim_work_id)}</code>` : "none"}</dd></div>
+</dl>
+</article>`;
+		})
 		.join("");
-	return `<section id="crew"><h2>Crew</h2>${cards}</section>`;
+	return `<section id="crew"><h2>CrewContender</h2>
+<p class="note">One collaborative promotion unit. Member commits are contribution SHAs. The promotable candidate is in Composition.</p>
+<p class="meta">Baseline <code>${esc(view.crew.baseline)}</code></p>
+<div class="crew">${parentCard}${members}</div></section>`;
 }
 
-function claimByWork(state: AuthorityState, workId: string): WorkClaim | undefined {
-	return state.claims.find((claim) => claim.work_id === workId);
-}
-
-function nameForWork(state: AuthorityState, workId: string): string {
-	const claim = claimByWork(state, workId);
-	if (!claim) return workId;
-	const agent = state.composition?.agents.find((row) => row.claim_work_id === workId || row.id === claim.agent);
-	const label = agent ? roleLabel(text(agent.role) ?? "", text(agent.id) ?? claim.agent) : roleLabel("", claim.agent);
-	return `${label} (${claim.agent})`;
-}
-
-function graphSection(state: AuthorityState): string {
-	const reports = state.conflict_reports ?? [];
-	const key = `<ul class="key">
-<li><span class="swatch risk-GREEN">GREEN</span> no conflict on the recorded layers</li>
-<li><span class="swatch risk-AMBER">AMBER</span> shared dependency, unavailable dependency analysis, or an amended claim</li>
-<li><span class="swatch risk-RED">RED</span> shared symbol or contract</li>
-<li><span class="swatch risk-BLOCKED">BLOCKED</span> shared state</li>
-</ul>
-<p class="note">Colors mark stored conflict reports only. This page does not classify pairs. A line overlap stays under Composition, with the classification the combine step stored.</p>`;
-	const edges =
-		reports.length === 0
-			? `<p>No conflict reports are stored.</p>`
-			: `<ul class="edges">${reports
-					.map((report) => {
-						const risk = report.risk;
-						const known = (RISKS as readonly string[]).includes(risk);
-						const cls = known ? `edge risk-${risk}` : "edge";
-						return `<li class="${cls}"><span class="risk">${esc(risk)}</span> ${esc(nameForWork(state, report.claim_a))} × ${esc(nameForWork(state, report.claim_b))}<p>${esc(report.explanation)}</p></li>`;
+function graphSection(state: AuthorityState, view: PageView): string {
+	const deps =
+		view.dependencies.length === 0
+			? `<p>No dependency is recorded.</p>`
+			: `<ul class="deps">${view.dependencies
+					.map((edge) => {
+						const risk = edge.risk ? `<p>Recorded risk ${esc(edge.risk)}</p>` : "";
+						const detail = edge.detail ? `<p>${esc(edge.detail)}</p>` : "";
+						return `<li class="dep"><span>${esc(edge.relation)}</span> <code>${esc(edge.from)}</code> → <code>${esc(edge.to)}</code>${risk}${detail}</li>`;
 					})
 					.join("")}</ul>`;
-	return `<section id="graph"><h2>Live work graph</h2>${key}${edges}</section>`;
+	const overlaps =
+		view.overlaps.length === 0
+			? `<p>No overlap is recorded.</p>`
+			: `<ul class="deps">${view.overlaps
+					.map(
+						(file) =>
+							`<li class="dep"><span>overlap</span> ${esc(file.path)} · ${esc(file.classification)} · ${esc(file.agents.join(", ") || "no agent recorded")}</li>`,
+					)
+					.join("")}</ul>`;
+	const reports = state.conflict_reports ?? [];
+	const claimEdges = view.dependencies.some((edge) => edge.relation === "claim-conflict");
+	const none = reports.length === 0 && !claimEdges ? `<p>No conflict reports are stored.</p>` : "";
+	return `<section id="graph"><h2>Live work graph</h2>
+<p class="note">Dependencies and overlaps are recorded relations. This page does not classify them.</p>
+<h3>Dependencies</h3>${deps}
+<h3>Overlaps</h3>${overlaps}
+${none}</section>`;
 }
 
-function compositionSection(state: AuthorityState): string {
-	const composition = state.composition;
-	if (!composition) {
-		return `<section id="composition"><h2>Composition</h2><p class="stamp">none</p><p>No composition is recorded.</p></section>`;
+function stateItem(name: string, current: string | null): string {
+	const now = name === current ? " now" : "";
+	return `<p class="state${now}">${name}<span>${STATE_NOTES[name]}</span></p>`;
+}
+
+function stateMap(current: string | null): string {
+	const left = ["PENDING", "COMPOSING", "COMPOSED"].map((name) => stateItem(name, current)).join("");
+	const right = ["CONFLICTED", "RESOLVING", "RESOLVED"].map((name) => stateItem(name, current)).join("");
+	return `<div class="map">
+<p class="note">The marked name is the recorded composition state. The other names are Git4Agents states. This is not a timeline of this task.</p>
+<div class="fork"><div>${left}</div><div>${right}</div></div>
+</div>`;
+}
+
+function candidatePlate(view: PageView): string {
+	if (view.promotableSha) {
+		return `<p class="candidate" id="promotable">PROMOTABLE CANDIDATE: <code>${esc(view.promotableSha)}</code></p>`;
 	}
-	const files = composition.files ?? [];
-	const fileHtml =
-		files.length === 0
-			? `<p>No overlap file is stored.</p>`
-			: files.map((file) => overlapFile(file)).join("");
-	const candidate = text(composition.candidate_sha);
-	return `<section id="composition"><h2>Composition</h2>
-<p class="stamp">${esc(composition.status)}</p>
-<p>Candidate ${candidate ? `<code>${esc(candidate)}</code>` : "none"}.</p>
-${fileHtml}</section>`;
+	return `<p class="candidate" id="promotable">PROMOTABLE CANDIDATE: NONE</p>`;
 }
 
-function overlapFile(file: CompositionRecord["files"][number]): string {
+function overlapExcerpt(file: CompositionRecord["files"][number]): string {
 	const sides = (file.sides ?? [])
 		.map(
-			(side) => `<div class="side"><p><code>${esc(side.agent_id)}</code> ${esc(side.role)}</p>
-<p>Intent: ${esc(side.intent)}</p>
-<p>Contributing SHA <code>${esc(side.sha)}</code></p>
+			(side) => `<div class="side"><p><code>${esc(text(side.agent_id) ?? "not recorded")}</code> ${esc(text(side.role) ?? "")}</p>
+<p>Intent: ${esc(text(side.intent) ?? "not recorded")}</p>
+<p>Contributing SHA <code>${esc(text(side.sha) ?? "none")}</code></p>
 <pre>${text(side.excerpt) ? esc(side.excerpt) : "no excerpt stored"}</pre></div>`,
 		)
 		.join("");
-	return `<article class="overlap"><h3>${esc(file.path)}</h3>
-<p>Reason: ${esc(file.classification)}</p>
+	return `<article class="overlap"><h3>${esc(text(file.path) ?? "not recorded")}</h3>
+<p>Reason: ${esc(text(file.classification) ?? "not recorded")}</p>
 ${sides}</article>`;
 }
 
-function resolutionSection(state: AuthorityState): string {
-	const composition = state.composition;
-	if (!composition) {
+function compositionSection(view: PageView): string {
+	if (!view.compositionState) {
+		return `<section id="composition"><h2>Composition</h2><p class="stamp">none</p><p>No composition is recorded.</p>${stateMap(null)}</section>`;
+	}
+	const fileHtml = view.excerpts.length === 0 ? `<p>No overlap file is stored.</p>` : view.excerpts.map((file) => overlapExcerpt(file)).join("");
+	const hidden = view.memberShaHidden
+		? `<p>The stored SHA is a member contribution. It is not shown as the promotable candidate.</p>`
+		: "";
+	return `<section id="composition"><h2>Composition</h2>
+<p class="stamp">${esc(view.compositionState)}</p>
+${stateMap(view.compositionState)}
+${candidatePlate(view)}
+${hidden}
+${fileHtml}</section>`;
+}
+
+function resolutionSection(view: PageView): string {
+	if (!view.compositionState) {
 		return `<section id="resolution"><h2>Resolution</h2><p>No composition is recorded.</p></section>`;
 	}
-	const contributing = (composition.contributing_shas ?? [])
-		.map((sha) => `<li><code>${esc(sha)}</code></li>`)
-		.join("");
-	const candidate = text(composition.candidate_sha);
-	if (composition.status === "CONFLICTED" || !candidate) {
+	const listed = view.contributionShas.map((sha) => `<li><code>${esc(sha)}</code></li>`).join("");
+	const left = `<div><p class="kicker">Member contribution SHAs</p><ul>${listed || "<li>none</li>"}</ul></div>`;
+	if (!view.promotableSha) {
+		const why = view.memberShaHidden
+			? `<p>The stored SHA is a member contribution. It is not a new candidate.</p>`
+			: `<p>Resolution state: unresolved.</p>`;
 		return `<section id="resolution"><h2>Resolution</h2>
-<p>Resolution state: unresolved.</p>
-<div class="seam"><div><p class="kicker">Contributing SHAs</p><ul>${contributing || "<li>none</li>"}</ul></div>
-<p class="arrow">→</p>
-<div class="candidate"><p class="kicker">Candidate SHA</p><p>none</p></div></div></section>`;
+${why}
+<div class="seam">${left}<p class="arrow">→</p><div class="candidate"><p class="kicker">Promotable candidate</p><p>NONE</p></div></div></section>`;
 	}
-	const isNew = !composition.contributing_shas.includes(candidate);
-	const label = isNew ? "New candidate" : "Candidate SHA is one of the contributing SHAs";
+	const fresh = view.compositionState === "RESOLVED";
+	const kicker = fresh ? "New candidate" : "Promotable candidate";
+	const note = fresh
+		? `<p>This SHA is a new software state. It still has to pass evaluation, the verdict seam, and a permit.</p>`
+		: `<p>Resolution state: ${esc(view.compositionState)}.</p>`;
 	return `<section id="resolution"><h2>Resolution</h2>
-<p>Resolution state: ${esc(composition.status)}.</p>
-<div class="seam"><div><p class="kicker">Contributing SHAs</p><ul>${contributing}</ul></div>
-<p class="arrow">→</p>
-<div class="candidate"><p class="kicker">${esc(label)}</p><code>${esc(candidate)}</code></div></div></section>`;
+${note}
+<div class="seam">${left}<p class="arrow">→</p><div class="candidate"><p class="kicker">${kicker}</p><code>${esc(view.promotableSha)}</code></div></div></section>`;
 }
 
 function mark(ok: boolean): string {
@@ -292,23 +498,20 @@ function gateList(bundle: EvaluationBundle): string {
 <div><dt>Provenance / policy</dt><dd>provenance ${mark(admission.provenance_complete)} · tool states ${mark(admission.valid_tool_states)} · static analysis ${mark(bundle.static_analysis.passed)}</dd></div>
 <div><dt>Semantic checks</dt><dd>${mark(semantic.passed)} (${num(semantic.total)} total)</dd></div>
 <div><dt>Tainted</dt><dd>${bundle.tainted ? "yes" : "no"}</dd></div>
-<div><dt>Bundle hash</dt><dd><code>${esc(bundle.bundle_hash)}</code></dd></div>
+<div><dt>Bundle hash</dt><dd><code>${esc(text(bundle.bundle_hash) ?? "not recorded")}</code></dd></div>
 </dl>`;
 }
 
-function evaluationSection(state: AuthorityState): string {
-	const candidate = text(state.composition?.candidate_sha);
+function evaluationSection(state: AuthorityState, view: PageView): string {
+	const candidate = view.promotableSha;
 	const bundles = Object.entries(state.evaluations ?? {});
 	const parts: string[] = [];
 	if (candidate && !Object.hasOwn(state.evaluations ?? {}, candidate)) {
-		parts.push(`<p>No evaluation bundle is stored for the composition candidate <code>${esc(candidate)}</code>.</p>`);
+		parts.push(`<p>No evaluation bundle is stored for the promotable candidate <code>${esc(candidate)}</code>.</p>`);
 	}
 	if (bundles.length === 0 && !candidate) parts.push(`<p>No evaluation bundle is stored.</p>`);
 	for (const [sha, bundle] of bundles) {
-		const relation =
-			candidate && sha === candidate
-				? "Composition candidate."
-				: "Stored bundle. Not the composition candidate.";
+		const relation = candidate && sha === candidate ? "Promotable candidate." : "Stored bundle. Not the promotable candidate.";
 		parts.push(`<article class="bundle"><h3><code>${esc(sha)}</code></h3><p>${relation}</p>${gateList(bundle)}</article>`);
 	}
 	return `<section id="evaluation"><h2>Evaluation</h2>${parts.join("")}</section>`;
@@ -318,10 +521,10 @@ function verdictSection(state: AuthorityState): string {
 	const verdicts = state.verdicts ?? [];
 	const latest = verdicts[verdicts.length - 1];
 	const verdictHtml = latest
-		? `<p class="stamp">${esc(latest.state)}</p>
-<p>Winner ${latest.winner_sha ? `<code>${esc(latest.winner_sha)}</code>` : "none"}.</p>
+		? `<p class="stamp">${esc(text(latest.state) ?? "not recorded")}</p>
+<p>Winner ${text(latest.winner_sha) ? `<code>${esc(latest.winner_sha ?? "")}</code>` : "none"}.</p>
 ${verdicts.length > 1 ? `<p>Showing the latest of ${verdicts.length} verdict records.</p>` : ""}
-<ul>${latest.reasons.map((reason) => `<li>${esc(reason)}</li>`).join("") || "<li>no reason recorded</li>"}</ul>`
+<ul>${(latest.reasons ?? []).map((reason) => `<li>${esc(text(reason) ?? "not recorded")}</li>`).join("") || "<li>no reason recorded</li>"}</ul>`
 		: `<p>No verdict is recorded.</p>`;
 	const quarantines = Object.values(state.quarantine ?? {});
 	const quarantineHtml =
@@ -330,39 +533,35 @@ ${verdicts.length > 1 ? `<p>Showing the latest of ${verdicts.length} verdict rec
 			: `<h3>Quarantine</h3><ul>${quarantines
 					.map(
 						(record) =>
-							`<li><code>${esc(record.contender_id)}</code> ${esc(record.status)} · ${esc(record.trigger)}</li>`,
+							`<li><code>${esc(text(record.contender_id) ?? "not recorded")}</code> ${esc(text(record.status) ?? "not recorded")} · ${esc(text(record.trigger) ?? "not recorded")}</li>`,
 					)
 					.join("")}</ul>`;
 	return `<section id="verdict"><h2>Verdict seam</h2>${verdictHtml}${quarantineHtml}</section>`;
 }
 
-function permitRelation(state: AuthorityState, permit: PermitRecord): string {
-	const candidate = state.composition?.candidate_sha ?? null;
-	if (!state.composition) return "No composition is recorded.";
-	if (candidate && permit.winner_candidate_sha === candidate) return "This permit names the composition candidate.";
-	if (state.composition.contributing_shas.includes(permit.winner_candidate_sha)) {
-		return "This permit names a contributing SHA, not the composition candidate.";
-	}
-	if (!candidate) return "The composition candidate is none.";
-	return "This permit names a different SHA from the composition candidate.";
+function permitRelation(view: PageView, permit: PermitRecord): string {
+	const winner = text(permit.winner_candidate_sha);
+	if (!view.compositionState) return "No composition is recorded.";
+	if (view.promotableSha && winner === view.promotableSha) return "This permit names the promotable candidate.";
+	if (winner && view.contributionShas.includes(winner)) return "This permit names a member contribution SHA, not the promotable candidate.";
+	if (!view.promotableSha) return "The promotable candidate is none.";
+	return "This permit names a different SHA from the promotable candidate.";
 }
 
-function authorizationSection(state: AuthorityState): string {
+function authorizationSection(state: AuthorityState, view: PageView): string {
 	const permits = Object.values(state.permits ?? {});
-	if (permits.length === 0) {
-		return `<section id="authorization"><h2>Authorization</h2><p>No permit is recorded.</p></section>`;
-	}
+	if (permits.length === 0) return `<section id="authorization"><h2>Authorization</h2><p>No permit is recorded.</p></section>`;
 	const cards = permits
 		.map(
-			(permit) => `<article class="permit"><h3><code>${esc(permit.permit_id)}</code></h3>
+			(permit) => `<article class="permit"><h3><code>${esc(text(permit.permit_id) ?? "not recorded")}</code></h3>
 <dl>
-<div><dt>Candidate SHA</dt><dd><code>${esc(permit.winner_candidate_sha)}</code></dd></div>
-<div><dt>Destination head</dt><dd><code>${esc(permit.expected_destination_head)}</code></dd></div>
+<div><dt>Candidate SHA</dt><dd><code>${esc(text(permit.winner_candidate_sha) ?? "none")}</code></dd></div>
+<div><dt>Destination head</dt><dd><code>${esc(text(permit.expected_destination_head) ?? "none")}</code></dd></div>
 <div><dt>Permit status</dt><dd>${permit.consumed ? "consumed" : "issued, not consumed"}</dd></div>
-<div><dt>Destination</dt><dd><code>${esc(permit.destination_repo)}</code></dd></div>
-<div><dt>Bound evaluation</dt><dd><code>${esc(permit.evaluation_bundle_hash)}</code></dd></div>
+<div><dt>Destination</dt><dd><code>${esc(text(permit.destination_repo) ?? "not recorded")}</code></dd></div>
+<div><dt>Bound evaluation</dt><dd><code>${esc(text(permit.evaluation_bundle_hash) ?? "not recorded")}</code></dd></div>
 </dl>
-<p>${esc(permitRelation(state, permit))}</p></article>`,
+<p>${esc(permitRelation(view, permit))}</p></article>`,
 		)
 		.join("");
 	return `<section id="authorization"><h2>Authorization</h2>${cards}</section>`;
@@ -384,12 +583,13 @@ function promotionSection(state: AuthorityState): string {
 	}
 	const fromBundles = bundles
 		.map(({ permit, bundle }) => {
-			const authorized = permit ? permit.winner_candidate_sha : null;
+			const authorized = permit ? text(permit.winner_candidate_sha) : null;
+			const ship = bundle.ship;
 			return `<article class="ship"><dl>
 <div><dt>Authorized SHA</dt><dd>${authorized ? `<code>${esc(authorized)}</code>` : "permit not stored"}</dd></div>
-<div><dt>Promoted SHA</dt><dd><code>${esc(bundle.ship.commit)}</code></dd></div>
-<div><dt>Canonical destination</dt><dd><code>${esc(bundle.ship.repo)}</code></dd></div>
-<div><dt>Promoted from</dt><dd><code>${esc(bundle.ship.base)}</code></dd></div>
+<div><dt>Promoted SHA</dt><dd><code>${esc(text(ship?.commit) ?? "none")}</code></dd></div>
+<div><dt>Canonical destination</dt><dd><code>${esc(text(ship?.repo) ?? "not recorded")}</code></dd></div>
+<div><dt>Promoted from</dt><dd><code>${esc(text(ship?.base) ?? "none")}</code></dd></div>
 </dl></article>`;
 		})
 		.join("");
@@ -397,7 +597,7 @@ function promotionSection(state: AuthorityState): string {
 		.filter((permit) => !state.promotion_bundles?.[permit.permit_id])
 		.map(
 			(permit) =>
-				`<p>Permit <code>${esc(permit.permit_id)}</code> is consumed. No promotion bundle is stored, so this page does not name a promoted SHA.</p>`,
+				`<p>Permit <code>${esc(text(permit.permit_id) ?? "not recorded")}</code> is consumed. No promotion bundle is stored, so this page does not name a promoted SHA.</p>`,
 		)
 		.join("");
 	return `<section id="promotion"><h2>Promotion</h2>${fromBundles}${consumedWithoutBundle}</section>`;
@@ -405,26 +605,24 @@ function promotionSection(state: AuthorityState): string {
 
 function proofSection(state: AuthorityState): string {
 	const bundles = bundlesOf(state);
+	const offline = `<p class="kicker">Offline verification</p><p>Not run</p>`;
 	if (bundles.length === 0) {
-		return `<section id="proof"><h2>Proof</h2><p>No promotion bundle is stored.</p><p>Offline verification: not executed in this view.</p></section>`;
+		return `<section id="proof"><h2>Proof</h2><p>No promotion bundle is stored.</p>${offline}</section>`;
 	}
 	const cards = bundles
 		.map(({ bundle }) => {
 			const envelopes = bundle.statements ?? [];
-			const signed = envelopes.filter((envelope) =>
-				(envelope.signatures ?? []).some((signature) => text(signature.sig)),
-			).length;
+			const signed = envelopes.filter((envelope) => (envelope.signatures ?? []).some((signature) => text(signature.sig))).length;
 			const named = text(bundle.authority_pubkey_der_hex);
 			const prefix = named ? named.slice(0, 12) : null;
 			return `<article class="proof"><dl>
-<div><dt>Bundle</dt><dd>version ${esc(String(bundle.version))} · ${envelopes.length} envelopes · ship <code>${esc(bundle.ship?.commit ?? "none")}</code></dd></div>
+<div><dt>Bundle</dt><dd>version ${esc(String(bundle.version ?? "not recorded"))} · ${envelopes.length} envelopes · ship <code>${esc(text(bundle.ship?.commit) ?? "none")}</code></dd></div>
 <div><dt>Signature</dt><dd>${signed} of ${envelopes.length} envelopes include a signature field. This page does not check the signature.</dd></div>
 <div><dt>Authority key</dt><dd>${prefix ? `named in the bundle, prefix <code>${esc(prefix)}</code>. The prefix is a label, not a trust anchor. This page does not check it against an out-of-band trust key.` : "not named in the bundle."}</dd></div>
-<div><dt>Offline verification</dt><dd>Offline verification: not executed in this view.</dd></div>
 </dl></article>`;
 		})
 		.join("");
-	return `<section id="proof"><h2>Proof</h2>${cards}</section>`;
+	return `<section id="proof"><h2>Proof</h2>${cards}${offline}</section>`;
 }
 
 const CSS = `
@@ -436,9 +634,7 @@ const CSS = `
   --line: #c5d2db;
   --stamp: #0f3d4c;
   --green: #0d6b3c;
-  --amber: #8a4b08;
   --red: #9d1c2f;
-  --blocked: #3a2f7a;
 }
 * { box-sizing: border-box; }
 body {
@@ -459,7 +655,8 @@ section { padding: 1.15rem 0; border-top: 1px solid var(--line); }
 code, pre { font-family: ui-monospace, "Cascadia Mono", Consolas, monospace; font-size: 0.86em; }
 code { overflow-wrap: anywhere; }
 pre { white-space: pre-wrap; overflow-wrap: anywhere; background: var(--plate); border: 1px solid var(--line); padding: 0.55rem 0.65rem; margin: 0.4rem 0 0; }
-.meta { color: var(--muted); font-size: 0.92rem; }
+.meta, .flow { color: var(--muted); }
+.flow { text-align: center; margin: 0; font-size: 1.2rem; color: var(--stamp); }
 .stamp {
   display: inline-block;
   margin: 0.2rem 0 0.6rem;
@@ -470,37 +667,37 @@ pre { white-space: pre-wrap; overflow-wrap: anywhere; background: var(--plate); 
   letter-spacing: 0.08em;
   line-height: 1.1;
 }
+.crew { display: grid; grid-template-columns: 1fr 1fr; gap: 0.45rem; }
 .agent, .overlap, .bundle, .permit, .ship, .proof {
   background: var(--plate);
   border: 1px solid var(--line);
   padding: 0.75rem 0.8rem;
-  margin: 0.55rem 0;
+  margin: 0;
+  min-width: 0;
 }
-dl { display: grid; grid-template-columns: 9.5rem 1fr; gap: 0.28rem 0.75rem; margin: 0; }
+.agent dl, .agent dl div { display: block; }
+.agent dl div { margin: 0.4rem 0; }
+.agent dt { font-size: 0.72rem; letter-spacing: 0.08em; text-transform: uppercase; }
+.overlap, .bundle, .permit, .ship, .proof { margin: 0.55rem 0; }
+dl { display: grid; grid-template-columns: 7.4rem 1fr; gap: 0.28rem 0.6rem; margin: 0; }
 dl div { display: contents; }
 dt { margin: 0; }
-dd { margin: 0; }
-.key, .edges { list-style: none; padding: 0; margin: 0.4rem 0; }
-.key li, .edges li { margin: 0.35rem 0; }
-.swatch, .risk { font-weight: 650; letter-spacing: 0.04em; }
-.risk-GREEN { color: var(--green); }
-.risk-AMBER { color: var(--amber); }
-.risk-RED { color: var(--red); }
-.risk-BLOCKED { color: var(--blocked); }
-.edge { border-left: 3px solid var(--line); padding-left: 0.6rem; }
-.edge.risk-GREEN { border-left-color: var(--green); }
-.edge.risk-AMBER { border-left-color: var(--amber); }
-.edge.risk-RED { border-left-color: var(--red); }
-.edge.risk-BLOCKED { border-left-color: var(--blocked); }
+dd { margin: 0; min-width: 0; }
+.deps { list-style: none; padding: 0; margin: 0.4rem 0; }
+.dep { border-left: 3px solid var(--line); padding: 0.2rem 0 0.2rem 0.6rem; margin: 0.35rem 0; }
+.fork { list-style: none; padding: 0; margin: 0.4rem 0 0.8rem; display: grid; grid-template-columns: 1fr 1fr; gap: 0.4rem; }
+.state { border: 1px solid var(--line); color: var(--muted); padding: 0.4rem 0.5rem; margin: 0; }
+.state span { display: block; font-size: 0.82rem; }
+.state.now { border: 2px solid var(--stamp); color: var(--stamp); font-weight: 650; }
 .seam { display: grid; gap: 0.35rem; }
 .arrow { margin: 0; font-size: 1.4rem; color: var(--stamp); }
-.candidate { border: 2px solid var(--stamp); padding: 0.6rem 0.7rem; background: var(--plate); }
+.candidate { border: 2px solid var(--stamp); padding: 0.7rem 0.8rem; background: var(--plate); font-size: 1.05rem; letter-spacing: 0.03em; }
 .pass { color: var(--green); font-weight: 650; }
 .fail { color: var(--red); font-weight: 650; }
 .fixture { border: 1px solid var(--stamp); padding: 0.55rem 0.7rem; margin: 0 0 0.8rem; }
 footer { color: var(--muted); font-size: 0.88rem; }
 @media (max-width: 36rem) {
-  dl { grid-template-columns: 1fr; gap: 0.05rem; }
+  .crew, dl, .fork { grid-template-columns: 1fr; }
   dl div { display: block; margin: 0.35rem 0; }
   .stamp { font-size: 1.35rem; }
 }
@@ -512,36 +709,43 @@ footer { color: var(--muted); font-size: 0.88rem; }
  */
 export function renderWorkGraphPage(state: AuthorityState, options: WorkGraphViewOptions = {}): string {
 	const task = state.task;
+	const view = pageView(state, options);
 	const banner = text(options.fixtureBanner);
 	const contract = text(task.behavior_contract);
+	const policy = text(task.policy_version) ?? "not recorded";
+	const repo = text(task.baseline_repo) ?? "not recorded";
+	const hash = text(task.task_hash) ?? "not recorded";
 	return `<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>${esc(task.task_id)} · MADGRIX</title>
+<title>${esc(view.taskId)} · MADGRIX</title>
 <style>${CSS}</style>
 </head>
 <body>
 ${banner ? `<p class="fixture">${esc(banner)}</p>` : ""}
 <header id="task">
-<p class="kicker">Task</p>
-<h1>${esc(task.intent)}</h1>
-<p class="meta">${esc(task.task_id)} · ${esc(state.task_status)} · ${esc(task.policy_version)}</p>
-<p class="meta">Baseline <code>${esc(task.baseline_repo)}</code> <code>${esc(task.baseline_commit)}</code></p>
-<p class="meta">Task hash <code>${esc(task.task_hash)}</code></p>
+<p class="kicker">Task / intent</p>
+<h1>${esc(view.intent)}</h1>
+<p class="meta">${esc(view.taskId)} · ${esc(view.taskStatus)} · ${esc(policy)}</p>
+<p class="meta">Baseline <code>${esc(repo)}</code> <code>${esc(view.baselineCommit)}</code></p>
+<p class="meta">Task hash <code>${esc(hash)}</code></p>
 ${contract ? `<p>${esc(contract)}</p>` : ""}
 </header>
-${crewSection(state)}
-${graphSection(state)}
-${compositionSection(state)}
-${resolutionSection(state)}
-${evaluationSection(state)}
+<p class="flow">↓</p>
+${crewSection(view)}
+<p class="flow">↓</p>
+${graphSection(state, view)}
+<p class="flow">↓</p>
+${compositionSection(view)}
+${resolutionSection(view)}
+${evaluationSection(state, view)}
 ${verdictSection(state)}
-${authorizationSection(state)}
+${authorizationSection(state, view)}
 ${promotionSection(state)}
 ${proofSection(state)}
-<footer><p>Rendered from task-authority state. This page does not classify claims, choose a verdict, or verify a bundle.</p></footer>
+<footer><p>Rendered from task-authority state. This page does not classify overlaps, choose a verdict, or verify a bundle.</p></footer>
 </body>
 </html>`;
 }

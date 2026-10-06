@@ -927,9 +927,11 @@ export async function handleTaskContext(env: Env, taskId: string, request: Reque
 }
 
 /**
- * GET /tasks/:id/graph — JSON for format=json, otherwise one HTML page.
- * Same auth as context. The page does not classify claims or verify a bundle,
- * and it does not include agent secrets. The JSON body is buildWorkGraph.
+ * GET /tasks/:id/graph — JSON for format=json or Accept: application/json,
+ * otherwise one HTML page. Same auth as context. The JSON body is
+ * buildWorkGraph. The page is presentation only: it does not classify
+ * overlaps, advance composition, choose a verdict, or verify a bundle, and
+ * it does not include agent secrets.
  */
 export async function handleWorkGraph(env: Env, taskId: string, request: Request): Promise<Response> {
 	if (!(await requireAgentOrControl(request, env))) return json({ error: "task_context_auth_required" }, 401);
