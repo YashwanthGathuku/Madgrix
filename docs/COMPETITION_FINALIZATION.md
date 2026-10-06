@@ -153,3 +153,52 @@ Classification is of the tree at the baseline SHA. "Tested locally" means the No
 ## What this pass will not do
 
 No edit to the three frozen spec files. No deploy. No billing change. No new paid Cloudflare resource. No force-push. Local harness output will not be described as a Cloudflare result.
+
+## Update at `4a8c4cc`
+
+The baseline section above stays the record of `4d979059`. This section is the tree after the composition work. It is not a Cloudflare run.
+
+| Item | Value |
+|---|---|
+| Branch | `git4agents/combined` |
+| SHA this section describes | `4a8c4cc7b521688f839f0f332605dcefa3984c38` |
+| Parent | `8644b8ee8964e1bcbc80cb3d8f73702ba73b4e06` Refuse an unresolved fork-crew conflict as a candidate. |
+| Also on the branch, not on origin at record time | `27b8ab0` baseline note, `b251b29` JSDoc typecheck fix |
+| Frozen specs | not edited. Amendment: `specs/amendments/composition-result-v1.md` |
+| Deploy | not done |
+
+Commands on 2026-10-06, after `4a8c4cc` was committed. The suite ran from `git archive HEAD` extracted in WSL so the shell scripts were LF. `node_modules` was the Windows install, symlinked. WSL Node is v24.21.0. Windows `tsc` is TypeScript 7.0.2. WSL `tsc` cannot start: `@typescript/typescript-linux-x64` is not installed.
+
+| Command | Result |
+|---|---|
+| Windows `node .\node_modules\typescript\lib\tsc.js --noEmit` | exit 0, before the demo commit. `src` did not change after that run. |
+| Windows `node .\node_modules\typescript\lib\tsc.js --noEmit -p tsconfig.node.json` | exit 0 on the tree committed as `4a8c4cc`. |
+| WSL `node --test "test/**/*.test.ts"` in the LF archive of `4a8c4cc` | **296 pass, 0 fail**, `duration_ms` 11315.073132. |
+| WSL `node src/harness/slice.ts` | `SLICE OK`. Offline verify printed `VERIFIED` against the harness pinned key. |
+| WSL `node src/harness/head-move.ts` | `HEAD-MOVE OK`. |
+| WSL `node src/lib/benchmark.ts` | `zero_tolerance_ok: true`. The ordinary stratum is still marked synthetic. |
+| `npm run build` | not re-run. At the baseline, the worker bundle step ran and the container image step failed because the Docker CLI was absent. |
+| `npm run live:e2e` | not run. |
+
+A direct `node --test` on the Windows working tree (`core.autocrlf=true`) failed the frozen-hash check and the bash container scripts with `pipefail\r`. Those failures are the CRLF working tree. The LF archive does not show them. Do not "fix" the blobs to CRLF.
+
+### What changed since the baseline
+
+| ID | Now | Status |
+|---|---|---|
+| P0-G | Overlapping lines produce no commit. The runner exits 3 and does not push unless `MADGRIX_RESOLVER_COMMAND` is set. The resolver commit is a new SHA. `POST /tasks/:id/composition` is control-plane only. CONFLICTED rejects evidence, permit, and promotion. A contributing SHA cannot stand in for the recorded candidate. | **IMPLEMENTED. TESTED LOCALLY** (`test/fork-crew.test.ts`, `test/composition-authority.test.ts`, `test/demo-composition.test.ts`). **NOT TESTED ON CLOUDFLARE.** |
+| P1-A | `GET /tasks/:id/context` adds `conflict_reports` and `composition`. `GET /tasks/:id/graph` is a small HTML page of that state. Same auth as context. | **IMPLEMENTED. TESTED LOCALLY** in `test/composition-authority.test.ts` (record, context, escaped graph). **NOT TESTED ON CLOUDFLARE.** |
+| P1-B | Sub-agent commands run in separate git worktrees, concurrently. | **IMPLEMENTED. TESTED LOCALLY.** Two agents overlap in time in `test/fork-crew.test.ts`. Three overlap in `test/demo-composition.test.ts`. Still one machine, not a microVM per agent. **NOT TESTED ON CLOUDFLARE.** |
+| P1-C | Results are `COMPOSED`, `CONFLICTED`, or `RESOLVED`. | **IMPLEMENTED. TESTED LOCALLY.** **NOT TESTED ON CLOUDFLARE.** |
+| P1-D | `resolveComposition` gives the resolver the baseline, `.madgrix/conflict.json`, and `.madgrix/sides/<agent>/`. Env is `MADGRIX_CONFLICT_PATH` and `MADGRIX_BASELINE_SHA` only. | **IMPLEMENTED. TESTED LOCALLY.** The resolver does not call the authority. `scripts/live-e2e.ts` posts the record with the control token. That script was not executed. |
+| P2 demo | `configs/demo-composition.json`: API, UI, and an integration check. One deliberate overlap on `src/contract.js`. `scripts/demo-resolve.mjs` writes the new tree. | **IMPLEMENTED. TESTED LOCALLY** by `test/demo-composition.test.ts` (1 pass). The test does not run the candidate's tests and does not promote. |
+
+P0-A through P0-F and P0-H are unchanged in claim from the baseline. The same local suite, now 296 tests, still passes on the LF archive. They remain **NOT TESTED ON CLOUDFLARE.**
+
+### Residual on P0-G
+
+The authority refuses a conflict only after the control plane records it. The runner no longer writes a marker commit. A commit someone else builds, with markers, and that nobody records as CONFLICTED, is still an ordinary candidate. `live-e2e` records the runner's composition and then refuses a CONFLICTED result. A run that never calls `POST /composition` does not arm the authority gate.
+
+An empty republish after a push is still a new SHA. It is not a contributing SHA, so the composition gate does not treat it as the recorded candidate. It needs its own evaluation.
+
+TheUstad still checks the frozen baseline before combine. It does not evaluate the composed or resolved tree.
