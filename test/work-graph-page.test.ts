@@ -7,6 +7,7 @@ import assert from "node:assert/strict";
 import { classifyPair } from "../src/lib/claims.ts";
 import { createAuthority } from "../src/lib/task-state.ts";
 import type { AuthorityState, ConflictRisk, EvaluationBundle, PermitRecord, WorkClaim } from "../src/lib/types.ts";
+import { buildWorkGraph } from "../src/lib/work-graph.ts";
 import type { PromotionBundle } from "../src/lib/attestation.ts";
 import { renderWorkGraphPage } from "../src/worker/work-graph-page.ts";
 
@@ -411,9 +412,10 @@ describe("work graph page", () => {
 		assert.doesNotMatch(composedHtml, /New candidate/);
 	});
 
-	it("prints a passed-in work graph and still refuses a member SHA as the candidate", () => {
-		const state = base();
-		state.composition = {
+	it("prints the canonical work graph and does not show a member SHA as the candidate", () => {
+		const stored = base();
+		stored.task = { ...stored.task, intent: "stored intent" };
+		stored.composition = {
 			status: "CONFLICTED",
 			contender_id: "contender-demo",
 			baseline: "baseline-sha",
@@ -425,52 +427,63 @@ describe("work graph page", () => {
 			files: [],
 			candidate_sha: null,
 		};
-		const shown = renderWorkGraphPage(state, {
-			graph: {
-				task: { intent: "graph intent" },
-				composition_state: "RESOLVED",
-				candidate_sha: "graph-sha",
-				crew: {
-					contender_id: "contender-demo",
-					parent: { agent_id: "parent", contender_id: "contender-demo", fork_repo: "fork-demo" },
-					baseline: "baseline-sha",
-					outcome: "RESOLVED",
-					members: [
-						{
-							agent_id: "sub-api",
-							role: "api",
-							intent: "from graph",
-							scope: ["src/contract.js"],
-							claim_work_id: "W-api",
-							commit_sha: "side-a",
-							status: "committed",
-						},
+		const resolved = base();
+		resolved.task = { ...resolved.task, intent: "graph intent" };
+		resolved.composition = {
+			status: "RESOLVED",
+			contender_id: "contender-demo",
+			baseline: "baseline-sha",
+			agents: [
+				{ id: "sub-api", role: "api", intent: "from graph", sha: "side-a", paths: ["src/contract.js"], claim_work_id: "W-api" },
+				{ id: "sub-ui", role: "ui", intent: "ui", sha: "side-b", paths: ["src/contract.js"], claim_work_id: null },
+			],
+			contributing_shas: ["side-a", "side-b"],
+			files: [
+				{
+					path: "src/contract.js",
+					classification: "textual-line-overlap",
+					sides: [
+						{ agent_id: "sub-api", role: "api", intent: "from graph", sha: "side-a", excerpt: "api" },
+						{ agent_id: "sub-ui", role: "ui", intent: "ui", sha: "side-b", excerpt: "ui" },
 					],
 				},
-				dependencies: [{ from: "side-a", to: "baseline-sha", relation: "baseline" }],
-				overlaps: [{ path: "src/contract.js", classification: "textual-line-overlap", agents: ["sub-api", "sub-ui"] }],
-			},
-		});
+			],
+			candidate_sha: "graph-sha",
+		};
+		const graph = buildWorkGraph(resolved);
+		assert.equal(graph.candidate_sha, "graph-sha");
+		assert.equal(graph.composition_state, "RESOLVED");
+		const shown = renderWorkGraphPage(stored, { graph });
 		assert.match(shown, /<h1>graph intent<\/h1>/);
 		assert.match(shown, /class="stamp">RESOLVED/);
 		assert.match(shown, /id="promotable">PROMOTABLE CANDIDATE: <code>graph-sha<\/code>/);
 		assert.match(shown, /New candidate/);
 		assert.match(shown, /from graph/);
 		assert.match(shown, /side-a/);
+		assert.doesNotMatch(shown, /class="stamp">CONFLICTED/);
 
-		const hidden = renderWorkGraphPage(state, {
-			graph: {
-				composition_state: "RESOLVED",
-				candidate_sha: "side-a",
-				crew: {
-					parent: { agent_id: "parent", contender_id: "contender-demo", fork_repo: "fork-demo" },
-					baseline: "baseline-sha",
-					members: [{ agent_id: "sub-api", role: "api", intent: "api", scope: ["src/a"], commit_sha: "side-a", status: "committed" }],
-				},
-			},
-		});
+		const illegal = base();
+		illegal.composition = {
+			status: "RESOLVED",
+			contender_id: "contender-demo",
+			baseline: "baseline-sha",
+			agents: [
+				{ id: "sub-api", role: "api", intent: "api", sha: "side-a", paths: ["src/a"], claim_work_id: null },
+				{ id: "sub-ui", role: "ui", intent: "ui", sha: "side-b", paths: ["src/b"], claim_work_id: null },
+			],
+			contributing_shas: ["side-a", "side-b"],
+			files: [],
+			candidate_sha: "side-a",
+		};
+		const hiddenGraph = buildWorkGraph(illegal);
+		assert.equal(hiddenGraph.candidate_sha, null);
+		assert.equal(hiddenGraph.crew?.candidate_sha, null);
+		const hidden = renderWorkGraphPage(illegal, { graph: hiddenGraph });
 		assert.match(hidden, /id="promotable">PROMOTABLE CANDIDATE: NONE/);
 		assert.match(hidden, /member contribution/);
+		assert.match(hidden, /Member contribution SHAs/);
+		assert.match(hidden, /side-a/);
 		assert.doesNotMatch(hidden, /New candidate/);
+		assert.doesNotMatch(hidden, /id="promotable">PROMOTABLE CANDIDATE: <code>side-a/);
 	});
 });

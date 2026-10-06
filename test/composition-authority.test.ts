@@ -414,5 +414,15 @@ describe("composition route", () => {
 		assert.equal(after.body.crew.candidate_sha, RESOLVED);
 		assert.equal(after.body.contributing_shas, undefined);
 		assert.equal((after.body.crew.members as Array<{ commit_sha: string }>).some((member) => member.commit_sha === RESOLVED), false);
+		const resolvedPage = await worker.fetch(new Request(`https://madgrix.test/tasks/${h.taskId}/graph`, {
+			headers: { authorization: `Bearer ${TOKENS.agent}` },
+		}), h.env as never);
+		const resolvedHtml = await resolvedPage.text();
+		assert.equal(resolvedPage.status, 200);
+		assert.match(resolvedHtml, new RegExp(`PROMOTABLE CANDIDATE: <code>${RESOLVED}</code>`));
+		assert.match(resolvedHtml, /Member contribution SHAs/);
+		assert.match(resolvedHtml, new RegExp(SIDE_A));
+		assert.doesNotMatch(resolvedHtml, new RegExp(`PROMOTABLE CANDIDATE: <code>${SIDE_A}`));
+		assert.equal(after.body.candidate_sha, RESOLVED);
 	});
 });

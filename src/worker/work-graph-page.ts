@@ -1,12 +1,11 @@
 /**
  * HTML for GET /tasks/:id/graph.
  *
- * Prints one task. Crew, dependencies, overlaps, and the composition
- * state come from the authority record, or from a work-graph object the
- * caller passes through. A SHA is placed in the promotable-candidate
- * position only when that state is COMPOSED or RESOLVED and the SHA is
- * not a member contribution. This file does not advance composition,
- * classify overlaps, score gates, choose a verdict, or verify a bundle.
+ * Prints one task. Crew, dependencies, overlaps, composition state, and
+ * the promotable candidate come from the canonical WorkGraph. This file
+ * formats that object. It does not decide which SHA is promotable.
+ * It does not advance composition, classify overlaps, score gates,
+ * choose a verdict, or verify a bundle.
  *
  * The route accepts the agent bearer, so this page does not print token
  * ids, agent secrets, permit nonces, DSSE signatures, hidden-test names,
@@ -15,33 +14,7 @@
 
 import type { PromotionBundle } from "../lib/attestation.ts";
 import type { AuthorityState, CompositionRecord, EvaluationBundle, PermitRecord } from "../lib/types.ts";
-
-export interface WorkGraphMemberInput {
-	agent_id?: string;
-	role?: string;
-	intent?: string;
-	scope?: string[];
-	claim_work_id?: string | null;
-	commit_sha?: string | null;
-	status?: string;
-}
-
-export interface WorkGraphInput {
-	task?: { task_id?: string; intent?: string; status?: string; baseline_commit?: string };
-	crew?: {
-		contender_id?: string;
-		parent?: { agent_id?: string; authority?: string; contender_id?: string; fork_repo?: string };
-		members?: WorkGraphMemberInput[];
-		baseline?: string;
-		outcome?: string;
-		candidate_sha?: string | null;
-	} | null;
-	members?: WorkGraphMemberInput[];
-	dependencies?: Array<{ from?: string; to?: string; relation?: string }>;
-	overlaps?: Array<{ path?: string; classification?: string; agents?: string[] }>;
-	composition_state?: string | null;
-	candidate_sha?: string | null;
-}
+import { buildWorkGraph, type WorkGraph } from "../lib/work-graph.ts";
 
 export interface WorkGraphViewOptions {
 	/**
@@ -50,12 +23,10 @@ export interface WorkGraphViewOptions {
 	 */
 	fixtureBanner?: string;
 	/**
-	 * Collaboration work graph. When set, it supplies the crew, dependencies,
-	 * overlaps, composition state, and candidate. The page still applies the
-	 * display rule: no candidate position unless the state is COMPOSED or
-	 * RESOLVED, and a member SHA never fills that position.
+	 * Canonical work graph. The worker passes the same object it returns
+	 * as JSON. When omitted, this page builds that object from `state`.
 	 */
-	graph?: WorkGraphInput;
+	graph?: WorkGraph;
 }
 
 interface MemberView {
@@ -134,11 +105,6 @@ function num(value: unknown): string {
 	return typeof value === "number" && Number.isFinite(value) ? String(value) : "not recorded";
 }
 
-function strings(value: unknown): string[] {
-	if (!Array.isArray(value)) return [];
-	return value.map((item) => text(item)).filter((item): item is string => item !== null);
-}
-
 function roleLabel(role: string, id: string): string {
 	if (role === "parent" || id === "parent") return "parent";
 	if (role === "api") return "API agent";
@@ -147,195 +113,67 @@ function roleLabel(role: string, id: string): string {
 	return text(role) ?? id;
 }
 
-function promotableState(status: string | null): boolean {
-	return status === "COMPOSED" || status === "RESOLVED";
-}
-
-function decideCandidate(status: string | null, raw: string | null, members: Set<string>): { sha: string | null; hidden: boolean } {
-	if (!promotableState(status) || !raw) return { sha: null, hidden: false };
-	if (members.has(raw)) return { sha: null, hidden: true };
-	return { sha: raw, hidden: false };
-}
-
-function memberView(input: {
-	agent_id?: unknown;
-	role?: unknown;
-	intent?: unknown;
-	scope?: unknown;
-	claim_work_id?: unknown;
-	commit_sha?: unknown;
-	status?: unknown;
-}): MemberView {
-	const sha = text(input.commit_sha);
-	return {
-		agent_id: text(input.agent_id) ?? "not recorded",
-		role: text(input.role) ?? "",
-		intent: text(input.intent) ?? "",
-		scope: strings(input.scope),
-		claim_work_id: text(input.claim_work_id),
-		commit_sha: sha,
-		status: text(input.status) ?? (sha ? "committed" : "pending"),
-	};
-}
-
-function crewFromState(state: AuthorityState): CrewView | null {
-	const composition = state.composition;
-	if (!composition) return null;
-	const contender = state.contenders?.[composition.contender_id];
-	if (!contender) return null;
-	const members = (composition.agents ?? []).map((agent) => {
-		const claim = agent.claim_work_id ? state.claims.find((row) => row.work_id === agent.claim_work_id) : undefined;
-		const sha = text(agent.sha);
-		return memberView({
-			agent_id: agent.id,
-			role: agent.role,
-			intent: agent.intent,
-			scope: agent.paths,
-			claim_work_id: agent.claim_work_id,
-			commit_sha: sha,
-			status: text(claim?.status) ?? (sha ? "committed" : "pending"),
-		});
-	});
-	return {
-		contender_id: text(contender.contender_id) ?? text(composition.contender_id) ?? "not recorded",
-		parent: {
-			agent_id: text(contender.agent_id) ?? "not recorded",
-			contender_id: text(contender.contender_id) ?? "not recorded",
-			fork_repo: text(contender.fork_repo) ?? "not recorded",
-		},
-		members,
-		baseline: text(composition.baseline) ?? "not recorded",
-		outcome: text(composition.status) ?? "not recorded",
-	};
-}
-
-function crewFromGraph(graph: NonNullable<WorkGraphInput["crew"]>, fallbackMembers: WorkGraphMemberInput[] | undefined): CrewView {
-	const parent = graph.parent ?? {};
-	const own = Array.isArray(graph.members) ? graph.members : [];
-	const listed = own.length > 0 ? own : (fallbackMembers ?? []);
-	return {
-		contender_id: text(graph.contender_id) ?? text(parent.contender_id) ?? "not recorded",
-		parent: {
-			agent_id: text(parent.agent_id) ?? "not recorded",
-			contender_id: text(parent.contender_id) ?? text(graph.contender_id) ?? "not recorded",
-			fork_repo: text(parent.fork_repo) ?? "not recorded",
-		},
-		members: listed.map((member) => memberView(member)),
-		baseline: text(graph.baseline) ?? "not recorded",
-		outcome: text(graph.outcome) ?? "not recorded",
-	};
-}
-
 function reportDetail(state: AuthorityState, from: string, to: string): { detail: string | null; risk: string | null } {
 	const report = (state.conflict_reports ?? []).find((row) => row.claim_a === from && row.claim_b === to);
 	if (!report) return { detail: null, risk: null };
 	return { detail: text(report.explanation), risk: text(report.risk) };
 }
 
-function depsFromState(state: AuthorityState, crew: CrewView | null, overlaps: OverlapView[]): DepView[] {
-	const dependencies: DepView[] = [];
-	if (crew) {
-		for (const member of crew.members) {
-			if (member.commit_sha) dependencies.push({ from: member.commit_sha, to: crew.baseline, relation: "baseline", detail: null, risk: null });
-		}
-	}
-	for (const file of overlaps) {
-		for (let i = 0; i < file.agents.length; i += 1) {
-			for (let j = i + 1; j < file.agents.length; j += 1) {
-				dependencies.push({ from: file.agents[i] ?? "", to: file.agents[j] ?? "", relation: "overlap", detail: null, risk: null });
+function pageView(state: AuthorityState, graph: WorkGraph): PageView {
+	const crew: CrewView | null = graph.crew
+		? {
+				contender_id: graph.crew.contender_id,
+				parent: {
+					agent_id: graph.crew.parent.agent_id,
+					contender_id: graph.crew.parent.contender_id,
+					fork_repo: graph.crew.parent.fork_repo,
+				},
+				members: graph.crew.members.map((member) => ({
+					agent_id: member.agent_id,
+					role: member.role,
+					intent: member.intent,
+					scope: [...member.scope],
+					claim_work_id: member.claim_work_id,
+					commit_sha: member.commit_sha,
+					status: member.status,
+				})),
+				baseline: graph.crew.baseline,
+				outcome: graph.crew.outcome,
 			}
-		}
-	}
-	for (const report of state.conflict_reports ?? []) {
-		const from = text(report.claim_a) ?? "not recorded";
-		const to = text(report.claim_b) ?? "not recorded";
-		dependencies.push({ from, to, relation: "claim-conflict", detail: text(report.explanation), risk: text(report.risk) });
-	}
-	return dependencies;
-}
-
-function overlapsFromFiles(files: CompositionRecord["files"] | undefined): OverlapView[] {
-	return (files ?? []).map((file) => ({
-		path: text(file.path) ?? "not recorded",
-		classification: text(file.classification) ?? "not recorded",
-		agents: (file.sides ?? []).map((side) => text(side.agent_id)).filter((id): id is string => id !== null),
+		: null;
+	const overlaps: OverlapView[] = graph.overlaps.map((file) => ({
+		path: file.path,
+		classification: file.classification,
+		agents: [...file.agents],
 	}));
-}
-
-function viewFromState(state: AuthorityState): PageView {
-	const crew = crewFromState(state);
-	const overlaps = overlapsFromFiles(state.composition?.files);
-	const outcome = crew?.outcome ?? text(state.composition?.status) ?? null;
-	const members = new Set<string>();
-	for (const member of crew?.members ?? []) if (member.commit_sha) members.add(member.commit_sha);
-	for (const sha of state.composition?.contributing_shas ?? []) {
-		const value = text(sha);
-		if (value) members.add(value);
-	}
-	const decision = decideCandidate(outcome, text(state.composition?.candidate_sha), members);
-	return {
-		intent: text(state.task.intent) ?? "not recorded",
-		taskId: text(state.task.task_id) ?? "not recorded",
-		taskStatus: text(state.task_status) ?? "not recorded",
-		baselineCommit: text(state.task.baseline_commit) ?? "not recorded",
-		crew,
-		dependencies: depsFromState(state, crew, overlaps),
-		overlaps,
-		excerpts: state.composition?.files ?? [],
-		compositionState: outcome,
-		promotableSha: decision.sha,
-		memberShaHidden: decision.hidden,
-		contributionShas: [...members],
-	};
-}
-
-function viewFromGraph(state: AuthorityState, graph: WorkGraphInput): PageView {
-	const crew = graph.crew ? crewFromGraph(graph.crew, graph.members) : null;
-	const outcome = text(graph.composition_state) ?? crew?.outcome ?? null;
-	if (crew && text(graph.composition_state)) crew.outcome = outcome ?? crew.outcome;
-	const overlaps = (graph.overlaps ?? []).map((file) => ({
-		path: text(file.path) ?? "not recorded",
-		classification: text(file.classification) ?? "not recorded",
-		agents: strings(file.agents),
-	}));
-	const dependencies = (graph.dependencies ?? []).map((edge) => {
-		const from = text(edge.from) ?? "not recorded";
-		const to = text(edge.to) ?? "not recorded";
-		const relation = text(edge.relation) ?? "not recorded";
-		const stored = relation === "claim-conflict" ? reportDetail(state, from, to) : { detail: null, risk: null };
-		return { from, to, relation, detail: stored.detail, risk: stored.risk };
+	const dependencies: DepView[] = graph.dependencies.map((edge) => {
+		const stored = edge.relation === "claim-conflict" ? reportDetail(state, edge.from, edge.to) : { detail: null, risk: null };
+		return { from: edge.from, to: edge.to, relation: edge.relation, detail: stored.detail, risk: stored.risk };
 	});
-	const sameRecord = !state.composition || state.composition.status === outcome;
-	const members = new Set<string>();
-	for (const member of crew?.members ?? []) if (member.commit_sha) members.add(member.commit_sha);
-	if (sameRecord) {
-		for (const sha of state.composition?.contributing_shas ?? []) {
-			const value = text(sha);
-			if (value) members.add(value);
-		}
+	const contribution = new Set<string>();
+	for (const member of graph.members) if (member.commit_sha) contribution.add(member.commit_sha);
+	const sameRecord = state.composition?.status === graph.composition_state;
+	if (sameRecord && state.composition) {
+		for (const sha of state.composition.contributing_shas) if (sha) contribution.add(sha);
 	}
-	const raw = text(graph.candidate_sha) ?? (sameRecord ? text(state.composition?.candidate_sha) : null);
-	const decision = decideCandidate(outcome, raw, members);
-	const task = graph.task ?? {};
+	const storedSha = sameRecord ? (state.composition?.candidate_sha ?? null) : null;
+	const memberShaHidden =
+		graph.candidate_sha === null && typeof storedSha === "string" && storedSha.length > 0 && contribution.has(storedSha);
 	const paths = new Set(overlaps.map((file) => file.path));
 	return {
-		intent: text(task.intent) ?? text(state.task.intent) ?? "not recorded",
-		taskId: text(task.task_id) ?? text(state.task.task_id) ?? "not recorded",
-		taskStatus: text(task.status) ?? text(state.task_status) ?? "not recorded",
-		baselineCommit: text(task.baseline_commit) ?? text(state.task.baseline_commit) ?? "not recorded",
+		intent: text(graph.task.intent) ?? "not recorded",
+		taskId: text(graph.task.task_id) ?? "not recorded",
+		taskStatus: text(graph.task.status) ?? "not recorded",
+		baselineCommit: text(graph.task.baseline_commit) ?? "not recorded",
 		crew,
 		dependencies,
 		overlaps,
-		excerpts: (state.composition?.files ?? []).filter((file) => paths.has(file.path)),
-		compositionState: outcome,
-		promotableSha: decision.sha,
-		memberShaHidden: decision.hidden,
-		contributionShas: [...members],
+		excerpts: sameRecord ? (state.composition?.files ?? []).filter((file) => paths.has(file.path)) : [],
+		compositionState: graph.composition_state,
+		promotableSha: graph.candidate_sha,
+		memberShaHidden,
+		contributionShas: [...contribution],
 	};
-}
-
-function pageView(state: AuthorityState, options: WorkGraphViewOptions): PageView {
-	return options.graph ? viewFromGraph(state, options.graph) : viewFromState(state);
 }
 
 function crewSection(view: PageView): string {
@@ -709,7 +547,7 @@ footer { color: var(--muted); font-size: 0.88rem; }
  */
 export function renderWorkGraphPage(state: AuthorityState, options: WorkGraphViewOptions = {}): string {
 	const task = state.task;
-	const view = pageView(state, options);
+	const view = pageView(state, options.graph ?? buildWorkGraph(state));
 	const banner = text(options.fixtureBanner);
 	const contract = text(task.behavior_contract);
 	const policy = text(task.policy_version) ?? "not recorded";
@@ -745,7 +583,7 @@ ${verdictSection(state)}
 ${authorizationSection(state, view)}
 ${promotionSection(state)}
 ${proofSection(state)}
-<footer><p>Rendered from task-authority state. This page does not classify overlaps, choose a verdict, or verify a bundle.</p></footer>
+<footer><p>Rendered from the canonical work graph and stored authority records. This page does not classify overlaps, choose a verdict, or verify a bundle.</p></footer>
 </body>
 </html>`;
 }

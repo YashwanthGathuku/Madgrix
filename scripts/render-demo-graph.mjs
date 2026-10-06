@@ -20,6 +20,7 @@ import { fileURLToPath } from "node:url";
 
 import { sha256Hex } from "../src/lib/canonical.ts";
 import { createAuthority, recordComposition, registerClaim } from "../src/lib/task-state.ts";
+import { buildWorkGraph } from "../src/lib/work-graph.ts";
 import { authorityComposition, loadForkCrew, resolveComposition, runCrewOnFork } from "./lib/fork-crew.mjs";
 import { renderWorkGraphPage } from "../src/worker/work-graph-page.ts";
 
@@ -169,7 +170,7 @@ try {
 		authorityComposition({ ...compositionInput, status: "CONFLICTED", sha: null }),
 		ctx,
 	);
-	const conflictedHtml = renderWorkGraphPage(state, { fixtureBanner: BANNER });
+	const conflictedHtml = renderWorkGraphPage(state, { fixtureBanner: BANNER, graph: buildWorkGraph(state) });
 	state = {
 		...state,
 		contenders: {
@@ -181,7 +182,7 @@ try {
 		authorityComposition({ ...compositionInput, status: "RESOLVED", sha: resolved.sha }),
 		ctx,
 	);
-	const resolvedHtml = renderWorkGraphPage(state, { fixtureBanner: BANNER });
+	const resolvedHtml = renderWorkGraphPage(state, { fixtureBanner: BANNER, graph: buildWorkGraph(state) });
 
 	for (const html of [conflictedHtml, resolvedHtml]) {
 		const leaked = [TOKEN_ID, ...secrets].filter((secret) => secret && html.includes(secret));

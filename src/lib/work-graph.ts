@@ -2,7 +2,7 @@
  * Live work-graph data for one task. The demo worker owns presentation.
  * This module only names the crew, its members, and the composition state
  * the authority has recorded. A promotable SHA appears only for COMPOSED
- * and RESOLVED.
+ * and RESOLVED, and only when that SHA is not a contributing or member SHA.
  */
 
 import type { AuthorityState, CompositionStatus, CrewContender, CrewMember } from "./types.ts";
@@ -32,6 +32,28 @@ export interface WorkGraph {
 
 function promotable(status: CompositionStatus): boolean {
 	return status === "COMPOSED" || status === "RESOLVED";
+}
+
+/**
+ * The one SHA promotion may use. Null for every state except COMPOSED and
+ * RESOLVED, and null when the recorded SHA is empty or is a contributing
+ * or member SHA. The HTML page prints this value. It does not decide it.
+ */
+function candidateSha(
+	composition: { status: CompositionStatus; candidate_sha: string | null; contributing_shas: string[] },
+	memberShas: ReadonlySet<string>,
+): string | null {
+	if (!promotable(composition.status)) return null;
+	const sha = composition.candidate_sha;
+	if (typeof sha !== "string" || sha.length === 0) return null;
+	if (composition.contributing_shas.includes(sha) || memberShas.has(sha)) return null;
+	return sha;
+}
+
+function memberShasOf(shas: Array<string | null>): Set<string> {
+	const memberShas = new Set<string>();
+	for (const sha of shas) if (sha) memberShas.add(sha);
+	return memberShas;
 }
 
 /** The parent fork plus its member agents. Null until a composition is recorded. */
@@ -65,7 +87,10 @@ export function crewContenderOf(state: AuthorityState): CrewContender | null {
 		members,
 		baseline: composition.baseline,
 		outcome: composition.status,
-		candidate_sha: promotable(composition.status) ? composition.candidate_sha : null,
+		candidate_sha: candidateSha(
+			composition,
+			memberShasOf(members.map((member) => member.commit_sha)),
+		),
 	};
 }
 
@@ -108,6 +133,11 @@ export function buildWorkGraph(state: AuthorityState): WorkGraph {
 		dependencies,
 		overlaps,
 		composition_state: composition?.status ?? null,
-		candidate_sha: composition && promotable(composition.status) ? composition.candidate_sha : null,
+		candidate_sha: composition
+			? candidateSha(
+					composition,
+					memberShasOf((composition.agents ?? []).map((agent) => (agent.sha.length > 0 ? agent.sha : null))),
+				)
+			: null,
 	};
 }
