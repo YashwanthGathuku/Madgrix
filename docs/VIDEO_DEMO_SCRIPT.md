@@ -4,9 +4,11 @@ Spoken walkthrough for Cloudflare judges. The picture is one task page, `GET /ta
 
 Say the lines in quotes. Do not improvise hashes, gate results, or a verdict. If a command fails, play the backup recording. Do not deploy during the recording.
 
+The competition runtime is Linux or WSL2, Node >= 24, and LF files. Node 22 is not that suite.
+
 ## Before you record
 
-Run these and keep the output. They are the local proof, not a Cloudflare run. On Windows, if `python3` is the Store stub, set `MADGRIX_PYTHON=python` first. `scripts/render-demo-graph.mjs` picks a working interpreter itself. Node 22 needs `NODE_OPTIONS=--experimental-strip-types`.
+Run these and keep the output. They are the local proof, not a Cloudflare run. Use Node >= 24. On Windows, if `python3` is the Store stub, set `MADGRIX_PYTHON=python` first. `scripts/render-demo-graph.mjs` picks a working interpreter itself.
 
 ```
 node --test test/demo-composition.test.ts test/work-graph-page.test.ts test/composition-authority.test.ts
@@ -28,7 +30,7 @@ Terminal font large. Browser at a width where the page is one column. No network
 - The resolver SHA is one of the three member commits. The page says **New candidate** only for RESOLVED, and only when that SHA is not a member contribution.
 - A section that says "not recorded" or "No evaluation bundle is stored" is a pass that has not happened. Do not fill it.
 - The graph verified a bundle. Offline verification says **Not run**. The check is `npm run verify` with an out-of-band trust key. A key named inside the bundle is not that check.
-- The live runner accepts `configs/demo-composition.json`. `configs/git4agents-fork-crew.yaml` lists `parent`, `sub-api`, and `sub-ui` only. `fleet validate` rejects this demo until a manifest lists `sub-test` in that roster. The HTML is local git.
+- That Agentfleet executed the sub-agents. It validates a roster only when `MADGRIX_FLEET_BIN` is set. MADGRIX itself checks `configs/git4agents-demo-composition.yaml` (`parent`, `sub-api`, `sub-ui`, `sub-test`). `configs/git4agents-fork-crew.yaml` is the three-id roster and is not the demo manifest. The HTML is local git.
 
 ## Why Artifacts is the point
 
@@ -142,7 +144,7 @@ Back to the resolved graph, top of the page, banner still visible.
 
 > "Artifacts holds each fork and the canonical repository as separate repositories. The Durable Object holds the task, the CrewContender, the overlap, and, only when the state is COMPOSED or RESOLVED, the one candidate SHA. The verdict seam is the decision boundary. The container is the only writer that moves the destination, and only to the SHA the permit names."
 
-> "What you saw in the browser is local fixture state. The live fleet manifest on this branch does not yet list the test agent, so the deployed runner would reject this crew config. The collaboration branch is what adds that manifest and the work-graph object this page is ready to render. This recording did not merge that branch, and it did not run on Cloudflare."
+> "What you saw in the browser is local fixture state. This tree's demo manifest lists parent, sub-api, sub-ui, and sub-test. MADGRIX checks that roster. Agentfleet, only if its binary is configured, cross-checks the roster. It does not run the sub-agents. The page renders the canonical work graph. It does not invent the candidate. This was not run on Cloudflare."
 
 > "Git records completed states. Git4Agents coordinates autonomous work while it is happening. MADGRIX determines which exact resulting state earns authority to become canonical."
 

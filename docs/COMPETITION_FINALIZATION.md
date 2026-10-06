@@ -234,3 +234,25 @@ Host: Windows, Node v22.17.0 with `--experimental-strip-types`, Git Bash 5.2.37.
 The paragraph that used to sit here said an omitted `unresolved_merge_artifacts` list, or `[]`, could still be permitted. That was true at `7b37f39467033089d1bcd1c59cb88e330bc1cc1c`. The follow-up in `docs/COMPETITION_RED_TEAM.md` ("Follow-up — scan completeness") makes a missing or malformed `merge_artifact_scan` ineligible. A completed scan with `paths: []` can still be a lie from the evaluation zone. The authority may permit that statement. `container/promote.sh` still refuses a tree that actually contains markers. That lie is not stopped before permit issuance.
 
 An empty republish is still a new SHA and still needs its own evaluation. TheUstad still does not score the composed tree. Nothing in this section was run on Cloudflare.
+
+## Final integration on `competition/final`
+
+The sections above are the records of the SHAs they name. This section is the integrated tree. It was not merged to `main`, not pushed, and not deployed. The command log, image build, and remaining priorities are `docs/FINAL_INTEGRATION_REPORT.md`.
+
+| Item | Value |
+|---|---|
+| Branch | `competition/final` |
+| Base | `competition/security` `9670893f36a986a59d153de4fbbf3ef10f1d9687` |
+| Cherry-picks | `49e53c3205ceccebeb4ae84df84ecd591e966bc2`, `99adfa9d89ee42536667bfb8e618e4a9af92374e`, `7bad8e787c8e7922efdacedf4d308e1da2ba6b6b`, `664beddbdf2e7d04ddf4e7c5d28b37855d93e539` |
+| Not cherry-picked | `16dbd7565966aa4160c0762a2a2eeb4e4a4e1378` (collaboration push note) |
+| Frozen specs | not edited |
+| Cloudflare | **NOT VERIFIED** |
+
+What this integration keeps:
+
+- `merge_artifact_scan` stays mandatory. A missing, malformed, unsupported, or mis-bound scan is ineligible. Non-empty paths fail `no_unresolved_merge_artifacts`. `container/promote.sh` still scans fetched blobs and can return `UNRESOLVED_CONFLICT` without moving canonical HEAD and without consuming the permit. A trusted evaluator can still submit `COMPLETE` and `paths: []` for a tree that contains markers. The authority may permit that statement. The container is the independent refusal.
+- A CrewContender exposes a candidate SHA only for `COMPOSED` and `RESOLVED`, and that SHA is not a member or contributing SHA. `PENDING`, `COMPOSING`, `CONFLICTED`, and `RESOLVING` do not. `RESOLVED` still needs a normal evaluation, verdict, and permit.
+- `GET /tasks/:id/graph?format=json` and `GET /tasks/:id/graph` use one `buildWorkGraph` object. The HTML page formats that object. It does not choose the candidate. Offline verification on the page stays `Not run` until a real result exists.
+- The demo roster is `configs/git4agents-demo-composition.yaml` (`parent`, `sub-api`, `sub-ui`, `sub-test`). MADGRIX checks it. Agentfleet is an extra roster cross-check only when `MADGRIX_FLEET_BIN` is set. It does not execute the sub-agents. The sibling contender swarm still needs `summary.agent_ids` or `MADGRIX_AGENT_IDS`.
+
+The baseline risks that said typecheck was red, that the container image was unbuilt because Docker was absent, and that P0-G was open, describe `4d979059` and the passes named above them. They are not the status of this section. P0-G is closed locally by the composition record, the scan, and the container scan. It is **NOT VERIFIED** on Cloudflare.

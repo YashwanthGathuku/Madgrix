@@ -1,29 +1,29 @@
 # Security boundaries
 
-Status words: **IMPLEMENTED**, **TESTED LOCALLY**, **TESTED ON CLOUDFLARE**, **NOT YET VERIFIED**.
+Status words: **IMPLEMENTED**, **TESTED ON FINAL SHA LOCALLY**, **TESTED ON CLOUDFLARE**, **NOT VERIFIED**.
 
-Tree: `git4agents/combined` `4a8c4cc7b521688f839f0f332605dcefa3984c38`. Local evidence is the LF archive suite on 2026-10-06: 296 tests passed, slice OK, head-move OK, benchmark `zero_tolerance_ok: true`. None of this was re-run on Cloudflare.
+The current tree is `competition/final`. It starts from `competition/security` `9670893f36a986a59d153de4fbbf3ef10f1d9687`, which already contains the merge-artifact scan and the completeness follow-up. The local command log is `docs/FINAL_INTEGRATION_REPORT.md`. Nothing in that log was run on Cloudflare. This map does not say the system is production-ready.
 
-This file also records the 2026-10-06 pass on `competition/security` parent `424b2b15425a65a25a230e949dea0f4d94192d9e`. The unresolved-merge scan is uncommitted. The attack log is `docs/COMPETITION_RED_TEAM.md`. That pass used Node v22.17.0 and Git Bash. It was not run on Cloudflare.
+The paragraphs below that name `4a8c4cc7b521688f839f0f332605dcefa3984c38` (296 tests) or an uncommitted scan are the earlier passes. They are not the final suite. The attack log for the scan pass is `docs/COMPETITION_RED_TEAM.md`. That pass used Node v22.17.0 and Git Bash. It was not run on Cloudflare.
 
 `docs/SECURITY.md` is the longer note. This file is the competition map. It does not replace the frozen threat model. The composition rule is `specs/amendments/composition-result-v1.md`. A commit that contains merge-marker bytes is also refused without a composition record: `specs/amendments/unresolved-merge-artifact-v1.md`. The frozen files were not edited.
 
-**Unresolved P0:** none. **P1 from the marker pass, closed locally on this follow-up:** a missing, malformed, or mis-bound merge-artifact scan is ineligible and is not permitted. A completed scan that lists no paths can still be permitted. That statement is the evaluation zone's. The promotion container still reads the blobs. This map does not say the system is production-ready. The follow-up is uncommitted on `7b37f39467033089d1bcd1c59cb88e330bc1cc1c`. It was not run on Cloudflare.
+**Unresolved P0 on the final tree:** none observed in the local suite recorded in `docs/FINAL_INTEGRATION_REPORT.md`. **P1:** a missing, malformed, or mis-bound merge-artifact scan is ineligible and is not permitted. A completed scan that lists no paths can still be permitted. That statement is the evaluation zone's. The promotion container still reads the blobs. The completeness follow-up is in `9670893f36a986a59d153de4fbbf3ef10f1d9687`. It was not run on Cloudflare.
 
 ## Zones
 
 | Zone | Credential | What it may do | Status |
 |---|---|---|---|
-| Coding agent | `AGENT_SERVICE_TOKEN` plus that agent's `X-Madgrix-Agent-Secret` | Claim and fork as itself. Child env is `minimalEnv` plus the names the runner sets. | **IMPLEMENTED. TESTED LOCALLY** (`test/env-isolation.test.ts`, contender-binding tests). **NOT TESTED ON CLOUDFLARE.** |
-| Evaluation | `EVALUATION_SERVICE_TOKEN` | Submit evidence. Short-lived read of one contender fork. | **IMPLEMENTED. TESTED LOCALLY.** **NOT TESTED ON CLOUDFLARE.** |
-| Control | `CONTROL_SERVICE_TOKEN` | Freeze tasks, record composition, run the verdict, start promotion. | **IMPLEMENTED. TESTED LOCALLY.** **NOT TESTED ON CLOUDFLARE.** |
-| Authority signer | `AUTHORITY_SIGNING_KEY` | Signs promotion bundles inside the TaskAuthority. Offline verify uses `keys/authority.pub` or `--trust-key`. | **IMPLEMENTED. TESTED LOCALLY** (slice verify printed `VERIFIED`; forged-bundle tests in the suite). **NOT TESTED ON CLOUDFLARE.** |
+| Coding agent | `AGENT_SERVICE_TOKEN` plus that agent's `X-Madgrix-Agent-Secret` | Claim and fork as itself. Child env is `minimalEnv` plus the names the runner sets. | **IMPLEMENTED. TESTED ON FINAL SHA LOCALLY** (`test/env-isolation.test.ts`, contender-binding tests). **NOT TESTED ON CLOUDFLARE.** |
+| Evaluation | `EVALUATION_SERVICE_TOKEN` | Submit evidence. Short-lived read of one contender fork. | **IMPLEMENTED. TESTED ON FINAL SHA LOCALLY.** **NOT TESTED ON CLOUDFLARE.** |
+| Control | `CONTROL_SERVICE_TOKEN` | Freeze tasks, record composition, run the verdict, start promotion. | **IMPLEMENTED. TESTED ON FINAL SHA LOCALLY.** **NOT TESTED ON CLOUDFLARE.** |
+| Authority signer | `AUTHORITY_SIGNING_KEY` | Signs promotion bundles inside the TaskAuthority. Offline verify uses `keys/authority.pub` or `--trust-key`. | **IMPLEMENTED. TESTED ON FINAL SHA LOCALLY** (slice verify printed `VERIFIED`; forged-bundle tests in the suite). **NOT TESTED ON CLOUDFLARE.** |
 
 A caller cannot put its zone in JSON. The Worker sets the zone after the bearer check.
 
 ## Composition
 
-**IMPLEMENTED. TESTED LOCALLY. NOT TESTED ON CLOUDFLARE.**
+**IMPLEMENTED. TESTED ON FINAL SHA LOCALLY. NOT TESTED ON CLOUDFLARE.**
 
 - A coding agent cannot `POST /tasks/:id/composition`. The route requires the control token. The demo test and the composition route test cover the agent and evaluation tokens (401).
 - `CONFLICTED` has no candidate SHA. Evidence throws. `issuePermit` and `attemptPromotion` return `UNRESOLVED_CONFLICT`, store no permit, and return no canonical-write effect.
@@ -35,7 +35,7 @@ The composition record is still required for a fork-crew `CONFLICTED` result. It
 
 ## Unresolved merge artifacts
 
-**IMPLEMENTED. TESTED LOCALLY. NOT TESTED ON CLOUDFLARE.**
+**IMPLEMENTED. TESTED ON FINAL SHA LOCALLY. NOT TESTED ON CLOUDFLARE.**
 
 A blob with a conflict-marker pair (N ≥ 7 `<` at the start of a line, and a later line of N `>`) is not an admissible candidate, whether or not anyone called `POST /tasks/:id/composition`. Three layers, and none of them replaces the others:
 

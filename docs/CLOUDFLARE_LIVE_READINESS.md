@@ -164,7 +164,9 @@ Worker → Artifacts push → `cf.artifacts.repo.pushed` → queue `madgrix-even
 
 Run it with Node 24. This machine's Node 22.17.0 does not strip TypeScript in `node` without a flag. The script holds all three service tokens. Children do not inherit that environment.
 
-Unset `MADGRIX_AGENT_IDS` selects the fork crew. That child runs `fleet validate` and requires `summary.agent_ids` in crew order. **LOCAL VERIFIED** on this machine: `fleet 0.3.0` validate of `configs/git4agents-fork-crew.yaml` returned `is_valid: true` and `summary.total_agents: 3`, and the summary had no `agent_ids` field. `assertFleetRoster` then fails closed before a push. A live fork-crew run is blocked on that report shape.
+The roster sentences in this section describe the readiness session, not `competition/final`. On the final tree, MADGRIX checks the paired manifest itself, and `fleet validate` runs only when `MADGRIX_FLEET_BIN` is set. See `docs/DEMO_RUNBOOK.md` and `docs/FINAL_INTEGRATION_REPORT.md`.
+
+Unset `MADGRIX_AGENT_IDS` selects the fork crew. In this readiness session that child ran `fleet validate` and required `summary.agent_ids` in crew order. **LOCAL VERIFIED** on this machine at that session: `fleet 0.3.0` validate of `configs/git4agents-fork-crew.yaml` returned `is_valid: true` and `summary.total_agents: 3`, and the summary had no `agent_ids` field. That older binary fails only an explicit `MADGRIX_FLEET_BIN` cross-check on the final tree. The sibling contender swarm still needs `summary.agent_ids` or `MADGRIX_AGENT_IDS`.
 
 The sibling path does not call `fleet` when `MADGRIX_AGENT_IDS` is set. That is the path that can reach a real push with the tools this session inspected. It still needs a real agent command, a real baseline, and a deployed Worker. It was not run.
 
@@ -195,7 +197,7 @@ MADGRIX_TRUST_KEY=keys/authority.pub
 
 Success is stdout containing `"status": "MADGRIX_LIVE_E2E_OK"` after `src/cli/verify.ts` prints `VERIFIED` for the bundle fetched from the Worker. A local bundle does not count.
 
-`configs/demo-composition.json` adds `sub-test`. No fleet manifest lists `parent`, `sub-api`, `sub-ui`, and `sub-test`. Combined with the missing `agent_ids` field, a live run of that JSON is **NOT VERIFIED** and will not get past the roster check.
+`configs/demo-composition.json` adds `sub-test`. At the inspected parent, no fleet manifest listed `parent`, `sub-api`, `sub-ui`, and `sub-test`. The integrated tree includes `configs/git4agents-demo-composition.yaml`. A live run of that JSON is still **NOT VERIFIED**.
 
 ## 8. Reliability audit
 
@@ -225,4 +227,4 @@ All of these are **LOCAL VERIFIED** as source behavior. None is **CLOUDFLARE VER
 5. Generate `AUTHORITY_SIGNING_KEY`, commit `keys/authority.pub`, and keep the private key in a gitignored secrets file with the three service tokens.
 6. Say which SHA may be deployed. Until then, do not run `cf deploy`.
 7. After that deploy, run `npm run live:e2e` with Node 24 and the environment in section 7. Keep the bundle and the verifier output. That is the Cloudflare evidence. A 404 from `/` is not.
-8. Decide the fork-crew fleet gap separately. `fleet 0.3.0` on this machine does not print `summary.agent_ids`. The sibling command in section 7 does not need that field. The demo JSON still has no matching manifest.
+8. The readiness session's fleet gap is historical. `fleet 0.3.0` on this machine did not print `summary.agent_ids`. On `competition/final` the demo manifest is in the tree, and the default roster check does not call fleet. The sibling contender command still needs `summary.agent_ids` or `MADGRIX_AGENT_IDS`.
