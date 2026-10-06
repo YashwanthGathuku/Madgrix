@@ -47,6 +47,7 @@
  */
 
 import { canonicalJson, sha256Hex } from "./canonical.ts";
+import { assumeCompleteMergeArtifactScan } from "./merge-artifacts.ts";
 import { checkAdmissionGates, evaluateCandidate } from "./evaluation.ts";
 import { classifyPair } from "./claims.ts";
 import { eligibility, runVerdict, type RankedCandidate } from "./verdict-seam.ts";
@@ -280,8 +281,9 @@ async function synthBundle(o: {
 		evaluated_at: fixedTs(o.taskIdx, o.candIdx),
 		tainted: false,
 	};
-	const bundle_hash = await sha256Hex(canonicalJson(rest));
-	return { ...rest, bundle_hash };
+	const scanned = assumeCompleteMergeArtifactScan(rest);
+	const bundle_hash = await sha256Hex(canonicalJson(scanned));
+	return { ...scanned, bundle_hash };
 }
 
 /**

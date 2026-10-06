@@ -8,7 +8,7 @@ This file also records the 2026-10-06 pass on `competition/security` parent `424
 
 `docs/SECURITY.md` is the longer note. This file is the competition map. It does not replace the frozen threat model. The composition rule is `specs/amendments/composition-result-v1.md`. A commit that contains merge-marker bytes is also refused without a composition record: `specs/amendments/unresolved-merge-artifact-v1.md`. The frozen files were not edited.
 
-**Unresolved P0 from that pass:** none. **P1, still open:** an evaluation bundle that omits `unresolved_merge_artifacts`, or sends `[]`, can be eligible and can be permitted. The promotion container then refuses the write. This map does not say the system is production-ready.
+**Unresolved P0:** none. **P1 from the marker pass, closed locally on this follow-up:** a missing, malformed, or mis-bound merge-artifact scan is ineligible and is not permitted. A completed scan that lists no paths can still be permitted. That statement is the evaluation zone's. The promotion container still reads the blobs. This map does not say the system is production-ready. The follow-up is uncommitted on `7b37f39467033089d1bcd1c59cb88e330bc1cc1c`. It was not run on Cloudflare.
 
 ## Zones
 
@@ -37,13 +37,17 @@ The composition record is still required for a fork-crew `CONFLICTED` result. It
 
 **IMPLEMENTED. TESTED LOCALLY. NOT TESTED ON CLOUDFLARE.**
 
-A blob with a conflict-marker pair (N ≥ 7 `<` at the start of a line, and a later line of N `>`) is not an admissible candidate, whether or not anyone called `POST /tasks/:id/composition`. The trusted evaluator records the paths. Eligibility fails `no_unresolved_merge_artifacts` when that list is non-empty. Passing tests do not compensate. `issuePermit`, `attemptPromotion`, and `runPromotion` return `UNRESOLVED_CONFLICT` with no permit and no canonical write. `container/promote.sh` scans the fetched blobs and exits 48 before any fast-forward, including before `ALREADY_WRITTEN`.
+A blob with a conflict-marker pair (N ≥ 7 `<` at the start of a line, and a later line of N `>`) is not an admissible candidate, whether or not anyone called `POST /tasks/:id/composition`. Three layers, and none of them replaces the others:
+
+1. The composition record. Unchanged.
+2. The evaluation scan. The trusted evaluator writes `merge_artifact_scan`: `status` `COMPLETE`, `scanner` `madgrix-merge-artifact/v1`, `candidate_sha` and `tree_sha256` equal to the bundle, and `paths` an array of non-empty strings. Eligibility fails `evaluation_integrity_valid` when that record is missing or not complete. Eligibility fails `no_unresolved_merge_artifacts` when it names a path. Passing tests do not compensate. `issuePermit`, `attemptPromotion`, and `runPromotion` return `UNRESOLVED_CONFLICT` with no permit and no canonical write in both of those cases.
+3. The promotion container. `container/promote.sh` still scans the fetched blobs and exits 48 before any fast-forward, including before `ALREADY_WRITTEN`. It does not trust the scan record.
 
 An unmerged index is visible only when a caller has one. Git will not commit it, so a submitted SHA is caught by the blob scan.
 
-This is not a semantic-conflict detector. A line of `=` alone is not a marker. Intentional marker quotes are refused.
+This is not a semantic-conflict detector. A line of `=` alone is not a marker. Intentional marker quotes are refused. A complete record with `paths: []` is not proof the tree is clean.
 
-**P1.** A bundle that omits `unresolved_merge_artifacts`, or sends an empty list, was not scanned by this rule. It can be eligible and it can be permitted. The container does not trust the field and does not fast-forward. Observed in `test/unresolved-merge-artifact.test.ts` (7 pass) and in the two new `test/fixtures/promotion-cases.json` rows (bash and the TypeScript model).
+**Trusted-evaluator boundary.** A caller that holds the evaluation token can submit a well-formed `COMPLETE` scan with `paths: []` for a tree that contains markers. The authority may accept that statement and may issue a permit. It does not fetch the blobs. The container then returns HTTP 409 `UNRESOLVED_CONFLICT`, does not consume the permit, and does not move canonical HEAD. Observed on WSL Node v24.21.0 in `test/unresolved-merge-artifact.test.ts` (18 pass, including that case and the container call) and in `test/promotion-fixtures.test.ts` (the marker rows, Linux bash and the TypeScript model).
 
 ## Attacks the local suite refuses
 

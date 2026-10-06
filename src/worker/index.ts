@@ -79,7 +79,7 @@ import type {
 } from "../lib/types.ts";
 import { SELECTOR_POLICY_VERSION } from "../lib/types.ts";
 import type { Effect } from "../lib/task-state.ts";
-import { hasUnresolvedMergeArtifacts } from "../lib/merge-artifacts.ts";
+import { mergeArtifactAdmissionRefuses } from "../lib/merge-artifacts.ts";
 import { AGENT_ID_PATTERN, evaluationBases, resolveAgentBySecret, taskHashFor, type RebaseReport } from "../lib/task-state.ts";
 import type { PromotionResult, RebaseResult } from "../lib/git-promotion.ts";
 import { computePermitId, TaskAuthority } from "../do/TaskAuthority.ts";
@@ -1246,7 +1246,11 @@ export async function runPromotion(env: Env, taskId: string, permit_id: string):
 	if (recomputed !== permit_id) return { status: 409, body: { error: "permit_id_invalid", permit_id } };
 
 	const storedBundle = state.evaluations[permit.winner_candidate_sha];
-	if (hasUnresolvedMergeArtifacts(storedBundle)) {
+	// A missing scan or a named artifact stops before any write token is
+	// minted. A complete scan that lists no paths does not: the container
+	// reads the blobs itself. This check does not prove the evaluator's
+	// empty list is true.
+	if (mergeArtifactAdmissionRefuses(storedBundle)) {
 		return { status: 409, body: { outcome: "UNRESOLVED_CONFLICT" satisfies PromotionOutcome, permit_id } };
 	}
 	if (!storedBundle || storedBundle.bundle_hash !== permit.evaluation_bundle_hash) {

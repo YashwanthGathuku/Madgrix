@@ -37,6 +37,7 @@ import {
 	type Ctx,
 } from "../lib/task-state.ts";
 import { canonicalJson, sha256Hex } from "../lib/canonical.ts";
+import { assumeCompleteMergeArtifactScan } from "../lib/merge-artifacts.ts";
 import { FakeArtifacts } from "../lib/fake-artifacts.ts";
 import { treeDigestOfFiles } from "../lib/tree-digest.ts";
 import { SELECTOR_POLICY_VERSION, type AuthorityState, type EvaluationBundle } from "../lib/types.ts";
@@ -105,7 +106,8 @@ async function makeBundle(input: {
 		evaluated_at: input.evaluated_at,
 		tainted: false,
 	};
-	return { ...rest, bundle_hash: await sha256Hex(canonicalJson(rest)) };
+	const scanned = assumeCompleteMergeArtifactScan(rest);
+	return { ...scanned, bundle_hash: await sha256Hex(canonicalJson(scanned)) };
 }
 
 /**

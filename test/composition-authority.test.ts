@@ -5,6 +5,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { canonicalJson, sha256Hex } from "../src/lib/canonical.ts";
+import { assumeCompleteMergeArtifactScan } from "../src/lib/merge-artifacts.ts";
 import { treeDigestOfFiles } from "../src/lib/tree-digest.ts";
 import {
 	attemptPromotion,
@@ -81,7 +82,8 @@ async function makeBundle(overrides: Partial<EvaluationBundle> = {}): Promise<Ev
 		...overrides,
 	};
 	const { bundle_hash: _ignored, ...rest } = base as EvaluationBundle & { bundle_hash?: string };
-	return { ...(rest as EvaluationBundle), bundle_hash: await sha256Hex(canonicalJson(rest)) };
+	const scanned = assumeCompleteMergeArtifactScan(rest);
+	return { ...(scanned as EvaluationBundle), bundle_hash: await sha256Hex(canonicalJson(scanned)) };
 }
 
 function observed(sha: string): AuthorityState {
@@ -263,9 +265,10 @@ describe("composition route", () => {
 			evaluated_at: "2026-10-06T12:00:00Z",
 			tainted: false,
 		};
+		const scanned = assumeCompleteMergeArtifactScan(rest);
 		const evidence = await call(h, "POST", `/tasks/${h.taskId}/evidence`, {
 			token: TOKENS.evaluation,
-			body: { bundle: { ...rest, bundle_hash: await sha256Hex(canonicalJson(rest)) } },
+			body: { bundle: { ...scanned, bundle_hash: await sha256Hex(canonicalJson(scanned)) } },
 		});
 		assert.equal(evidence.status, 422, JSON.stringify(evidence.body));
 		assert.match(evidence.body.detail, /CONFLICTED/);

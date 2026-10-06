@@ -20,6 +20,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { canonicalJson, sha256Hex } from "../src/lib/canonical.ts";
+import { assumeCompleteMergeArtifactScan } from "../src/lib/merge-artifacts.ts";
 import {
 	attemptPromotion,
 	createAuthority,
@@ -71,7 +72,8 @@ async function makeBundle(input: {
 		evaluated_at: "2026-10-01T18:00:00Z",
 		tainted: false,
 	};
-	return { ...rest, bundle_hash: await sha256Hex(canonicalJson(rest)) };
+	const scanned = assumeCompleteMergeArtifactScan(rest);
+	return { ...scanned, bundle_hash: await sha256Hex(canonicalJson(scanned)) };
 }
 
 const EVAL_CALLER = { zone: "evaluation_domain" } as const;

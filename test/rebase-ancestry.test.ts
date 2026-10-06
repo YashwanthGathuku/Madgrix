@@ -18,6 +18,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 
 import { canonicalJson, sha256Hex } from "../src/lib/canonical.ts";
+import { assumeCompleteMergeArtifactScan } from "../src/lib/merge-artifacts.ts";
 // A namespace import: a missing export is undefined in one test, not a link
 // error that hides every other test in this file.
 import * as taskState from "../src/lib/task-state.ts";
@@ -66,7 +67,8 @@ async function bundleFor(state: AuthorityState, candidate_sha: string, evaluated
 		tainted: false,
 		...extra,
 	};
-	return { ...rest, bundle_hash: await sha256Hex(canonicalJson(rest)) } as EvaluationBundle;
+	const scanned = assumeCompleteMergeArtifactScan(rest);
+	return { ...scanned, bundle_hash: await sha256Hex(canonicalJson(scanned)) } as EvaluationBundle;
 }
 
 /** A task on BASE whose contender forked at BASE and pushed X (observed). */

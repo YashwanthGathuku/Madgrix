@@ -215,6 +215,8 @@ A blob is an unresolved merge artifact when a line is N `>` characters, N ≥ 7,
 
 The trusted evaluator (`scripts/evaluate-candidate.ts`) records the paths on `unresolved_merge_artifacts`. Eligibility fails `no_unresolved_merge_artifacts` when that list is non-empty, including when tests passed and nobody called `POST /tasks/:id/composition`. `issuePermit`, `attemptPromotion`, and `runPromotion` return `UNRESOLVED_CONFLICT` with no permit and no canonical write. `container/promote.sh` scans the fetched blobs and exits 48 before any fast-forward, including before `ALREADY_WRITTEN`.
 
+The next follow-up, still uncommitted on this parent, requires `merge_artifact_scan` as well. The current rule is that section's successor in `docs/COMPETITION_RED_TEAM.md`, not the omit-field behavior described in the command table below.
+
 ### Commands on this pass
 
 Host: Windows, Node v22.17.0 with `--experimental-strip-types`, Git Bash 5.2.37. Container scripts were LF when bash ran them. `node_modules` was not installed, so `tsc` was not run.
@@ -229,6 +231,6 @@ Host: Windows, Node v22.17.0 with `--experimental-strip-types`, Git Bash 5.2.37.
 
 ### What this scan does not close
 
-**P1.** A bundle that omits `unresolved_merge_artifacts`, or sends `[]`, can still be eligible and can still receive a permit. The container then returns HTTP 409 `UNRESOLVED_CONFLICT`. The permit is not consumed and canonical HEAD does not move. That case is in `test/unresolved-merge-artifact.test.ts`. The evaluation zone can lie about this measurement the same way it can lie about any other gate.
+The paragraph that used to sit here said an omitted `unresolved_merge_artifacts` list, or `[]`, could still be permitted. That was true at `7b37f39467033089d1bcd1c59cb88e330bc1cc1c`. The follow-up in `docs/COMPETITION_RED_TEAM.md` ("Follow-up — scan completeness") makes a missing or malformed `merge_artifact_scan` ineligible. A completed scan with `paths: []` can still be a lie from the evaluation zone. The authority may permit that statement. `container/promote.sh` still refuses a tree that actually contains markers. That lie is not stopped before permit issuance.
 
 An empty republish is still a new SHA and still needs its own evaluation. TheUstad still does not score the composed tree. Nothing in this section was run on Cloudflare.

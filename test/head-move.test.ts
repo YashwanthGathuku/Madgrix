@@ -21,6 +21,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { canonicalJson, sha256Hex } from "../src/lib/canonical.ts";
+import { assumeCompleteMergeArtifactScan } from "../src/lib/merge-artifacts.ts";
 import { runHeadMoveScenario } from "../src/harness/head-move.ts";
 import {
 	attemptPromotion,
@@ -74,7 +75,8 @@ async function makeBundle(input: {
 		evaluated_at: input.evaluated_at,
 		tainted: false,
 	};
-	return { ...rest, bundle_hash: await sha256Hex(canonicalJson(rest)) };
+	const scanned = assumeCompleteMergeArtifactScan(rest);
+	return { ...scanned, bundle_hash: await sha256Hex(canonicalJson(scanned)) };
 }
 
 describe("head-move: rebase-vs-reverify end to end", () => {

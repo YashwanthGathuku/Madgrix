@@ -56,10 +56,13 @@
  *
  * Unresolved merge artifacts (specs/amendments/unresolved-merge-artifact-v1.md):
  * every blob is scanned for a git conflict-marker pair, and the clone's
- * index is read with `git ls-files --unmerged` when it has one. The paths
- * are `unresolved_merge_artifacts` on the bundle. An empty list means this
- * scan found none. It is not a semantic-conflict detector. The authority
- * refuses a non-empty list whether or not composition was recorded.
+ * index is read with `git ls-files --unmerged` when it has one. The result
+ * is `merge_artifact_scan` (status COMPLETE, this scanner, this candidate,
+ * this tree digest, and the paths). `unresolved_merge_artifacts` lists the
+ * same paths. An empty path list means this scan found none. It is not a
+ * semantic-conflict detector. The authority refuses a non-empty list
+ * whether or not composition was recorded, and it refuses a scan record
+ * that is missing, malformed, or bound to a different candidate or tree.
  *
  * White-box caveat: candidate code and test processes share this disposable
  * evaluator host. This protects evaluator credentials/authority and destroys
@@ -78,7 +81,7 @@ import path from "node:path";
 import { spawn } from "node:child_process";
 
 import { canonicalJson, sha256Hex } from "../src/lib/canonical.ts";
-import { blobHasConflictMarkers, unresolvedMergeArtifacts } from "../src/lib/merge-artifacts.ts";
+import { blobHasConflictMarkers, completeMergeArtifactScan, unresolvedMergeArtifacts } from "../src/lib/merge-artifacts.ts";
 import {
 	DEFAULT_TEST_GLOBS,
 	TOOL_STATUS_LOG_MAX_BYTES,
@@ -469,7 +472,14 @@ try {
 		evaluation_base: evaluationBase,
 		// Non-empty: the authority quarantines the contender (tamper-quarantine-v1).
 		eval_file_changes: gates.evalFileChanges,
-		// Empty means this scan found none. It is not a semantic-conflict claim.
+		// This process scanned the blobs and the index. Empty paths means that
+		// scan found none. It is not a semantic-conflict claim, and another
+		// zone that did not see the bytes must not invent this record.
+		merge_artifact_scan: completeMergeArtifactScan({
+			candidate_sha: candidateSha,
+			tree_sha256,
+			paths: unresolved_merge_artifacts,
+		}),
 		unresolved_merge_artifacts,
 	};
 	const bundle_hash = await sha256Hex(canonicalJson(withoutHash));

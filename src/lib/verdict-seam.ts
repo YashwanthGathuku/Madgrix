@@ -15,7 +15,7 @@
  */
 
 import { canonicalJson } from "./canonical.ts";
-import { hasUnresolvedMergeArtifacts } from "./merge-artifacts.ts";
+import { hasUnresolvedMergeArtifacts, mergeArtifactScanComplete } from "./merge-artifacts.ts";
 import type {
 	EvaluationBundle,
 	VerdictRecord,
@@ -46,7 +46,13 @@ const ELIGIBILITY_CHECKS: {
 }[] = [
 	{ name: "baseline_valid", evidence: (b) => b.admission.exact_baseline },
 	{ name: "scope_valid", evidence: (b) => b.admission.scope_compliance },
-	{ name: "evaluation_integrity_valid", evidence: (b) => b.admission.no_eval_tampering },
+	{
+		// no_eval_tampering, and a merge-artifact scan that is complete and
+		// bound to this candidate and this tree. A missing or malformed scan
+		// is an integrity failure. It is not treated as "no artifacts found".
+		name: "evaluation_integrity_valid",
+		evidence: (b) => b.admission.no_eval_tampering && mergeArtifactScanComplete(b),
+	},
 	{
 		name: "provenance_valid",
 		evidence: (b) => b.admission.provenance_complete && b.admission.valid_tool_states,
@@ -60,9 +66,9 @@ const ELIGIBILITY_CHECKS: {
 		evidence: (b) => b.security_policy.passed && b.static_analysis.passed,
 	},
 	{
-		// Absent or empty is not a scan. A non-empty list is the evaluator's
-		// report of marker pairs or an unmerged index, and it is ineligible
-		// whether or not POST /composition recorded the conflict.
+		// A non-empty path list is the evaluator's report of marker pairs or
+		// an unmerged index. Passing tests do not compensate. An empty list
+		// passes this gate only. Completeness is evaluation_integrity_valid.
 		name: "no_unresolved_merge_artifacts",
 		evidence: (b) => !hasUnresolvedMergeArtifacts(b),
 	},

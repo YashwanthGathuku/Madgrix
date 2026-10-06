@@ -34,7 +34,7 @@ import {
 	type Signer,
 } from "./attestation.ts";
 import { classifyPair, validateClaim, type ClaimInput } from "./claims.ts";
-import { hasUnresolvedMergeArtifacts } from "./merge-artifacts.ts";
+import { mergeArtifactAdmissionRefuses, reportedMergeArtifactPaths } from "./merge-artifacts.ts";
 import { verifyReveal } from "./verifiers.ts";
 import {
 	importEd25519PublicKey,
@@ -627,6 +627,9 @@ export async function submitEvaluation(
 		throw new Error("evaluation rejected: evaluation_config_sha256 is not a SHA-256 hex digest");
 	const evalFileChanges = bundle.eval_file_changes;
 	const mergeArtifacts = bundle.unresolved_merge_artifacts;
+	// The legacy path list, when a producer still sends it, must be paths.
+	// merge_artifact_scan is not validated here and is not filled in here.
+	// A missing or malformed scan is stored and fails evaluation_integrity_valid.
 	if (mergeArtifacts !== undefined) {
 		if (!Array.isArray(mergeArtifacts) || !mergeArtifacts.every((p) => typeof p === "string" && p !== ""))
 			throw new Error("evaluation rejected: unresolved_merge_artifacts must be a list of paths");
@@ -1219,7 +1222,7 @@ export async function issuePermit(
 	if (!ev) throw new Error(`issuePermit: no evaluation bundle for winner ${winner_sha}`);
 	const contender = Object.hasOwn(state.contenders, ev.contender_id) ? state.contenders[ev.contender_id] : undefined;
 	if (!contender) throw new Error(`issuePermit: the winner's contender ${ev.contender_id} is unknown`);
-	if (compositionBlocks(state, ev.contender_id, winner_sha) || hasUnresolvedMergeArtifacts(ev)) {
+	if (compositionBlocks(state, ev.contender_id, winner_sha) || mergeArtifactAdmissionRefuses(ev)) {
 		const refused = await appendLedger(
 			state,
 			"permit_refused",
@@ -1227,7 +1230,7 @@ export async function issuePermit(
 				outcome: "UNRESOLVED_CONFLICT",
 				winner_sha,
 				contender_id: ev.contender_id,
-				paths: ev.unresolved_merge_artifacts ?? [],
+				paths: reportedMergeArtifactPaths(ev),
 			},
 			ctx,
 		);
@@ -1327,7 +1330,7 @@ export async function attemptPromotion(
 	const recordedBundle = state.evaluations[permit.winner_candidate_sha];
 	if (
 		compositionBlocks(state, permit.contender_id, permit.winner_candidate_sha) ||
-		hasUnresolvedMergeArtifacts(recordedBundle)
+		mergeArtifactAdmissionRefuses(recordedBundle)
 	) {
 		const blocked = await appendLedger(
 			state,
@@ -1336,7 +1339,7 @@ export async function attemptPromotion(
 				permit_id,
 				error: "UNRESOLVED_CONFLICT",
 				winner_sha: permit.winner_candidate_sha,
-				paths: recordedBundle?.unresolved_merge_artifacts ?? [],
+				paths: reportedMergeArtifactPaths(recordedBundle),
 			},
 			ctx,
 		);

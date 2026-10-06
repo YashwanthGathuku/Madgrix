@@ -245,12 +245,26 @@ export interface EvaluationBundle {
 	 */
 	eval_file_changes?: string[];
 	/**
-	 * Paths of known unresolved merge artifacts in the candidate: a
-	 * conflict-marker pair in a blob, or an unmerged index path when the
-	 * evaluator had an index (specs/amendments/unresolved-merge-artifact-v1.md).
-	 * This is not a semantic-conflict scan. scripts/evaluate-candidate.ts
-	 * always sets it (empty when the scan found none). A bundle that omits
-	 * it was not scanned. A non-empty list is ineligible.
+	 * Completed merge-artifact scan of this candidate
+	 * (specs/amendments/unresolved-merge-artifact-v1.md). Eligibility
+	 * requires status COMPLETE, scanner madgrix-merge-artifact/v1,
+	 * candidate_sha and tree_sha256 equal to this bundle, and paths an
+	 * array of non-empty strings. This is the evaluation zone's statement.
+	 * It is not a blob the authority fetched. scripts/evaluate-candidate.ts
+	 * always sets it.
+	 */
+	merge_artifact_scan?: {
+		status: string;
+		scanner: string;
+		candidate_sha: string;
+		tree_sha256: string;
+		paths: string[];
+	};
+	/**
+	 * Same paths as merge_artifact_scan.paths, when a producer still sets
+	 * the earlier field. If it is present it must list the same paths in
+	 * the same order. A non-empty list is ineligible. Omitting it does not
+	 * omit the scan.
 	 */
 	unresolved_merge_artifacts?: string[];
 }

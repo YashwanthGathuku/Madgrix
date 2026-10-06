@@ -18,6 +18,7 @@ import { registerHooks } from "node:module";
 
 import { TaskAuthority } from "../../src/do/TaskAuthority.ts";
 import { canonicalJson, sha256Hex } from "../../src/lib/canonical.ts";
+import { assumeCompleteMergeArtifactScan } from "../../src/lib/merge-artifacts.ts";
 import { FakeArtifacts } from "../../src/lib/fake-artifacts.ts";
 import { treeDigestOfFiles } from "../../src/lib/tree-digest.ts";
 import { fakePromote, fakeRebase } from "../../src/harness/fake-container.ts";
@@ -268,7 +269,8 @@ export async function evidence(h: Harness, sha: string, evaluated_at: string, ex
 		tainted: false,
 		...extra,
 	};
-	const bundle = { ...rest, bundle_hash: await sha256Hex(canonicalJson(rest)) };
+	const scanned = assumeCompleteMergeArtifactScan(rest);
+	const bundle = { ...scanned, bundle_hash: await sha256Hex(canonicalJson(scanned)) };
 	const res = await call(h, "POST", `/tasks/${h.taskId}/evidence`, { token: TOKENS.evaluation, body: { bundle } });
 	assert.equal(res.status, 200, JSON.stringify(res.body));
 	return res;

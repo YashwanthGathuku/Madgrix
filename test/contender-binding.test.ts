@@ -26,6 +26,7 @@ import { registerHooks } from "node:module";
 
 import { TaskAuthority } from "../src/do/TaskAuthority.ts";
 import { canonicalJson, sha256Hex } from "../src/lib/canonical.ts";
+import { assumeCompleteMergeArtifactScan } from "../src/lib/merge-artifacts.ts";
 import { FakeArtifacts } from "../src/lib/fake-artifacts.ts";
 import { quarantineContender, type Ctx } from "../src/lib/task-state.ts";
 import { SELECTOR_POLICY_VERSION, type AuthorityState, type TaskRecord } from "../src/lib/types.ts";
@@ -428,7 +429,8 @@ describe("tamper quarantine at the evidence route", () => {
 			tainted: false,
 			eval_file_changes: evalFileChanges,
 		};
-		const bundle = { ...rest, bundle_hash: await sha256Hex(canonicalJson(rest)) };
+		const scanned = assumeCompleteMergeArtifactScan(rest);
+		const bundle = { ...scanned, bundle_hash: await sha256Hex(canonicalJson(scanned)) };
 		return call(h, "POST", `/tasks/${h.taskId}/evidence`, { token: TOKENS.evaluation, body: { bundle } });
 	}
 

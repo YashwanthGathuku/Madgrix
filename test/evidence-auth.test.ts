@@ -18,6 +18,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { canonicalJson, sha256Hex } from "../src/lib/canonical.ts";
+import { assumeCompleteMergeArtifactScan } from "../src/lib/merge-artifacts.ts";
 import { TaskAuthority } from "../src/do/TaskAuthority.ts";
 import {
 	assignCandidateLabels,
@@ -82,8 +83,9 @@ async function makeBundle(overrides: Partial<EvaluationBundle> = {}): Promise<Ev
 		...overrides,
 	};
 	const { bundle_hash: _h, ...rest } = base as EvaluationBundle & { bundle_hash?: string };
-	const bundle_hash = await sha256Hex(canonicalJson(rest));
-	return { ...(rest as EvaluationBundle), bundle_hash };
+	const scanned = assumeCompleteMergeArtifactScan(rest);
+	const bundle_hash = await sha256Hex(canonicalJson(scanned));
+	return { ...(scanned as EvaluationBundle), bundle_hash };
 }
 
 function caller(zone: TrustZone): CallerIdentity {

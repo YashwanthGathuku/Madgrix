@@ -12,13 +12,19 @@ None from this pass.
 
 The stated attack is closed on the paths below: a commit created outside `run-fork-crew`, containing a conflict-marker pair, submitted through the trusted evaluator with no `POST /tasks/:id/composition`, is not eligible, is not permitted, is not promoted, and does not move canonical HEAD.
 
-## P1, still open
+## P1 from the marker pass
 
-An evaluation bundle that omits `unresolved_merge_artifacts`, or sends `[]`, can still be eligible and can still receive a permit. The promotion container then refuses the fast-forward. The permit is not consumed and canonical HEAD does not move.
+Closed locally by the follow-up below. The paragraph in Mission 1 that says an omitted field was accepted is the result of that earlier pass, at `7b37f39467033089d1bcd1c59cb88e330bc1cc1c`. It is not the current rule.
 
-That is the evidence-trust limit of the evaluation zone. The zone can lie about this measurement the same way it can lie about any other gate. `container/promote.sh` does not trust the field. Eligibility does.
+## Follow-up — scan completeness
 
-`hasUnresolvedMergeArtifacts([])` is false (`test/unresolved-merge-artifact.test.ts`). The omit-field case was driven through verdict and promotion. An explicit `[]` was not given its own promotion run.
+Uncommitted on parent `7b37f39467033089d1bcd1c59cb88e330bc1cc1c`. Not merged. Not deployed. Not run on Cloudflare.
+
+`merge_artifact_scan` is required before eligibility. A record is complete only when `status` is `COMPLETE`, `scanner` is `madgrix-merge-artifact/v1`, `candidate_sha` and `tree_sha256` equal the bundle, and `paths` is an array of non-empty strings. A legacy `unresolved_merge_artifacts` list, when present, must be the same paths. Missing or not complete fails `evaluation_integrity_valid`. A non-empty path list fails `no_unresolved_merge_artifacts`. Either one is `REJECT`, no permit, and no `canonical_write`. A forged `ACCEPT` on those bundles gets `UNRESOLVED_CONFLICT` and a null permit. `container/promote.sh` still scans the fetched blobs.
+
+**What this does not prove.** A well-formed `COMPLETE` scan with `paths: []` can be a lie. The authority trusts that evaluation-zone statement and may issue a permit. It does not scan the repository. The promotion container then returns `UNRESOLVED_CONFLICT`, does not consume the permit, and does not move canonical HEAD. That case called the container (one call). It is the trusted-evaluator boundary, not a claim that the lie is stopped before the permit.
+
+**WSL evidence, 2026-10-06.** Linux Node v24.21.0 (`/home/gathu/node24/bin/node`, ELF), Linux git 2.43.0, LF archive of this tree plus the uncommitted overlay. One `node --test` of the unresolved-merge file, the promotion fixtures, the authority and evidence suites named in Mission 2, `test/task-state.test.ts`, `test/promotion-bundle.test.ts`, `test/demo-composition.test.ts`, `test/env-isolation.test.ts`, and `test/evaluator-isolation.test.ts`: **224 pass, 0 fail.** That includes cases A–I, both marker fixture rows, the newline-in-filename rebase row, the git argv check (`Artifacts tokens reach git through its environment, never its command line`), and the live-e2e per-child zone split. The earlier Git Bash MSYS-variable failures and the unexercised argv shim were not reproduced on this Linux run. `tsc` was not run.
 
 ## What was added
 
@@ -36,7 +42,7 @@ The trusted evaluator records the paths. Eligibility fails `no_unresolved_merge_
 
 **Actual result.** The evaluator's bundle listed `unresolved_merge_artifacts: ["src/shared.js"]`. The seam rejected with `no_unresolved_merge_artifacts`. `issuePermit` threw `no ACCEPT verdict`. A forged ACCEPT verdict then got `UNRESOLVED_CONFLICT` and a null permit. `attemptPromotion` returned no effects. The worker verdict was HTTP 200, state `REJECT`, `permit: null`, `composition` undefined, canonical HEAD still the baseline, and the promotion container was not called.
 
-A second run omitted the field on purpose. The seam accepted and issued a permit. Promotion finished HTTP 409 `UNRESOLVED_CONFLICT`. The permit stayed unconsumed. Canonical HEAD stayed the baseline. That is the P1 above.
+A second run omitted the field on purpose. The seam accepted and issued a permit. Promotion finished HTTP 409 `UNRESOLVED_CONFLICT`. The permit stayed unconsumed. Canonical HEAD stayed the baseline. That was the open P1 of this pass. The follow-up below makes an omitted scan ineligible.
 
 **Proof.** `node --experimental-strip-types --test test/unresolved-merge-artifact.test.ts` — 7 tests, 7 pass, 0 fail. The file does not import `scripts/lib/fork-crew.mjs` and does not record a composition. Real `git` confirmed an unmerged index cannot be committed, and `git ls-files --unmerged` on the committed candidate was empty.
 

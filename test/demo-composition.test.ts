@@ -15,6 +15,7 @@ import { after, describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
 
 import { canonicalJson, sha256Hex } from "../src/lib/canonical.ts";
+import { assumeCompleteMergeArtifactScan } from "../src/lib/merge-artifacts.ts";
 import { createAuthority, recordComposition, submitEvaluation, type Ctx } from "../src/lib/task-state.ts";
 import type { EvaluationBundle } from "../src/lib/types.ts";
 import { authorityComposition, loadForkCrew, resolveComposition, runCrewOnFork } from "../scripts/lib/fork-crew.mjs";
@@ -185,7 +186,8 @@ describe("demo composition fixture", () => {
 			evaluated_at: "2026-10-06T12:00:00Z",
 			tainted: false,
 		};
-		const bundle: EvaluationBundle = { ...rest, bundle_hash: await sha256Hex(canonicalJson(rest)) };
+		const scanned = assumeCompleteMergeArtifactScan(rest);
+		const bundle: EvaluationBundle = { ...scanned, bundle_hash: await sha256Hex(canonicalJson(scanned)) };
 		await assert.rejects(submitEvaluation(stored, bundle, { zone: "evaluation_domain" }, ctx), /contributing SHA/);
 	});
 });

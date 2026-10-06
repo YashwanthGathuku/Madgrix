@@ -10,8 +10,8 @@ Nothing in this SHA was deployed. `live:e2e` was not run. The public worker root
 
 ## Composition
 
-- A fork-crew `CONFLICTED` record still comes only from `POST /tasks/:id/composition` (control token). The runner does not create a marker commit. A commit someone else builds is no longer an ordinary candidate when its blobs contain a conflict-marker pair: the trusted evaluator lists the paths, eligibility fails, and `container/promote.sh` exits 48 before fast-forward. See `specs/amendments/unresolved-merge-artifact-v1.md`.
-- **P1.** An evaluation bundle that omits `unresolved_merge_artifacts`, or sends `[]`, can still be eligible and can still be permitted. The container does not trust that field and does not fast-forward. Absence of markers is not proof that the edits agree.
+- A fork-crew `CONFLICTED` record still comes only from `POST /tasks/:id/composition` (control token). The runner does not create a marker commit. A commit someone else builds is not eligible when the evaluation bundle's `merge_artifact_scan` is missing, malformed, mis-bound, or names a path. `container/promote.sh` still exits 48 before fast-forward. See `specs/amendments/unresolved-merge-artifact-v1.md`.
+- A completed scan with `paths: []` is the evaluation zone's statement, not a blob the authority read. The authority may permit that statement even when the tree contains markers. The promotion container is the check that refuses the write. Absence of markers is not proof that the edits agree.
 - The resolver does not evaluate, permit, or promote. `live-e2e` is the control-plane caller, and it was not executed.
 - An empty republish, used when the first push is not observed, is a new SHA. The composition record's candidate SHA is updated to that republish in the runner result. If a record was stored for the pre-republish SHA, the republish is a different candidate and needs its own evaluation.
 - Sub-agents share one machine and one fork. Worktrees stop them editing one directory at the same time. They are not separate microVMs. A sub-agent command can still read the parent repo's objects.

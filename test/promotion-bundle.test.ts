@@ -19,6 +19,7 @@ import { registerHooks } from "node:module";
 
 import { SELECTOR_POLICY_INPUT, TaskAuthority } from "../src/do/TaskAuthority.ts";
 import { canonicalJson, sha256Hex } from "../src/lib/canonical.ts";
+import { assumeCompleteMergeArtifactScan } from "../src/lib/merge-artifacts.ts";
 import {
 	createAuthority,
 	issuePermit,
@@ -119,7 +120,8 @@ async function seededState(ctx: Ctx) {
 		tainted: false,
 		evaluation_config_sha256: EVALUATION_CONFIG_SHA256,
 	};
-	const evaluation: EvaluationBundle = { ...rest, bundle_hash: await sha256Hex(canonicalJson(rest)) };
+	const scanned = assumeCompleteMergeArtifactScan(rest);
+	const evaluation: EvaluationBundle = { ...scanned, bundle_hash: await sha256Hex(canonicalJson(scanned)) };
 	state = (await submitEvaluation(state, evaluation, { zone: "evaluation_domain" }, ctx)).state;
 	const verdict = await runVerdictSeam(
 		state,

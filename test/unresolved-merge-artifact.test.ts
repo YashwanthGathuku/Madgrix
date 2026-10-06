@@ -21,12 +21,17 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { sha256Hex } from "../src/lib/canonical.ts";
+import { canonicalJson, sha256Hex } from "../src/lib/canonical.ts";
+import { eligibility } from "../src/lib/verdict-seam.ts";
 import { FakeArtifacts } from "../src/lib/fake-artifacts.ts";
 import { fakePromote } from "../src/harness/fake-container.ts";
 import {
+	MERGE_ARTIFACT_SCANNER_V1,
 	blobHasConflictMarkers,
+	completeMergeArtifactScan,
 	hasUnresolvedMergeArtifacts,
+	mergeArtifactScanComplete,
+	mergeArtifactScanIssue,
 	unmergedIndexPaths,
 	unresolvedMergeArtifacts,
 } from "../src/lib/merge-artifacts.ts";
@@ -42,6 +47,7 @@ import { treeDigestOfFiles } from "../src/lib/tree-digest.ts";
 import type { AuthorityState, EvaluationBundle, VerdictRecord } from "../src/lib/types.ts";
 import {
 	BASELINE_TREE,
+	FIXED_TREE,
 	TOKENS,
 	authorityState,
 	call,
@@ -86,6 +92,17 @@ describe("merge-artifact scan", () => {
 		assert.equal(hasUnresolvedMergeArtifacts(undefined), false);
 		assert.equal(hasUnresolvedMergeArtifacts({ unresolved_merge_artifacts: [] }), false);
 		assert.equal(hasUnresolvedMergeArtifacts({ unresolved_merge_artifacts: ["src/shared.js"] }), true);
+		const bound = completeMergeArtifactScan({ candidate_sha: "sha", tree_sha256: "tree", paths: [] });
+		assert.equal(hasUnresolvedMergeArtifacts({ merge_artifact_scan: bound }), false);
+		assert.equal(mergeArtifactScanComplete({ candidate_sha: "sha", tree_sha256: "tree", merge_artifact_scan: bound }), true);
+		assert.equal(
+			hasUnresolvedMergeArtifacts({
+				merge_artifact_scan: completeMergeArtifactScan({ candidate_sha: "sha", tree_sha256: "tree", paths: ["src/shared.js"] }),
+			}),
+			true,
+		);
+		assert.equal(mergeArtifactScanIssue(undefined), "missing");
+		assert.equal(mergeArtifactScanComplete({ candidate_sha: "sha", tree_sha256: "tree" }), false);
 	});
 });
 
@@ -305,6 +322,13 @@ describe("unrecorded conflict markers never become a candidate", () => {
 		assert.ok(posted, "the evaluator submitted evidence");
 		const bundle = posted as EvaluationBundle;
 		assert.deepEqual(bundle.unresolved_merge_artifacts, ["src/shared.js"]);
+		assert.deepEqual(bundle.merge_artifact_scan, {
+			status: "COMPLETE",
+			scanner: MERGE_ARTIFACT_SCANNER_V1,
+			candidate_sha: sha,
+			tree_sha256: bundle.tree_sha256,
+			paths: ["src/shared.js"],
+		});
 		assert.equal(bundle.admission.exact_baseline, true);
 		assert.equal(bundle.admission.scope_compliance, true);
 		assert.equal(bundle.admission.no_eval_tampering, true);
@@ -371,7 +395,12 @@ describe("the worker authority path", () => {
 			blobs: Object.entries(conflicted).map(([file, text]) => ({ path: file, bytes: utf8(text) })),
 		});
 		assert.deepEqual(artifacts, ["src/shared.js"]);
-		await evidence(h, sha, "2026-10-06T12:00:00.000Z", { unresolved_merge_artifacts: artifacts });
+		const tree = h.fake.readCommitObject(h.forkRepo, sha)!.tree;
+		const tree_sha256 = await treeDigestOfFiles(tree);
+		await evidence(h, sha, "2026-10-06T12:00:00.000Z", {
+			merge_artifact_scan: completeMergeArtifactScan({ candidate_sha: sha, tree_sha256, paths: artifacts }),
+			unresolved_merge_artifacts: artifacts,
+		});
 		const verdict = await call(h, "POST", `/tasks/${h.taskId}/verdict`, {
 			token: TOKENS.control,
 			body: {
@@ -390,10 +419,18 @@ describe("the worker authority path", () => {
 		assert.equal(h.containerCalls.length, 0, "promotion was not started");
 	});
 
-	it("a bundle that omits the scan can be marked eligible; the container still does not fast-forward", async () => {
+	it("I: a false COMPLETE scan with no paths is trusted by the authority; the container still does not fast-forward", async () => {
+		// The harness evidence helper does not read blobs. It states a
+		// completed scan with paths: []. That is a lie about this tree.
+		// The authority may permit it. The promotion container scans the
+		// fetched blobs and is the check that catches the lie.
 		const h = await makeHarness();
 		const sha = await push(h, conflicted, h.baseline);
 		await evidence(h, sha, "2026-10-06T12:00:00.000Z");
+		const stored = (await authorityState(h)).evaluations[sha];
+		assert.equal(stored.merge_artifact_scan?.status, "COMPLETE");
+		assert.deepEqual(stored.merge_artifact_scan?.paths, []);
+		assert.equal(stored.merge_artifact_scan?.candidate_sha, sha);
 		const verdict = await call(h, "POST", `/tasks/${h.taskId}/verdict`, {
 			token: TOKENS.control,
 			body: {
@@ -402,8 +439,8 @@ describe("the worker authority path", () => {
 			},
 		});
 		assert.equal(verdict.status, 200, JSON.stringify(verdict.body));
-		assert.equal(verdict.body.verdict.state, "ACCEPT", "omitting the scan field does not fail the seam");
-		assert.ok(verdict.body.permit, "a permit can be issued from a bundle that never scanned");
+		assert.equal(verdict.body.verdict.state, "ACCEPT", "the authority trusts the evaluation-zone statement");
+		assert.ok(verdict.body.permit, "a permit can be issued from a completed empty scan");
 		const permitId = verdict.body.permit.permit_id as string;
 		const started = await call(h, "POST", `/tasks/${h.taskId}/promote`, { token: TOKENS.control, body: { permit_id: permitId } });
 		assert.equal(started.status, 202, JSON.stringify(started.body));
@@ -412,7 +449,253 @@ describe("the worker authority path", () => {
 		assert.equal(done.body.status, "complete", JSON.stringify(done.body));
 		assert.equal(done.body.result.status, 409);
 		assert.equal(done.body.result.body.outcome, "UNRESOLVED_CONFLICT");
+		assert.equal(h.containerCalls.length, 1, "the promotion container scanned the blobs; the authority did not");
 		assert.equal((await authorityState(h)).permits[permitId].consumed, false);
+		assert.equal(await (await h.fake.get("canonical")).getHead(), h.baseline);
+	});
+});
+
+const BOUND_SHA = "b".repeat(40);
+const BOUND_TREE = "c".repeat(64);
+const BOUND_BASE = "a".repeat(40);
+
+function boundScan(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+	return {
+		status: "COMPLETE",
+		scanner: MERGE_ARTIFACT_SCANNER_V1,
+		candidate_sha: BOUND_SHA,
+		tree_sha256: BOUND_TREE,
+		paths: [] as string[],
+		...overrides,
+	};
+}
+
+/** A bundle whose hash matches its body. `scan` of "OMIT" leaves the record off. */
+async function scannedBundle(scan: unknown, legacy?: string[]): Promise<EvaluationBundle> {
+	const rest: Record<string, unknown> = {
+		candidate_sha: BOUND_SHA,
+		tree_sha256: BOUND_TREE,
+		contender_id: "contender-markers",
+		task_hash: TASK_HASH,
+		admission: {
+			exact_baseline: true,
+			scope_compliance: true,
+			valid_tool_states: true,
+			no_eval_tampering: true,
+			provenance_complete: true,
+		},
+		hidden_oracle: { passed: true, total: 1, failed: [] as string[] },
+		regressions: { passed: true, total: 1, failed: [] as string[] },
+		static_analysis: { passed: true, findings: [] as string[] },
+		semantic_checks: { passed: true, total: 1, failed: [] as string[] },
+		security_policy: { passed: true, findings: [] as string[] },
+		evaluated_at: "2026-10-06T12:00:00.000Z",
+		tainted: false,
+	};
+	if (scan !== "OMIT") rest.merge_artifact_scan = scan;
+	if (legacy !== undefined) rest.unresolved_merge_artifacts = legacy;
+	return { ...rest, bundle_hash: await sha256Hex(canonicalJson(rest)) } as EvaluationBundle;
+}
+
+async function admitted(bundle: EvaluationBundle) {
+	const c = ctx();
+	const submitted = await submitEvaluation(authorityFor(BOUND_SHA, BOUND_BASE), bundle, { zone: "evaluation_domain" }, c);
+	const seam = await runVerdictSeam(
+		submitted.state,
+		[{ contender_id: "contender-markers", candidate_sha: BOUND_SHA, blast_radius: 1, change_surface: 1 }],
+		c,
+	);
+	return { c, state: seam.state, record: seam.record };
+}
+
+async function assertNoPermit(label: string, bundle: EvaluationBundle, gate: string): Promise<void> {
+	const open = await eligibility(bundle, sha256Hex);
+	assert.equal(open.eligible, false, label);
+	assert.ok(open.failed.includes(gate), `${label}: ${open.failed.join(",")}`);
+	const got = await admitted(bundle);
+	assert.equal(got.record.state, "REJECT", label);
+	assert.match(got.record.reasons.join("\n"), new RegExp(gate), label);
+	assert.equal(got.record.winner_sha, null, label);
+	assert.deepEqual(Object.keys(got.state.permits), [], label);
+	await assert.rejects(issuePermit(got.state, BOUND_SHA, "acme/api", BOUND_BASE, got.c), /no ACCEPT verdict/);
+	const forced: VerdictRecord = {
+		state: "ACCEPT",
+		candidate_shas: [BOUND_SHA],
+		evidence_hashes: [bundle.bundle_hash],
+		reasons: [`forged ACCEPT for ${label}`],
+		policy_hash: "policyhash",
+		selector_policy_version: "seam-policy/0.1.0",
+		timestamp: "2026-10-06T12:00:00.000Z",
+		winner_sha: BOUND_SHA,
+	};
+	const refused = await issuePermit(
+		{ ...got.state, verdicts: [...got.state.verdicts, forced] },
+		BOUND_SHA,
+		"acme/api",
+		BOUND_BASE,
+		got.c,
+	);
+	assert.equal(refused.outcome, "UNRESOLVED_CONFLICT", label);
+	assert.equal(refused.permit, null, label);
+	assert.deepEqual(Object.keys(refused.state.permits), [], label);
+	const promoted = await attemptPromotion(refused.state, "cd".repeat(32), BOUND_BASE, BOUND_TREE, got.c);
+	assert.equal(promoted.outcome, "UNKNOWN_PERMIT", label);
+	assert.deepEqual(promoted.effects, [], label);
+	assert.equal(promoted.effects.some((effect) => effect.kind === "canonical_write"), false, label);
+}
+
+describe("merge-artifact scan completeness is an evaluation-integrity input", () => {
+	it("A: a COMPLETE scan with no paths stays eligible and can be permitted", async () => {
+		const bundle = await scannedBundle(boundScan());
+		const open = await eligibility(bundle, sha256Hex);
+		assert.deepEqual(open, { eligible: true, failed: [] });
+		const got = await admitted(bundle);
+		assert.equal(got.record.state, "ACCEPT");
+		const issued = await issuePermit(got.state, BOUND_SHA, "acme/api", BOUND_BASE, got.c);
+		assert.equal(issued.outcome, "ISSUED");
+		assert.ok(issued.permit);
+		const promoted = await attemptPromotion(issued.state, issued.permit!.permit_id, BOUND_BASE, BOUND_TREE, got.c);
+		assert.equal(promoted.outcome, "PROMOTED");
+		assert.equal(promoted.effects.some((effect) => effect.kind === "canonical_write"), true);
+	});
+
+	it("B: a COMPLETE scan that names a path is REJECT with no permit", async () => {
+		const bundle = await scannedBundle(boundScan({ paths: ["src/shared.js"] }), ["src/shared.js"]);
+		await assertNoPermit("paths", bundle, "no_unresolved_merge_artifacts");
+		const open = await eligibility(bundle, sha256Hex);
+		assert.equal(open.failed.includes("evaluation_integrity_valid"), false);
+	});
+
+	it("C: a bundle that omits the scan is ineligible and gets no permit", async () => {
+		const bundle = await scannedBundle("OMIT");
+		await assertNoPermit("omitted", bundle, "evaluation_integrity_valid");
+		const got = await admitted(bundle);
+		const permitId = "cd".repeat(32);
+		const promoted = await attemptPromotion(
+			{
+				...got.state,
+				permits: {
+					[permitId]: {
+						permit_id: permitId,
+						task_hash: TASK_HASH,
+						baseline_commit: BOUND_BASE,
+						winner_candidate_sha: BOUND_SHA,
+						contender_id: "contender-markers",
+						winning_tree_sha256: BOUND_TREE,
+						evaluation_bundle_hash: bundle.bundle_hash,
+						selector_policy_hash: "policyhash",
+						destination_repo: "acme/api",
+						expected_destination_head: BOUND_BASE,
+						nonce: "n",
+						issued_at: "2026-10-06T12:00:00.000Z",
+						consumed: false,
+						consumed_at: null,
+					},
+				},
+			},
+			permitId,
+			BOUND_BASE,
+			BOUND_TREE,
+			got.c,
+		);
+		assert.equal(promoted.outcome, "UNRESOLVED_CONFLICT");
+		assert.deepEqual(promoted.effects, []);
+		assert.equal(promoted.state.permits[permitId].consumed, false);
+	});
+
+	it("D: a scan whose status is not COMPLETE is ineligible and gets no permit", async () => {
+		await assertNoPermit("status", await scannedBundle(boundScan({ status: "PARTIAL" })), "evaluation_integrity_valid");
+	});
+
+	it("E: an unsupported scanner version is ineligible and gets no permit", async () => {
+		await assertNoPermit(
+			"scanner",
+			await scannedBundle(boundScan({ scanner: "madgrix-merge-artifact/v0" })),
+			"evaluation_integrity_valid",
+		);
+	});
+
+	it("F: a candidate_sha that is not the bundle candidate is ineligible and gets no permit", async () => {
+		await assertNoPermit(
+			"candidate",
+			await scannedBundle(boundScan({ candidate_sha: "d".repeat(40) })),
+			"evaluation_integrity_valid",
+		);
+	});
+
+	it("G: a tree_sha256 that is not the evaluated tree is ineligible and gets no permit", async () => {
+		await assertNoPermit(
+			"tree",
+			await scannedBundle(boundScan({ tree_sha256: "e".repeat(64) })),
+			"evaluation_integrity_valid",
+		);
+	});
+
+	it("H: paths that are not an array of non-empty strings are ineligible and get no permit", async () => {
+		await assertNoPermit("paths-string", await scannedBundle(boundScan({ paths: "src/shared.js" })), "evaluation_integrity_valid");
+		await assertNoPermit("paths-number", await scannedBundle(boundScan({ paths: [1] })), "evaluation_integrity_valid");
+		await assertNoPermit("paths-empty", await scannedBundle(boundScan({ paths: [""] })), "evaluation_integrity_valid");
+		await assertNoPermit("paths-null", await scannedBundle(null), "evaluation_integrity_valid");
+	});
+
+	it("a legacy path list that disagrees with the scan fails evaluation integrity", async () => {
+		const bundle = await scannedBundle(boundScan(), ["src/shared.js"]);
+		const open = await eligibility(bundle, sha256Hex);
+		assert.equal(open.eligible, false);
+		assert.ok(open.failed.includes("evaluation_integrity_valid"));
+		assert.equal(mergeArtifactScanIssue(bundle), "legacy");
+	});
+
+	it("A on the worker: a clean tree with a COMPLETE empty scan can promote", async () => {
+		const h = await makeHarness();
+		const sha = await push(h, FIXED_TREE, h.baseline);
+		await evidence(h, sha, "2026-10-06T12:00:00.000Z");
+		const stored = (await authorityState(h)).evaluations[sha];
+		assert.equal(stored.merge_artifact_scan?.status, "COMPLETE");
+		assert.equal(stored.merge_artifact_scan?.scanner, MERGE_ARTIFACT_SCANNER_V1);
+		assert.equal(stored.merge_artifact_scan?.candidate_sha, sha);
+		assert.deepEqual(stored.merge_artifact_scan?.paths, []);
+		const verdict = await call(h, "POST", `/tasks/${h.taskId}/verdict`, {
+			token: TOKENS.control,
+			body: {
+				candidates: [{ contender_id: h.contenderId, candidate_sha: sha, blast_radius: 1, change_surface: 1 }],
+				destination_repo: "canonical",
+			},
+		});
+		assert.equal(verdict.status, 200, JSON.stringify(verdict.body));
+		assert.equal(verdict.body.verdict.state, "ACCEPT");
+		assert.ok(verdict.body.permit);
+		const permitId = verdict.body.permit.permit_id as string;
+		const started = await call(h, "POST", `/tasks/${h.taskId}/promote`, { token: TOKENS.control, body: { permit_id: permitId } });
+		assert.equal(started.status, 202, JSON.stringify(started.body));
+		await h.workflow.drain();
+		const done = await call(h, "GET", `/tasks/${h.taskId}/promotions/${permitId}`, { token: TOKENS.control });
+		assert.equal(done.body.status, "complete", JSON.stringify(done.body));
+		assert.equal(done.body.result.status, 200, JSON.stringify(done.body.result));
+		assert.equal(done.body.result.body.outcome, "PROMOTED");
+		assert.equal((await authorityState(h)).permits[permitId].consumed, true);
+		assert.equal(await (await h.fake.get("canonical")).getHead(), sha);
+	});
+
+	it("C on the worker: omitting the scan is ineligible and does not start promotion", async () => {
+		const h = await makeHarness();
+		const sha = await push(h, FIXED_TREE, h.baseline);
+		await evidence(h, sha, "2026-10-06T12:00:00.000Z", { merge_artifact_scan: undefined });
+		const stored = (await authorityState(h)).evaluations[sha];
+		assert.equal(stored.merge_artifact_scan, undefined);
+		const verdict = await call(h, "POST", `/tasks/${h.taskId}/verdict`, {
+			token: TOKENS.control,
+			body: {
+				candidates: [{ contender_id: h.contenderId, candidate_sha: sha, blast_radius: 1, change_surface: 1 }],
+				destination_repo: "canonical",
+			},
+		});
+		assert.equal(verdict.status, 200, JSON.stringify(verdict.body));
+		assert.equal(verdict.body.verdict.state, "REJECT");
+		assert.match(verdict.body.verdict.reasons.join("\n"), /evaluation_integrity_valid/);
+		assert.equal(verdict.body.permit, null);
+		assert.deepEqual(Object.keys((await authorityState(h)).permits), []);
+		assert.equal(h.containerCalls.length, 0);
 		assert.equal(await (await h.fake.get("canonical")).getHead(), h.baseline);
 	});
 });

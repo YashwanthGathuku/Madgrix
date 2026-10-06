@@ -34,6 +34,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { canonicalJson, sha256Hex } from "../src/lib/canonical.ts";
+import { assumeCompleteMergeArtifactScan } from "../src/lib/merge-artifacts.ts";
 import { FakeArtifacts } from "../src/lib/fake-artifacts.ts";
 import * as taskState from "../src/lib/task-state.ts";
 import type { Ctx } from "../src/lib/task-state.ts";
@@ -441,7 +442,8 @@ async function acceptedEvidence(state: AuthorityState, sha: string, c: Ctx): Pro
 		evaluated_at: c.now(),
 		tainted: false,
 	};
-	const bundle = { ...rest, bundle_hash: await sha256Hex(canonicalJson(rest)) } as EvaluationBundle;
+	const scanned = assumeCompleteMergeArtifactScan(rest);
+	const bundle = { ...scanned, bundle_hash: await sha256Hex(canonicalJson(scanned)) } as EvaluationBundle;
 	state = (await taskState.submitEvaluation(state, bundle, { zone: "evaluation_domain" }, c)).state;
 	const verdict = await taskState.runVerdictSeam(
 		state,
