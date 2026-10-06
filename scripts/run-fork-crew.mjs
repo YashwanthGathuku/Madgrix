@@ -28,9 +28,9 @@ import { fileURLToPath } from "node:url";
 import { gitAuthEnv, minimalEnv } from "./lib/child-env.mjs";
 import {
 	DEFAULT_FORK_CREW_CONFIG,
-	DEFAULT_FORK_CREW_FLEET_CONFIG,
 	assertFleetRoster,
 	authorityComposition,
+	fleetConfigForCrew,
 	loadForkCrew,
 	resolveComposition,
 	runCrewOnFork,
@@ -59,8 +59,9 @@ if (claimPaths.length === 0 || claimPaths.includes("**")) {
 /** @type {ReturnType<typeof loadForkCrew>} */
 let crew;
 try {
-	crew = loadForkCrew(process.env.MADGRIX_FORK_CREW_CONFIG || DEFAULT_FORK_CREW_CONFIG);
-	assertFleetRoster(crew, process.env.MADGRIX_FLEET_CONFIG || DEFAULT_FORK_CREW_FLEET_CONFIG);
+	const crewConfig = process.env.MADGRIX_FORK_CREW_CONFIG || DEFAULT_FORK_CREW_CONFIG;
+	crew = loadForkCrew(crewConfig);
+	assertFleetRoster(crew, process.env.MADGRIX_FLEET_CONFIG || fleetConfigForCrew(crewConfig));
 } catch (err) {
 	console.error(/** @type {Error} */ (err).message);
 	process.exit(2);

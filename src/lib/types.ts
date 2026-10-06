@@ -357,23 +357,65 @@ export type PromotionOutcome =
 
 /**
  * Fork-crew composition (specs/amendments/composition-result-v1.md).
- * CONFLICTED is not a candidate. RESOLVED names a new SHA that still needs
- * its own evaluation.
+ * Only COMPOSED and RESOLVED name a promotable candidate SHA. CONFLICTED,
+ * PENDING, COMPOSING, and RESOLVING do not. RESOLVED names a new SHA that
+ * still needs its own evaluation.
  */
+export type CompositionStatus = "PENDING" | "COMPOSING" | "COMPOSED" | "CONFLICTED" | "RESOLVING" | "RESOLVED";
+
 export interface CompositionFile {
 	path: string;
 	classification: "textual-line-overlap";
 	sides: Array<{ agent_id: string; role: string; intent: string; sha: string; excerpt: string }>;
 }
 
+export interface CompositionAgent {
+	id: string;
+	role: string;
+	intent: string;
+	sha: string;
+	paths: string[];
+	claim_work_id: string | null;
+}
+
 export interface CompositionRecord {
-	status: "COMPOSED" | "CONFLICTED" | "RESOLVED";
+	status: CompositionStatus;
 	contender_id: string;
 	baseline: string;
-	agents: Array<{ id: string; role: string; intent: string; sha: string; paths: string[]; claim_work_id: string | null }>;
+	agents: CompositionAgent[];
 	contributing_shas: string[];
 	files: CompositionFile[];
-	/** Null only while CONFLICTED. */
+	/** Set only for COMPOSED and RESOLVED. Null for every other state. */
+	candidate_sha: string | null;
+}
+
+/**
+ * One contender that is a crew, not a single coding agent.
+ * Promotion still binds one exact candidate SHA. This record does not
+ * replace the permit. candidate_sha is that SHA only when the outcome is
+ * COMPOSED or RESOLVED; otherwise it is null.
+ */
+export interface CrewMember {
+	agent_id: string;
+	role: string;
+	intent: string;
+	scope: string[];
+	claim_work_id: string | null;
+	commit_sha: string | null;
+	status: string;
+}
+
+export interface CrewContender {
+	contender_id: string;
+	parent: {
+		agent_id: string;
+		authority: "parent";
+		contender_id: string;
+		fork_repo: string;
+	};
+	members: CrewMember[];
+	baseline: string;
+	outcome: CompositionStatus;
 	candidate_sha: string | null;
 }
 
@@ -442,7 +484,7 @@ export interface AuthorityState {
 	conflict_reports?: ConflictReport[];
 	/**
 	 * Fork-crew composition for this task. Absent until the control plane
-	 * records one. CONFLICTED blocks evidence and promotion for that contender.
+	 * records one. Only COMPOSED and RESOLVED name a promotable candidate.
 	 */
 	composition?: CompositionRecord;
 	/** Keyed by candidate_sha. */

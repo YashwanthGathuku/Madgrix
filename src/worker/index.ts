@@ -78,6 +78,8 @@ import type {
 	WorkClaim,
 } from "../lib/types.ts";
 import { SELECTOR_POLICY_VERSION } from "../lib/types.ts";
+import { compositionBlocks } from "../lib/task-state.ts";
+import { buildWorkGraph } from "../lib/work-graph.ts";
 import type { Effect } from "../lib/task-state.ts";
 import { mergeArtifactAdmissionRefuses } from "../lib/merge-artifacts.ts";
 import { AGENT_ID_PATTERN, evaluationBases, resolveAgentBySecret, taskHashFor, type RebaseReport } from "../lib/task-state.ts";
@@ -903,6 +905,7 @@ export async function handleTaskContext(env: Env, taskId: string, request: Reque
 	const read = await readTaskState(env, taskId);
 	if (!read.ok) return json(read.body, read.status);
 	const state = read.state;
+	const graph = buildWorkGraph(state);
 	return json({
 		task: state.task,
 		task_status: state.task_status,
@@ -917,6 +920,8 @@ export async function handleTaskContext(env: Env, taskId: string, request: Reque
 		})),
 		conflict_reports: state.conflict_reports ?? [],
 		composition: state.composition ?? null,
+		crew: graph.crew,
+		graph,
 	});
 }
 
@@ -939,6 +944,11 @@ export async function handleWorkGraph(env: Env, taskId: string, request: Request
 	const read = await readTaskState(env, taskId);
 	if (!read.ok) return json(read.body, read.status);
 	const state = read.state;
+	const graph = buildWorkGraph(state);
+	const wantsJson =
+		new URL(request.url).searchParams.get("format") === "json" ||
+		(request.headers.get("accept") ?? "").includes("application/json");
+	if (wantsJson) return json(graph);
 	const composition = state.composition;
 	const claims = state.claims
 		.map(
@@ -983,8 +993,36 @@ export async function handleWorkGraph(env: Env, taskId: string, request: Request
   h1 { font-weight: 500; letter-spacing: -0.02em; }
 </style>
 <h1>${escapeHtml(state.task.intent)}</h1>
-<p>Status ${escapeHtml(state.task_status)}. Composition ${escapeHtml(composition?.status ?? "none")}.
-Candidate <code>${escapeHtml(composition?.candidate_sha ?? "none")}</code>.</p>
+<p>Status ${escapeHtml(state.task_status)}. Composition ${escapeHtml(graph.composition_state ?? "none")}.
+Candidate <code>${escapeHtml(graph.candidate_sha ?? "none")}</code>.</p>
+<h2>Crew</h2>
+<p>${graph.crew ? `parent <code>${escapeHtml(graph.crew.parent.agent_id)}</code> authority parent, outcome ${escapeHtml(graph.crew.outcome)}` : "none"}</p>
+<h2>Members</h2>
+<ul>${
+	graph.members
+		.map(
+			(member) =>
+				`<li><code>${escapeHtml(member.agent_id)}</code> ${escapeHtml(member.status)} ` +
+				`intent ${escapeHtml(member.intent)} scope ${escapeHtml(member.scope.join(", "))} ` +
+				`commit <code>${escapeHtml(member.commit_sha ?? "none")}</code></li>`,
+		)
+		.join("") || "<li>none</li>"
+}</ul>
+<h2>Dependencies</h2>
+<ul>${
+	graph.dependencies
+		.map(
+			(edge) =>
+				`<li>${escapeHtml(edge.relation)} <code>${escapeHtml(edge.from)}</code> → <code>${escapeHtml(edge.to)}</code></li>`,
+		)
+		.join("") || "<li>none</li>"
+}</ul>
+<h2>Overlaps</h2>
+<ul>${
+	graph.overlaps
+		.map((file) => `<li>${escapeHtml(file.path)} ${escapeHtml(file.classification)} ${escapeHtml(file.agents.join(", "))}</li>`)
+		.join("") || "<li>none</li>"
+}</ul>
 <h2>Claims</h2><ul>${claims || "<li>none</li>"}</ul>
 <h2>Contenders</h2><ul>${contenders || "<li>none</li>"}</ul>
 <h2>Potential conflicts</h2><ul>${conflicts || "<li>none</li>"}</ul>
@@ -1221,15 +1259,7 @@ export async function runPromotion(env: Env, taskId: string, permit_id: string):
 	if (quarantine?.status === "QUARANTINED") {
 		return { status: 409, body: { outcome: "QUARANTINED_CANDIDATE" satisfies PromotionOutcome, permit_id } };
 	}
-	if (state.composition?.contender_id === permit.contender_id && state.composition.status === "CONFLICTED") {
-		return { status: 409, body: { outcome: "UNRESOLVED_CONFLICT" satisfies PromotionOutcome, permit_id } };
-	}
-	if (
-		state.composition?.contender_id === permit.contender_id &&
-		state.composition.candidate_sha !== null &&
-		permit.winner_candidate_sha !== state.composition.candidate_sha &&
-		state.composition.contributing_shas.includes(permit.winner_candidate_sha)
-	) {
+	if (compositionBlocks(state, permit.contender_id, permit.winner_candidate_sha)) {
 		return { status: 409, body: { outcome: "UNRESOLVED_CONFLICT" satisfies PromotionOutcome, permit_id } };
 	}
 	const contender = state.contenders[permit.contender_id];

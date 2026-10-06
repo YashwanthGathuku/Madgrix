@@ -17,6 +17,7 @@ import {
 	type Ctx,
 } from "../src/lib/task-state.ts";
 import type { AuthorityState, CompositionRecord, EvaluationBundle } from "../src/lib/types.ts";
+import { buildWorkGraph } from "../src/lib/work-graph.ts";
 import { FIXED_TREE, TOKENS, call, makeHarness, push, worker } from "./helpers/worker-harness.ts";
 
 const BASELINE = "base123";
@@ -210,6 +211,71 @@ describe("composition authority", () => {
 		assert.equal(permit.outcome, "ISSUED");
 		assert.equal(permit.permit?.winner_candidate_sha, RESOLVED);
 	});
+
+	it("only COMPOSED and RESOLVED expose a candidate, and a resolver SHA is not a contribution", async () => {
+		const ctx = makeCtx();
+		const pending = composition({ status: "PENDING", candidate_sha: null, contributing_shas: [], agents: [], files: [] });
+		let state = await recordComposition(observed(SIDE_A), pending, ctx);
+		assert.equal(state.composition?.candidate_sha, null);
+		assert.equal(buildWorkGraph(state).composition_state, "PENDING");
+		assert.equal(buildWorkGraph(state).candidate_sha, null);
+		const pendingPermit = await issuePermit(
+			await recordComposition(await accepted(ctx, SIDE_A), pending, ctx),
+			SIDE_A,
+			"acme/api",
+			BASELINE,
+			ctx,
+		);
+		assert.equal(pendingPermit.outcome, "UNRESOLVED_CONFLICT");
+
+		state = await recordComposition(state, composition({ status: "COMPOSING", candidate_sha: null, contributing_shas: [], agents: [], files: [] }), ctx);
+		assert.equal(state.composition?.status, "COMPOSING");
+		assert.equal(state.composition?.candidate_sha, null);
+		state = await recordComposition(state, composition(), ctx);
+		assert.equal(state.composition?.status, "CONFLICTED");
+		assert.equal(buildWorkGraph(state).candidate_sha, null);
+		assert.equal(buildWorkGraph(state).crew?.parent.authority, "parent");
+		assert.deepEqual(
+			buildWorkGraph(state).members.map((member) => member.agent_id),
+			["sub-api", "sub-ui"],
+		);
+		assert.equal(buildWorkGraph(state).overlaps[0]?.path, "src/shared.js");
+		assert.ok(buildWorkGraph(state).dependencies.some((edge) => edge.relation === "overlap"));
+		assert.ok(buildWorkGraph(state).dependencies.some((edge) => edge.relation === "baseline" && edge.to === BASELINE));
+
+		await assert.rejects(
+			recordComposition(state, composition({ status: "RESOLVING", candidate_sha: SIDE_A }), ctx),
+			/RESOLVING has no candidate SHA/,
+		);
+		state = await recordComposition(state, composition({ status: "RESOLVING", candidate_sha: null }), ctx);
+		assert.equal(state.composition?.candidate_sha, null);
+		assert.equal(buildWorkGraph(state).composition_state, "RESOLVING");
+		const resolvingPermit = await issuePermit(
+			await recordComposition(await accepted(ctx, SIDE_A), composition({ status: "RESOLVING", candidate_sha: null }), ctx),
+			SIDE_A,
+			"acme/api",
+			BASELINE,
+			ctx,
+		);
+		assert.equal(resolvingPermit.outcome, "UNRESOLVED_CONFLICT");
+
+		await assert.rejects(
+			recordComposition(state, composition({ status: "RESOLVED", candidate_sha: SIDE_B }), ctx),
+			/must be new/,
+		);
+		state = await recordComposition(state, composition({ status: "RESOLVED", candidate_sha: RESOLVED }), ctx);
+		const graph = buildWorkGraph(state);
+		assert.equal(graph.composition_state, "RESOLVED");
+		assert.equal(graph.candidate_sha, RESOLVED);
+		assert.equal(graph.crew?.candidate_sha, RESOLVED);
+		assert.equal(graph.crew?.outcome, "RESOLVED");
+		assert.equal(state.composition?.contributing_shas.includes(graph.candidate_sha ?? ""), false);
+		await assert.rejects(
+			recordComposition(state, composition({ status: "COMPOSED", candidate_sha: "other-sha" }), ctx),
+			/already bound/,
+		);
+		await assert.rejects(recordComposition(observed(SIDE_A), composition({ status: "COMPOSED", candidate_sha: null }), ctx), /require a candidate SHA/);
+	});
 });
 
 describe("composition route", () => {
@@ -289,11 +355,56 @@ describe("composition route", () => {
 		assert.match(html, /CONFLICTED/);
 		assert.match(html, /&lt;script&gt;alert\(1\)&lt;\/script&gt;/);
 		assert.doesNotMatch(html, /<script>alert/);
+		assert.match(html, /sub-api/);
+		assert.match(html, /src\/shared\.js/);
+
+		const data = await worker.fetch(new Request(`https://madgrix.test/tasks/${h.taskId}/graph?format=json`, {
+			headers: { authorization: `Bearer ${TOKENS.control}` },
+		}), h.env as never);
+		const graph = await data.json() as {
+			composition_state: string;
+			candidate_sha: string | null;
+			crew: { parent: { authority: string }; outcome: string; candidate_sha: string | null; members: Array<{ agent_id: string; intent: string; scope: string[]; commit_sha: string }> };
+			overlaps: Array<{ path: string; agents: string[] }>;
+			dependencies: Array<{ relation: string }>;
+		};
+		assert.equal(data.status, 200);
+		assert.match(data.headers.get("content-type") ?? "", /application\/json/);
+		assert.equal(graph.composition_state, "CONFLICTED");
+		assert.equal(graph.candidate_sha, null);
+		assert.equal(graph.crew.candidate_sha, null);
+		assert.equal(graph.crew.parent.authority, "parent");
+		assert.equal(graph.crew.outcome, "CONFLICTED");
+		assert.deepEqual(graph.crew.members.map((member) => member.agent_id), ["sub-api", "sub-ui"]);
+		assert.equal(graph.crew.members[0].intent, "change the handler");
+		assert.deepEqual(graph.crew.members[0].scope, ["src/api.js"]);
+		assert.equal(graph.crew.members[0].commit_sha, SIDE_A);
+		assert.equal(graph.overlaps[0].path, "src/shared.js");
+		assert.ok(graph.dependencies.some((edge) => edge.relation === "overlap"));
+		assert.equal(JSON.stringify(graph).includes(SIDE_A) && graph.candidate_sha === null, true);
 
 		const ordinary = await call(h, "POST", `/tasks/${h.taskId}/composition`, {
 			token: TOKENS.control,
 			body: { composition: composition({ contender_id: h.contenderId, baseline: h.baseline, status: "COMPOSED", candidate_sha: RESOLVED }) },
 		});
 		assert.equal(ordinary.status, 422, JSON.stringify(ordinary.body));
+
+		const resolving = await call(h, "POST", `/tasks/${h.taskId}/composition`, {
+			token: TOKENS.control,
+			body: { composition: composition({ contender_id: h.contenderId, baseline: h.baseline, status: "RESOLVING", candidate_sha: null }) },
+		});
+		assert.equal(resolving.status, 200, JSON.stringify(resolving.body));
+		const resolved = await call(h, "POST", `/tasks/${h.taskId}/composition`, {
+			token: TOKENS.control,
+			body: { composition: composition({ contender_id: h.contenderId, baseline: h.baseline, status: "RESOLVED", candidate_sha: RESOLVED }) },
+		});
+		assert.equal(resolved.status, 200, JSON.stringify(resolved.body));
+		const after = await call(h, "GET", `/tasks/${h.taskId}/graph?format=json`, { token: TOKENS.agent });
+		assert.equal(after.status, 200, JSON.stringify(after.body));
+		assert.equal(after.body.composition_state, "RESOLVED");
+		assert.equal(after.body.candidate_sha, RESOLVED);
+		assert.equal(after.body.crew.candidate_sha, RESOLVED);
+		assert.equal(after.body.contributing_shas, undefined);
+		assert.equal((after.body.crew.members as Array<{ commit_sha: string }>).some((member) => member.commit_sha === RESOLVED), false);
 	});
 });
