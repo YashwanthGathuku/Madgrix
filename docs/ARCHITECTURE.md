@@ -20,7 +20,7 @@ flowchart TB
     SEAM --> PERMIT["5. Promotion service — exact-state single-use permit<br/>binds task · baseline · winning tree · evaluation bundle · policy · destination head"]
     PERMIT --> PROMOTE["Trusted promotion Container — sole canonical writer<br/>recompute tree-digest/v1 · exact candidate SHA<br/>replay reconciled · destination HEAD moved → permit EXPIRED"]
     PROMOTE --> ATTEST["Attestation chain — in-toto statements, DSSE envelope<br/>→ promotion.bundle"]
-    ATTEST --> OFFLINE(["Offline verify — 8-line transcript → VERIFIED<br/>no network · no trusted server"])
+    ATTEST --> OFFLINE(["Offline verify — 10-line transcript → VERIFIED<br/>no network · pinned authority key"])
 ```
 
 ## The five trust zones
@@ -72,20 +72,28 @@ component that can write canonical state, and it lives inside the control plane.
 8. **Permit.** On ACCEPT, the authority issues a single-use permit binding the exact
    task, baseline, winning tree SHA, evaluation bundle, policy version, and the
    expected destination head.
-9. **Promote.** The promotion service — the sole canonical writer — validates the
-   permit, mints short-lived Git capabilities, and invokes the trusted promotion
-   Container. The Container fetches the exact candidate SHA, recomputes
-   `tree-digest/v1`, verifies the destination parent, and fast-forwards canonical
-   `main` to that candidate commit itself. Authority consumes the permit only after
-   the write is known to exist. A lost-response retry reconciles
-   `ALREADY_WRITTEN`; a moved destination HEAD expires the permit.
+9. **Promote.** `POST /tasks/:id/promote` starts the permit's `PromotionWorkflow`
+   instance (instance id = permit id); its step is the promotion service — the sole
+   canonical writer — which verifies the permit, fast-forwards the canonical branch
+   to the reviewed commit itself (`container/promote.sh`), records the ship, and
+   consumes the permit atomically. The step retries a 5xx or an exception; a 409
+   refusal is final (`specs/amendments/promotion-runtime-v1.md`).
+   A replayed permit returns `ALREADY_CONSUMED` (no-op ACK). If the destination HEAD
+   moved after the verdict, the permit is EXPIRED, and the same commit gets no
+   permit at the new head (`REBASE_REQUIRED`): the rebase service replays it onto
+   the new head as a new commit (`container/rebase.sh`), which is evaluated again
+   before it can be promoted (`specs/amendments/rebase-ancestry-v1.md`).
 10. **Attest.** Each step emits an in-toto statement (link, test result, verification
     result, plus the custom `AgentPromotionAuthority/v1` predicate), chained and
-    signed in DSSE envelopes into `promotion.bundle`.
-11. **Verify offline.** Anyone can check the bundle with `npm run verify -- <bundle>`:
-    eight transcript lines (`subject digest`, `candidate digest`, `chain integrity`,
-    `hidden evaluation`, `policy digest`, `destination parent`, `signature`,
-    `promotion authority`) and `VERIFIED` — no network, no trusted server.
+    signed in DSSE envelopes into `promotion.bundle`. The TaskAuthority signs them
+    at promotion with `AUTHORITY_SIGNING_KEY`, together with the head of its
+    hash-chained ledger (`specs/amendments/authority-signing-v1.md`).
+11. **Verify offline.** Anyone holding the pinned authority public key can check the
+    bundle with `npm run verify -- --trust-key <key> <bundle>` (default key:
+    `keys/authority.pub`): ten transcript lines (`subject digest`, `candidate digest`,
+    `chain integrity`, `hidden evaluation`, `policy digest`, `destination base`,
+    `authority key`, `signature`, `permit id`, `ledger chain`) and `VERIFIED` — no
+    network; the key embedded in the bundle is never trusted.
 
 ## The honest sandbox constraint
 
@@ -117,9 +125,9 @@ what white-box protects is evaluation *authority and persistence*).
 | Platform interface | `src/lib/artifacts-port.ts` | What production Artifacts must provide |
 | In-memory substrate | `src/lib/fake-artifacts.ts` | NOT production — repos, tokens, queue events in memory |
 | TaskAuthority DO | `src/do/TaskAuthority.ts` | Durable Object wrapper around the state machine |
-| Worker router | `src/worker/index.ts` | HTTP routes for tasks, claims, contenders, evidence, verdict, promote, ledger |
+| Worker router | `src/worker/index.ts` | HTTP routes for tasks, claims, contenders, evidence, verdict, promote, promotion status, ledger; the `PromotionWorkflow` |
 | Vertical slice | `src/harness/slice.ts` | The 12-stage end-to-end proof |
-| Offline verifier | `src/cli/verify.ts` | Verify-only Ed25519 signer; prints the 8-line transcript |
+| Offline verifier | `src/cli/verify.ts` | Verify-only Ed25519 signer over the pinned authority key; prints the 10-line transcript |
 | Benchmark harness | `src/lib/benchmark.ts` | Synthetic / harness-validation only — not evidence |
 
 The deterministic local slice uses `FakeArtifacts` for repeatability. The

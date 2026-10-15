@@ -63,6 +63,10 @@ Five zones (see `ARCHITECTURE.md` for the full table):
 | Judge / verifiers | **NO Git access** | — | They read evidence, not repos |
 | Promotion service | WRITE canonical repo | Per-promotion, single use | Held only inside the control plane; never leaves it |
 
+- **Agents are enrolled.** `POST /tasks` names the agent ids and returns one secret
+  per agent, once, to the control plane. Every `/claim` and `/contenders` call
+  presents the agent's own secret, so no holder of the shared agent token can take
+  an agent id first (`specs/amendments/agent-enrollment-v1.md`).
 - All tokens are minted by the control plane via the Artifacts binding
   (`repo.createToken(scope, ttl)`); plaintext is delivered once, never logged, never
   persisted.
@@ -71,6 +75,167 @@ Five zones (see `ARCHITECTURE.md` for the full table):
 - Sandbox outbound destinations are restricted to an allowlist (package registries,
   the Artifacts remote). The exact allowlist mechanism in the Sandbox API is still an
   OPEN question in the spec.
+
+## Process environment boundaries
+
+The live-run scripts run on an operator host whose shell typically holds all three
+MADGRIX service tokens at once, often alongside Cloudflare and other credentials. No
+child process inherits that environment. Every spawn in `scripts/live-e2e.ts`,
+`scripts/run-contenders.mjs` and `scripts/evaluate-candidate.ts` goes through
+`minimalEnv(extra)` (`scripts/lib/child-env.mjs`): `PATH`, `HOME`, `LANG`, `TMPDIR` and
+`TERM` copied from the parent when set, plus exactly the extras the spawning code names.
+The amendment recording this is `specs/amendments/process-env-boundaries.md`.
+
+| Process | Started by | Service token it receives | Other variables beyond `minimalEnv()` |
+|---|---|---|---|
+| `live-e2e.ts` | operator | all three (it orchestrates every zone) | operator's environment |
+| `run-contenders.mjs` | `live-e2e.ts` | AGENT only | runner settings, allowlisted variables, `MADGRIX_AGENT_SECRETS` (each agent's enrollment secret) |
+| coding-agent command | `run-contenders.mjs` | **none** | `MADGRIX_AGENT_ID`, `MADGRIX_CONTENDER_ID`, `MADGRIX_TASK_ID`, `MADGRIX_BASELINE_SHA`, `MADGRIX_WORKSPACE`, allowlisted variables |
+| `evaluate-candidate.ts` | `live-e2e.ts` | EVALUATION only | evaluation settings and commands |
+| hidden, regression, semantic, static, security commands | `evaluate-candidate.ts` | **none** | none |
+| `git` clone / push | runner or evaluator | none | `GIT_CONFIG_COUNT`, `GIT_CONFIG_KEY_0`, `GIT_CONFIG_VALUE_0`: the Artifacts token as `http.extraHeader` |
+| other `git` commands | runner or evaluator | none | none |
+| `src/cli/verify.ts` | `live-e2e.ts` | none | none |
+
+- **No login shell.** The agent command and the five evaluation commands run under
+  `bash -c`, not `bash -lc`. A login shell re-reads `/etc/profile` and `~/.profile`,
+  which would re-export whatever the operator's profile exports (for example
+  `CLOUDFLARE_API_TOKEN`) even into a scrubbed environment. `PATH` now comes from the
+  parent, so start the run from a shell where the agent CLI is already on `PATH`.
+- **The agent's own model key.** `MADGRIX_AGENT_ENV_ALLOWLIST` is a comma-separated
+  list of variable names the operator passes through to the agent command, for
+  example `MADGRIX_AGENT_ENV_ALLOWLIST=ANTHROPIC_API_KEY`. Both `live-e2e.ts` and
+  `run-contenders.mjs` exit 2 before any Worker call if an entry is not a variable
+  name, or names a `MADGRIX_*`, `*SERVICE_TOKEN*`, `*CLOUDFLARE*` or `CF_*` variable.
+  The guard is by name only: what a differently named variable holds is the operator's
+  responsibility. Allowlisted variables never reach the evaluator or its commands.
+- **Git settings from the environment are gone.** Proxy (`HTTPS_PROXY`), CA bundle
+  (`GIT_SSL_CAINFO`, `SSL_CERT_FILE`) and agent-socket (`SSH_AUTH_SOCK`) variables no
+  longer reach `git`. `HOME` is passed, so put proxy and CA settings in `~/.gitconfig`
+  (`http.proxy`, `http.sslCAInfo`). Because `SSH_AUTH_SOCK` is not passed, a global
+  `commit.gpgsign` that signs through an SSH agent cannot reach that agent when the
+  runner makes the contender commit.
+- **Artifacts tokens stay off git's command line.** The runner's clone and push and
+  the evaluator's clone receive the token as `http.extraHeader` in their environment
+  (`GIT_CONFIG_*`), never as `-c` on the command line. Another local user can read a
+  process's command line, but not its environment. A process running as the same
+  user still can (below).
+
+`test/env-isolation.test.ts` runs the three scripts against a local HTTP mock of the
+Worker and local bare Git repos (no network). The operator environment it supplies
+holds all three tokens, Cloudflare/GitHub/signing variables, and a login profile that
+exports one more secret. It asserts that the `env` dumps of the agent command and of
+all five evaluation commands contain no variable matching
+`/SERVICE_TOKEN|CLOUDFLARE|API_TOKEN|SECRET/`, no injected credential value under any
+name, and nothing beyond `minimalEnv()` plus their explicit extras. It also asserts
+that, in a full `live-e2e.ts` run, the contender runner received only the AGENT token,
+each evaluator only the EVALUATION token, and the offline verifier none (observed
+through a `node` shim on `PATH`), and that the agent never saw an evaluation command.
+Finally, it asserts that an allowlist naming a zone or Cloudflare credential is refused,
+and, through a `git` shim, that no git command line carries an Artifacts token while
+every clone and push still receives one in its environment.
+Before this change the same test failed. In a `live-e2e.ts` run, the agent command
+received all three service tokens, the Cloudflare/GitHub/signing variables, and
+`MADGRIX_HIDDEN_TEST_COMMAND` along with the other four evaluation commands. The
+evaluation commands received the CONTROL and AGENT tokens.
+
+What this boundary does **not** do:
+
+- **It is not an OS boundary.** The agent and evaluation commands run as the
+  operator's OS user with the operator's `HOME`. Files there (shell profiles, CLI
+  credential stores) stay readable, and a process running as the same user can
+  generally read another's `/proc/<pid>/environ`, including that of `live-e2e.ts`,
+  which holds all three tokens. Against an adversarial agent, the boundary is the
+  separate sandbox per contender required by spec 3 §2–§3, or at least a separate OS
+  user or container on the operator host.
+
+## Evidence integrity and the evaluation run directory
+
+The amendments are `specs/amendments/evidence-integrity-v1.md`,
+`tool-status-v1.md`, `tamper-quarantine-v1.md` and
+`evaluation-config-digest-v1.md` (all in `specs/amendments/`).
+
+- **Evidence names the observed commit.** The task authority records an evaluation
+  bundle only when its `candidate_sha` is the contender's `latest_commit`, the newest
+  push it observed (422 otherwise). Once a candidate label is bound to a SHA, a
+  different bundle for that SHA is refused with 409, the stored bundle stands, and the
+  ledger records `evidence_replacement_rejected`.
+- **The commands run the baseline's configuration.** `evaluate-candidate.ts` runs
+  every evaluation command in a fresh directory outside the candidate checkout. That
+  directory holds the baseline's runner configuration (`package.json`, lockfiles,
+  `conftest.py`, jest/vitest/mocha configs, `pytest.ini`, `pyproject.toml`,
+  `tox.ini`, `setup.cfg`, `Makefile`, …) and test material (test globs including
+  `__mocks__/`), the candidate's other files, and the hidden tests from
+  `MADGRIX_HIDDEN_TESTS_DIR`. A candidate change to runner configuration, to a path a
+  test glob matches, or to a path outside its claim fails `no_eval_tampering`.
+- **A changed evaluation file quarantines.** The evaluator lists the changed runner
+  configuration and test files in the bundle (`eval_file_changes`). Recording a
+  bundle with any quarantines the contender (trigger `eval_file_modification`): every
+  fork token is revoked and its evaluations are tainted. A path outside the claim
+  scope fails the gate without quarantine (spec 3 §6 attack 5).
+- **The bundle commits to its configuration.** Before fetching a candidate, the
+  evaluator hashes its commands, test globs, hidden tests, version and runtime into
+  `evaluation_config_sha256`. The authority signs that digest as the test result's
+  configuration digest.
+- **Claims are bounded.** A claim scope of `"**"` is refused at `/claim` and by the
+  contender runner, and fails `scope_compliance` at evaluation.
+- **Tool receipts come from the agent.** `valid_tool_states` and `provenance_complete`
+  are read from the agent's `.madgrix/tool-status.jsonl`, bound to the task,
+  contender, agent and baseline. The model id comes from that log, never from the
+  evaluator's environment. For Claude Code, `scripts/adapters/claude-code-tool-log.mjs`
+  writes the log from `claude -p ... --output-format stream-json --verbose`.
+
+`test/evaluator-isolation.test.ts` runs the evaluator against a mock Worker and bare
+Git repositories. A candidate whose only change sets `package.json` `"test"` to
+`"exit 0"` fails `no_eval_tampering`, and the hidden suite still runs the baseline's
+test script against the candidate's code (and fails). Before this change both
+assertions failed: the evaluator ran the candidate's `"exit 0"`.
+
+What this does **not** do: the run directory is not a sandbox. Candidate code runs
+next to the baseline and hidden tests and can read or rewrite them while the suite
+runs (white-box caveat below). The tool log is the agent's own statement. The
+evaluator checks its form and binding, not that the listed actions happened.
+
+## A moved destination: rebase, never re-permit
+
+The amendment is `specs/amendments/rebase-ancestry-v1.md`.
+
+- **Promotion is a fast-forward.** `container/promote.sh` moves the canonical branch
+  to the reviewed commit itself, and only if the permit-bound head is that commit's
+  ancestor (exit 47 otherwise). Nothing is rebuilt, so the shipped SHA is the
+  reviewed SHA.
+- **A permit binds only a head the candidate descends from.** The task authority
+  issues a permit only at the contender's fork base (the task baseline) or at a head
+  a recorded rebase put under that exact SHA. Any other head is `REBASE_REQUIRED`:
+  no permit, and the refusal is ledgered. Re-evaluating the same SHA does not change
+  this, so the same commit cannot be re-promoted after the destination moved.
+- **A rebase makes a new candidate.** `POST /tasks/:id/rebase` (control plane) runs
+  `container/rebase.sh`. It replays the contender's latest commit onto the current
+  destination head and pushes the result to the contender's fork with a five-minute
+  fork-scoped write token, as a compare-and-swap on the candidate SHA. The
+  destination gets only a read token. The authority records the new SHA as the
+  contender's candidate; it has no evidence until the evaluation domain evaluates
+  it, against the head it now sits on (`evaluation_base`), so the head's own changes
+  are not counted as the contender's.
+- **The candidate cannot choose how conflicts merge.** `rebase.sh` reads git
+  attributes from the empty tree, so a candidate's own `.gitattributes`
+  (`merge=union`, say) cannot turn a conflict into a silent merge. A conflict
+  escalates the task to the operator-of-record; the conflicting paths, which the
+  contender chose, are kept as structured data, never in the escalation's text.
+- **Terminal refusals stay terminal.** Every refusal of `promote.sh` and
+  `rebase.sh` (head moved, tree or baseline mismatch, refused push, unsupported tree
+  entry, conflict) is a 409 that the PromotionWorkflow does not retry; only git
+  failures (502) and a container that is not running or overran its 60 s (503) are
+  retried. The permit stays unconsumed.
+
+`test/promotion-fixtures.test.ts` runs both scripts against real git repositories on
+a shared fixture table (`test/fixtures/promotion-cases.json`) and checks that the
+TypeScript model the harnesses use agrees on every case.
+
+What this does **not** do: the authority has no git. It trusts the evaluation
+domain's `exact_baseline` gate for the fork base and the promotion container's report
+for a rebase; `promote.sh` re-checks real ancestry before any write. The scripts have
+run only against local repositories, never against Cloudflare Artifacts.
 
 ## The honest sandbox constraint
 
@@ -87,10 +252,13 @@ policy, or anything outside its destroyed sandbox).
 
 - **Quarantine is a sanction track, not a verdict state.** It is entered *only* from a
   mechanically verified violation — agent accusation is explicitly **not** a trigger.
-- On entering quarantine: the contender's write token is revoked, pending Workflow
-  steps are canceled, the candidate is removed from selection, the evidence bundle is
-  frozen (content-addressed, immutable), the fork stays read-only for forensics, and
-  downstream artifacts are marked tainted.
+- On entering quarantine: the contender's write token is revoked, the
+  `PromotionWorkflow` instances of its unconsumed permits are terminated, the
+  candidate is removed from selection, the evidence bundle is frozen
+  (content-addressed, immutable), the fork stays read-only for forensics, and
+  downstream artifacts are marked tainted. A push already running in the promotion
+  container is not undone; finalize refuses it, so no bundle is signed
+  (`specs/amendments/promotion-runtime-v1.md`).
 - Review is conducted by the **operator-of-record**. `RELEASED` requires a
   determination of mechanical false positive plus passing re-verification; otherwise
   `REVOKED`. Salvage is a new SHA with full re-evaluation — quarantined state can

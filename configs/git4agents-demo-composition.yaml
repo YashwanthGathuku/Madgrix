@@ -1,0 +1,45 @@
+# Competition demo crew. Git4agents does not vendor Agentfleet.
+# `fleet validate --config` this file. summary.agent_ids is parent, sub-api,
+# sub-ui, sub-test, in that order. Roles and path globs live in
+# configs/demo-composition.json. Sub-agents commit on the parent fork.
+version: "1.0"
+name: git4agents-demo-composition
+endpoints:
+  local:
+    provider: mock
+    base_url: http://127.0.0.1:9/v1
+    model_name: mock
+agents:
+  - id: parent
+    role: parent
+    model_ref: local
+    system_prompt: Fork the baseline once. Do not edit the sub-agents' files. Sub-agents work on this fork.
+  - id: sub-api
+    role: api
+    model_ref: local
+    system_prompt: Own src/api and the API side of src/contract.js. Do not edit src/ui or test/integration.
+  - id: sub-ui
+    role: ui
+    model_ref: local
+    system_prompt: Own src/ui and the UI side of src/contract.js. Do not edit src/api or test/integration.
+  - id: sub-test
+    role: test
+    model_ref: local
+    system_prompt: Own test/integration only. Do not receive evaluator authority.
+tasks:
+  - id: work-parent
+    assigned_agent: parent
+    instruction: Fork the baseline and host the API, UI, and integration agents. Do not edit their files.
+    expected_output: out/parent.md
+  - id: work-sub-api
+    assigned_agent: sub-api
+    instruction: Add the API handler and name the contract api.
+    expected_output: src/api/handler.js
+  - id: work-sub-ui
+    assigned_agent: sub-ui
+    instruction: Add the UI view and name the contract ui.
+    expected_output: src/ui/view.js
+  - id: work-sub-test
+    assigned_agent: sub-test
+    instruction: Add the integration check under test/integration only.
+    expected_output: test/integration/check.js

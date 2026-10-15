@@ -1,0 +1,30 @@
+{
+  "parent": {
+    "id": "parent",
+    "role": "parent",
+    "intent": "Host the API, UI, and integration agents on one fork."
+  },
+  "subs": [
+    {
+      "id": "sub-api",
+      "role": "api",
+      "intent": "Change the API handler and name the contract api.",
+      "paths": ["src/api/**", "src/contract.js"],
+      "command": "mkdir -p src/api && printf '%s\\n' 'export function handler() { return \"api\"; }' > src/api/handler.js && printf '%s\\n' 'export const label = \"api\";' > src/contract.js"
+    },
+    {
+      "id": "sub-ui",
+      "role": "ui",
+      "intent": "Change the UI view and name the contract ui.",
+      "paths": ["src/ui/**", "src/contract.js"],
+      "command": "mkdir -p src/ui && printf '%s\\n' 'export function view() { return \"ui\"; }' > src/ui/view.js && printf '%s\\n' 'export const label = \"ui\";' > src/contract.js"
+    },
+    {
+      "id": "sub-test",
+      "role": "test",
+      "intent": "Add an integration check. Do not receive evaluator authority.",
+      "paths": ["test/integration/**"],
+      "command": "mkdir -p test/integration && printf '%s\\n' 'export function check(label) { return label === \"api+ui\"; }' > test/integration/check.js"
+    }
+  ]
+}

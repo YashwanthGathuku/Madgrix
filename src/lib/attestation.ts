@@ -14,23 +14,19 @@
  * digests MUST chain; a verifier recomputes the chain and any break
  * fails verification.
  *
- * Bit-for-bit promotion assumption (documented, NOT a spec change): the
- * "candidate digest" check in verifyBundle assumes promotion writes the
- * reviewed commit to the canonical repo bit-for-bit — same tree, same
- * message, same parents — so the shipped commit SHA is identical to the
- * reviewed candidate SHA. This holds by construction of the promotion
- * path: attemptPromotion (task-state.ts) emits a canonical_write effect
- * carrying only the reviewed tree_sha256 and the expected parent; the
- * promotion service (the ONLY canonical writer, spec 3 §2) creates no
- * merge commit and performs no re-encoding — it stores
- * SHA256(canonical_json({parents, tree, message})) with the candidate's
- * own tree/message and the reviewed parent (fake-artifacts.ts
- * storeCommit; the slice's harness asserts promotedSha === winner_sha).
- * If a future promotion path ever re-encodes or re-parents the candidate
- * tree, verifyBundle's candidate-digest check will fail closed rather
- * than silently bless a different artifact — that is the correct behavior
- * here, because "reviewed at SHA X ships at SHA X" is the binding the
- * attestation makes.
+ * Bit-for-bit promotion (documented, NOT a spec change): the "candidate
+ * digest" check in verifyBundle relies on promotion shipping the reviewed
+ * commit itself. It does by construction: container/promote.sh, the only
+ * canonical writer (spec 3 §2), fast-forwards the destination's main to
+ * the reviewed candidate SHA after checking that the permit-bound head is
+ * its ancestor. It creates no commit, so nothing is re-encoded or
+ * re-parented, and the shipped SHA IS the reviewed SHA. A candidate that
+ * does not descend from the destination head is rebased first
+ * (container/rebase.sh), which makes a NEW SHA that is evaluated again
+ * before any permit names it (specs/amendments/rebase-ancestry-v1.md).
+ * If a promotion path ever shipped a different commit, the candidate-digest
+ * check fails closed, because "reviewed at SHA X ships at SHA X" is the
+ * binding the attestation makes.
  *
  * The predicateType URIs for the reused in-toto predicates are
  * slice-level constants; spec 4 §8 leaves the exact reuse-vs-subtype
@@ -38,7 +34,10 @@
  * spec 4 §4 (revisit when the public product name is chosen).
  */
 
-import { canonicalJson } from "./canonical.ts";
+import { canonicalJson, sha256Hex } from "./canonical.ts";
+import { verifyLedgerChain } from "./ledger.ts";
+import { buildPermitId } from "./permit.ts";
+import type { LedgerEntry } from "./types.ts";
 
 /* ------------------------------------------------------------------ */
 /* in-toto statement                                                   */
@@ -71,8 +70,20 @@ export interface AgentPromotionAuthorityPredicate {
 	candidate: { repo: string; commit: string; tree_sha256: string };
 	evaluation: { bundle_sha256: string };
 	verification: { result: "PASSED" | "FAILED"; policy_sha256: string };
-	destination: { repo: string; expected_parent: string };
+	/**
+	 * `base` is the destination head bound into the permit: promotion
+	 * fast-forwards from it to the candidate. Spec 4 §4 called it
+	 * `expected_parent`; it is the candidate's parent only when the
+	 * candidate is one commit above it (specs/amendments/rebase-ancestry-v1.md).
+	 */
+	destination: { repo: string; base: string };
 	authority: { nonce: string; single_use: true; permit_id: string; issued_at: string };
+	/**
+	 * Head of the task authority's hash-chained ledger when the bundle was
+	 * signed (authority-signing-v1). Signing it here binds the ledger the
+	 * bundle carries; the verifier recomputes the chain to this head.
+	 */
+	ledger?: { head_sha256: string };
 }
 
 /* ------------------------------------------------------------------ */
@@ -161,10 +172,13 @@ export async function buildPromotionAuthority(input: {
 	verificationResult: "PASSED" | "FAILED";
 	policySha256: string;
 	destinationRepo: string;
-	expectedParent: string;
+	/** The permit's expected destination head. */
+	destinationBase: string;
 	nonce: string;
 	permitId: string;
 	issuedAt: string;
+	/** Ledger head at signing (authority-signing-v1). */
+	ledgerHeadSha256?: string;
 }): Promise<InTotoStatement> {
 	const predicate: AgentPromotionAuthorityPredicate = {
 		intent: { digest: input.taskHash },
@@ -176,13 +190,14 @@ export async function buildPromotionAuthority(input: {
 		},
 		evaluation: { bundle_sha256: input.evaluationBundleHash },
 		verification: { result: input.verificationResult, policy_sha256: input.policySha256 },
-		destination: { repo: input.destinationRepo, expected_parent: input.expectedParent },
+		destination: { repo: input.destinationRepo, base: input.destinationBase },
 		authority: {
 			nonce: input.nonce,
 			single_use: true,
 			permit_id: input.permitId,
 			issued_at: input.issuedAt,
 		},
+		...(input.ledgerHeadSha256 === undefined ? {} : { ledger: { head_sha256: input.ledgerHeadSha256 } }),
 	};
 	return statement(AGENT_PROMOTION_AUTHORITY_V1, input.treeSha256, predicate);
 }
@@ -232,23 +247,34 @@ export async function verifyEnvelope(
 /* Promotion bundle verification (spec 4 §7 transcript).               */
 /* ------------------------------------------------------------------ */
 
+/**
+ * Promotion bundle, authority-signing-v1 (specs/amendments/authority-signing-v1.md);
+ * version 3 (specs/amendments/rebase-ancestry-v1.md) records the ship's
+ * `base` and the promoted commit's own `parent` separately.
+ */
 export interface PromotionBundle {
-	version: 1;
+	version: 3;
 	statements: DsseEnvelope[];
 	ship: {
 		repo: string;
+		/** The promoted commit: the reviewed candidate itself. */
 		commit: string;
 		tree_sha256: string;
+		/** The destination head the promotion fast-forwarded from (the permit's). */
+		base: string;
+		/** The promoted commit's first parent, read from git ("" for a root commit). */
 		parent: string;
 		permit_id: string;
 	};
-	/** Ledger hashes; the permit_id must appear exactly once (consumed once). */
-	ledger_hashes: string[];
 	/**
-	 * SPKI DER (hex) of the promotion-authority Ed25519 public key that
-	 * signed the envelopes. Lets an offline verifier build a verify-only
-	 * signer from the bundle alone — no key-distribution side channel.
-	 * (Slice: the Ed25519 slice signer; production: Sigstore per spec 4 §6.)
+	 * The task authority's hash-chained ledger when the bundle was signed.
+	 * `head_sha256` is also signed into the authority statement.
+	 */
+	ledger: { head_sha256: string; entries: LedgerEntry[] };
+	/**
+	 * SPKI DER (hex) of the authority key that signed the envelopes. A
+	 * label, never a trust anchor: the verifier checks it equals the key it
+	 * has pinned and verifies every signature with the pinned key.
 	 */
 	authority_pubkey_der_hex: string;
 }
@@ -264,14 +290,17 @@ function subjectDigest(s: InTotoStatement | null): string | null {
 }
 
 /**
- * `$ verify promotion.bundle` — reproduces the spec 4 §7 transcript
- * lines IN ORDER. Any line failing → verified=false with the failing
- * line(s) named. Fully offline: the bundle carries everything needed.
+ * `$ verify promotion.bundle` — the spec 4 §7 transcript as amended by
+ * authority-signing-v1, IN ORDER. Any line failing → verified=false with
+ * the failing line(s) named. Offline: the bundle carries everything except
+ * the trust anchor. The caller pins the authority key: `signer` verifies
+ * with it and `opts.trustedKeyDerHex` is its SPKI DER (hex). Statements
+ * that do not verify under that key are not evaluated at all.
  */
 export async function verifyBundle(
 	bundle: PromotionBundle,
 	signer: Signer,
-	opts: { policyHash: string },
+	opts: { policyHash: string; trustedKeyDerHex: string },
 ): Promise<{ lines: VerifyLine[]; verified: boolean }> {
 	const lines: VerifyLine[] = [];
 	const fail = (label: string, detail: string): void => {
@@ -311,15 +340,10 @@ export async function verifyBundle(
 	}
 
 	// 2. candidate digest — candidate commit+tree match the attested digests.
-	// ASSUMPTION (documented in this module's doc comment): promotion
-	// preserves the reviewed commit bit-for-bit — the promotion path
-	// (task-state.ts attemptPromotion → canonical_write effect → sole
-	// canonical writer) creates no merge commit and performs no
-	// re-encoding; the commit hash is a pure function of
-	// {parents, tree, message}, so the shipped commit IS the reviewed
-	// candidate SHA. Any re-encoding/re-parenting upstream would land
-	// here as a FAIL, which is the correct fail-closed behavior (reviewed
-	// at SHA X must ship at SHA X; spec 3 §6 attack #7).
+	// Promotion fast-forwards the destination to the reviewed commit itself
+	// (this module's doc comment), so the shipped commit IS the reviewed
+	// candidate SHA. Anything else lands here as a FAIL (reviewed at SHA X
+	// must ship at SHA X; spec 3 §6 attack #7).
 	if (
 		ap !== null &&
 		ap.candidate.commit === bundle.ship.commit &&
@@ -359,36 +383,74 @@ export async function verifyBundle(
 		fail("policy digest", "selector policy hash does not match the frozen policy");
 	}
 
-	// 6. destination parent — expected_parent matches the ship parent.
-	if (ap !== null && ap.destination.expected_parent === bundle.ship.parent) {
-		lines.push({ label: "destination parent", status: "OK" });
+	// 6. destination base — the permit-bound head the authority attested is
+	// the head the ship record says the promotion fast-forwarded from
+	// (rebase-ancestry-v1; spec 4 §7 called this line "destination parent").
+	if (ap !== null && typeof ap.destination?.base === "string" && ap.destination.base === bundle.ship.base) {
+		lines.push({ label: "destination base", status: "OK" });
 	} else {
-		fail(
-			"destination parent",
-			`expected_parent ${ap?.destination.expected_parent} != ship parent ${bundle.ship.parent}`,
-		);
+		fail("destination base", `attested base ${ap?.destination?.base} != ship base ${bundle.ship.base}`);
 	}
 
-	// 7. signature — every envelope verifies (offline).
+	// 7. authority key — the key the bundle names is the key the verifier
+	// pinned. The embedded key is a label, never a trust anchor.
+	if (
+		typeof bundle.authority_pubkey_der_hex === "string" &&
+		bundle.authority_pubkey_der_hex.toLowerCase() === opts.trustedKeyDerHex.toLowerCase()
+	) {
+		lines.push({ label: "authority key", status: "PINNED" });
+	} else {
+		fail("authority key", "the bundle's authority key is not the pinned authority key");
+	}
+
+	// 8. signature — every envelope verifies under the pinned key (offline).
 	if (signaturesOk) {
 		lines.push({ label: "signature", status: "VALID" });
 	} else {
 		fail("signature", signatureDetail ?? "a DSSE signature did not verify");
 	}
 
-	// 8. promotion authority — permit_id present exactly once across
-	// bundle + ledger_hashes (single-use). For the slice: the ship record
-	// references the permit and ledger_hashes contains it exactly once.
-	const permitId = ap?.authority.permit_id ?? null;
-	const occurrences =
-		permitId === null ? 0 : bundle.ledger_hashes.filter((h) => h === permitId).length;
-	if (permitId !== null && bundle.ship.permit_id === permitId && occurrences === 1) {
-		lines.push({ label: "promotion authority", status: "CONSUMED ONCE" });
+	// 9. permit id — recomputes from the fields it binds (spec 1 §10,
+	// spec 4 §4) and is the permit the ship record names. Whether a permit
+	// was consumed once cannot be established offline; line 10 checks what
+	// the authority's signed ledger records.
+	const recomputedPermitId =
+		ap === null
+			? null
+			: await buildPermitId(
+					{
+						task_hash: ap.intent?.digest,
+						baseline_commit: ap.baseline?.git_commit,
+						winning_tree_sha256: ap.candidate?.tree_sha256,
+						evaluation_bundle_hash: ap.evaluation?.bundle_sha256,
+						selector_policy_hash: ap.verification?.policy_sha256,
+						expected_destination_head: ap.destination?.base,
+					},
+					sha256Hex,
+				);
+	if (ap !== null && recomputedPermitId === ap.authority?.permit_id && bundle.ship.permit_id === ap.authority.permit_id) {
+		lines.push({ label: "permit id", status: "RECOMPUTED FROM BOUND FIELDS" });
 	} else {
-		fail(
-			"promotion authority",
-			`permit_id ${permitId}: ship references ${bundle.ship.permit_id}, present ${occurrences}x in ledger_hashes (must be exactly once)`,
+		fail("permit id", "permit_id does not recompute from its bound fields, or the ship record names another permit");
+	}
+
+	// 10. ledger chain — the entries hash-chain to the head signed into the
+	// authority statement, and that signed ledger records this promotion
+	// exactly once.
+	const ledgerChain = await verifyLedgerChain(bundle.ledger?.entries, sha256Hex);
+	if (!ledgerChain.ok) {
+		fail("ledger chain", ledgerChain.detail);
+	} else if (ledgerChain.head !== bundle.ledger.head_sha256 || ledgerChain.head !== ap?.ledger?.head_sha256) {
+		fail("ledger chain", "the ledger does not end at the head signed into the authority statement");
+	} else {
+		const promotionPayloadHash = await sha256Hex(
+			canonicalJson({ permit_id: bundle.ship.permit_id, tree_sha256: bundle.ship.tree_sha256 }),
 		);
+		const recorded = bundle.ledger.entries.filter(
+			(e) => e.kind === "promotion_succeeded" && e.payload_hash === promotionPayloadHash,
+		).length;
+		if (recorded === 1) lines.push({ label: "ledger chain", status: "OK" });
+		else fail("ledger chain", `the signed ledger records this promotion ${recorded} times (must be exactly once)`);
 	}
 
 	return { lines, verified: lines.every((l) => l.status !== "FAIL") };

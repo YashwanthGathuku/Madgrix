@@ -1,0 +1,117 @@
+{
+  "parent": {
+    "id": "parent",
+    "role": "parent",
+    "intent": "Fork ext-ky once and host 12 sub-agents on that one fork."
+  },
+  "subs": [
+    {
+      "id": "sub-01-core",
+      "role": "core",
+      "intent": "Write the crew note source/core/MADGRIX_CREW_01.md only.",
+      "paths": [
+        "source/core/MADGRIX_CREW_01.md"
+      ],
+      "command": "mkdir -p 'source/core' && printf '%s\\n' \"# crew note 01\" \"$MADGRIX_AGENT_ID run $(date -u +%Y-%m-%dT%H:%M:%SZ)-$$\" > 'source/core/MADGRIX_CREW_01.md'"
+    },
+    {
+      "id": "sub-02-errors",
+      "role": "errors",
+      "intent": "Write the crew note source/errors/MADGRIX_CREW_02.md only.",
+      "paths": [
+        "source/errors/MADGRIX_CREW_02.md"
+      ],
+      "command": "mkdir -p 'source/errors' && printf '%s\\n' \"# crew note 02\" \"$MADGRIX_AGENT_ID run $(date -u +%Y-%m-%dT%H:%M:%SZ)-$$\" > 'source/errors/MADGRIX_CREW_02.md'"
+    },
+    {
+      "id": "sub-03-types",
+      "role": "types",
+      "intent": "Write the crew note source/types/MADGRIX_CREW_03.md only.",
+      "paths": [
+        "source/types/MADGRIX_CREW_03.md"
+      ],
+      "command": "mkdir -p 'source/types' && printf '%s\\n' \"# crew note 03\" \"$MADGRIX_AGENT_ID run $(date -u +%Y-%m-%dT%H:%M:%SZ)-$$\" > 'source/types/MADGRIX_CREW_03.md'"
+    },
+    {
+      "id": "sub-04-utils",
+      "role": "utils",
+      "intent": "Write the crew note source/utils/MADGRIX_CREW_04.md only.",
+      "paths": [
+        "source/utils/MADGRIX_CREW_04.md"
+      ],
+      "command": "mkdir -p 'source/utils' && printf '%s\\n' \"# crew note 04\" \"$MADGRIX_AGENT_ID run $(date -u +%Y-%m-%dT%H:%M:%SZ)-$$\" > 'source/utils/MADGRIX_CREW_04.md'"
+    },
+    {
+      "id": "sub-05-src",
+      "role": "src",
+      "intent": "Write the crew note source/MADGRIX_CREW_05.md only.",
+      "paths": [
+        "source/MADGRIX_CREW_05.md"
+      ],
+      "command": "mkdir -p 'source' && printf '%s\\n' \"# crew note 05\" \"$MADGRIX_AGENT_ID run $(date -u +%Y-%m-%dT%H:%M:%SZ)-$$\" > 'source/MADGRIX_CREW_05.md'"
+    },
+    {
+      "id": "sub-06-test",
+      "role": "test",
+      "intent": "Write the crew note source/core/MADGRIX_CREW_06.md only.",
+      "paths": [
+        "source/core/MADGRIX_CREW_06.md"
+      ],
+      "command": "mkdir -p 'source/core' && printf '%s\\n' \"# crew note 06\" \"$MADGRIX_AGENT_ID run $(date -u +%Y-%m-%dT%H:%M:%SZ)-$$\" > 'source/core/MADGRIX_CREW_06.md'"
+    },
+    {
+      "id": "sub-07-helpers",
+      "role": "helpers",
+      "intent": "Write the crew note source/utils/MADGRIX_CREW_07.md only.",
+      "paths": [
+        "source/utils/MADGRIX_CREW_07.md"
+      ],
+      "command": "mkdir -p 'source/utils' && printf '%s\\n' \"# crew note 07\" \"$MADGRIX_AGENT_ID run $(date -u +%Y-%m-%dT%H:%M:%SZ)-$$\" > 'source/utils/MADGRIX_CREW_07.md'"
+    },
+    {
+      "id": "sub-08-typed",
+      "role": "typed",
+      "intent": "Write the crew note test-d/MADGRIX_CREW_08.md only.",
+      "paths": [
+        "test-d/MADGRIX_CREW_08.md"
+      ],
+      "command": "mkdir -p 'test-d' && printf '%s\\n' \"# crew note 08\" \"$MADGRIX_AGENT_ID run $(date -u +%Y-%m-%dT%H:%M:%SZ)-$$\" > 'test-d/MADGRIX_CREW_08.md'"
+    },
+    {
+      "id": "sub-09-media",
+      "role": "media",
+      "intent": "Write the crew note media/MADGRIX_CREW_09.md only.",
+      "paths": [
+        "media/MADGRIX_CREW_09.md"
+      ],
+      "command": "mkdir -p 'media' && printf '%s\\n' \"# crew note 09\" \"$MADGRIX_AGENT_ID run $(date -u +%Y-%m-%dT%H:%M:%SZ)-$$\" > 'media/MADGRIX_CREW_09.md'"
+    },
+    {
+      "id": "sub-10-wf",
+      "role": "wf",
+      "intent": "Write the crew note .github/workflows/MADGRIX_CREW_10.md only.",
+      "paths": [
+        ".github/workflows/MADGRIX_CREW_10.md"
+      ],
+      "command": "mkdir -p '.github/workflows' && printf '%s\\n' \"# crew note 10\" \"$MADGRIX_AGENT_ID run $(date -u +%Y-%m-%dT%H:%M:%SZ)-$$\" > '.github/workflows/MADGRIX_CREW_10.md'"
+    },
+    {
+      "id": "sub-11-gh",
+      "role": "gh",
+      "intent": "Write the crew note .github/MADGRIX_CREW_11.md only.",
+      "paths": [
+        ".github/MADGRIX_CREW_11.md"
+      ],
+      "command": "mkdir -p '.github' && printf '%s\\n' \"# crew note 11\" \"$MADGRIX_AGENT_ID run $(date -u +%Y-%m-%dT%H:%M:%SZ)-$$\" > '.github/MADGRIX_CREW_11.md'"
+    },
+    {
+      "id": "sub-12-root",
+      "role": "root",
+      "intent": "Write the crew note MADGRIX_CREW_12.md only.",
+      "paths": [
+        "MADGRIX_CREW_12.md"
+      ],
+      "command": "mkdir -p '.' && printf '%s\\n' \"# crew note 12\" \"$MADGRIX_AGENT_ID run $(date -u +%Y-%m-%dT%H:%M:%SZ)-$$\" > 'MADGRIX_CREW_12.md'"
+    }
+  ]
+}

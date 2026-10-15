@@ -5,13 +5,16 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { canonicalJson, sha256Hex } from "../src/lib/canonical.ts";
+import { assumeCompleteMergeArtifactScan } from "../src/lib/merge-artifacts.ts";
 import { createCommitment } from "../src/lib/verifiers.ts";
 import {
 	appendLedger,
 	attemptPromotion,
+	beginPromotion,
 	commitVerifier,
 	createAuthority,
 	defaultCtx,
+	enrollAgents,
 	escalateToOperator,
 	ingestQueueEvent,
 	issuePermit,
@@ -25,6 +28,7 @@ import {
 	submitVerifierReport,
 	taskHashFor,
 	type Ctx,
+	type Effect,
 	type QuarantineRecheck,
 	type SignedDetermination,
 } from "../src/lib/task-state.ts";
@@ -36,6 +40,7 @@ import type {
 	ContenderRecord,
 	EvaluationBundle,
 	QueuePushEvent,
+	QuarantineTrigger,
 	ReferenceReport,
 	TaskRecord,
 	VerifierCommitment,
@@ -73,6 +78,7 @@ function makeContender(): ContenderRecord {
 		agent_id: "agent-1",
 		fork_repo: "fork-1",
 		fork_lineage: { parent_repo: "acme/api", parent_commit: BASELINE },
+		fork_base: BASELINE,
 		token_id: "tok-1",
 		status: "forked",
 		claim_work_id: null,
@@ -83,6 +89,13 @@ function makeContender(): ContenderRecord {
 function stateWithContender(ctx: Ctx): AuthorityState {
 	const s = createAuthority(makeTask());
 	return { ...s, contenders: { "contender-1": makeContender() } };
+}
+
+/** As stateWithContender, with the contender's push of `sha` already observed
+ *  (evidence must name the contender's latest observed commit). */
+function stateWithObservedCandidate(ctx: Ctx, sha = "csha1"): AuthorityState {
+	const s = stateWithContender(ctx);
+	return { ...s, contenders: { "contender-1": { ...makeContender(), latest_commit: sha } } };
 }
 
 async function makeBundle(overrides: Partial<EvaluationBundle> = {}): Promise<EvaluationBundle> {
@@ -108,13 +121,14 @@ async function makeBundle(overrides: Partial<EvaluationBundle> = {}): Promise<Ev
 		...overrides,
 	};
 	const { bundle_hash: _h, ...rest } = base as EvaluationBundle & { bundle_hash?: string };
-	const bundle_hash = await sha256Hex(canonicalJson(rest));
-	return { ...(rest as EvaluationBundle), bundle_hash };
+	const scanned = assumeCompleteMergeArtifactScan(rest);
+	const bundle_hash = await sha256Hex(canonicalJson(scanned));
+	return { ...(scanned as EvaluationBundle), bundle_hash };
 }
 
 /** Drive a fresh authority to an ACCEPT verdict for one candidate. */
 async function authorityWithAccept(ctx: Ctx, bundle: EvaluationBundle) {
-	let state = stateWithContender(ctx);
+	let state = stateWithObservedCandidate(ctx, bundle.candidate_sha);
 	const evalCaller: CallerIdentity = { zone: "evaluation_domain" };
 	state = (await submitEvaluation(state, bundle, evalCaller, ctx)).state;
 	const { state: s2, record } = await runVerdictSeam(
@@ -158,7 +172,7 @@ async function makeOperator() {
 	};
 }
 
-function makeRecheck(trigger: "tool_status_fabrication", passed: boolean, detail: string): QuarantineRecheck {
+function makeRecheck(trigger: QuarantineTrigger, passed: boolean, detail: string): QuarantineRecheck {
 	return { trigger, passed, detail, checked_at: "2026-10-01T19:00:00Z" };
 }
 
@@ -182,7 +196,7 @@ describe("ingestQueueEvent", () => {
 		assert.equal(r2.state.ledger.length, r1.state.ledger.length); // no new entry
 	});
 
-	it("unknown repo → REJECTED_OUT_OF_ORDER (ledgered, not applied)", async () => {
+	it("unknown repo → REJECTED_UNKNOWN_REPO (ledgered, not applied)", async () => {
 		const ctx = makeCtx();
 		const state = stateWithContender(ctx);
 		const event: QueuePushEvent = {
@@ -193,9 +207,9 @@ describe("ingestQueueEvent", () => {
 			after: "commitX",
 		};
 		const r = await ingestQueueEvent(state, event, ctx);
-		assert.equal(r.outcome, "REJECTED_OUT_OF_ORDER");
+		assert.equal(r.outcome, "REJECTED_UNKNOWN_REPO");
 		assert.equal(r.state.contenders["contender-1"].latest_commit, null);
-		assert.ok(r.state.ledger.some((e) => e.kind === "queue_event_rejected_out_of_order"));
+		assert.ok(r.state.ledger.some((e) => e.kind === "queue_event_rejected_unknown_repo"));
 	});
 });
 
@@ -231,6 +245,44 @@ describe("registerClaim", () => {
 		}, ctx);
 		assert.equal(r2.reports.length, 1);
 		assert.equal(r2.reports[0].risk, "RED");
+	});
+
+	it("enrolled task: only enrolled agents, each with its own secret, may claim; nothing is minted", async () => {
+		const ctx = makeCtx();
+		const secretA = "a1".repeat(32);
+		let state = await enrollAgents(stateWithContender(ctx), { "contender-1": await sha256Hex(secretA) }, ctx);
+		const input = {
+			agent: "contender-1",
+			task: TASK_HASH,
+			baseline: BASELINE,
+			intent: { behavior: ["x"] },
+			scope: { paths: ["src/**"], symbols: [] },
+			contracts: { reads: [], modifies: [] },
+			interfaces: [],
+			schema_changes: [],
+			expected_tests: [],
+			lease: { claimed_at: "2026-10-01T18:00:00Z", expires_at: "2026-10-01T20:00:00Z" },
+		};
+		await assert.rejects(registerClaim(state, input, ctx), /requires its secret/);
+		await assert.rejects(registerClaim(state, input, ctx, "b2".repeat(32)), /does not match/);
+		await assert.rejects(registerClaim(state, { ...input, agent: "contender-9" }, ctx, secretA), /not enrolled/);
+		const r = await registerClaim(state, input, ctx, secretA);
+		assert.equal(r.agent_secret, null, "no secret is minted for an enrolled agent");
+		assert.equal(r.claim.agent_secret_sha256, await sha256Hex(secretA));
+		state = r.state;
+		await assert.rejects(enrollAgents(state, { "contender-2": await sha256Hex("x") }, ctx), /already enrolled/);
+	});
+
+	it("enrollAgents validates ids and digests and must precede every claim", async () => {
+		const ctx = makeCtx();
+		const digest = "c3".repeat(32);
+		for (const [label, enrollment] of [
+			["no agents", {}],
+			["bad id", { "agent a": digest }],
+			["bad digest", { "agent-a": "nope" }],
+		] as const) {
+			await assert.rejects(enrollAgents(stateWithContender(ctx), enrollment, ctx), /enrollAgents/, label);
+		}
 	});
 
 	it("rejects empty scope.paths", async () => {
@@ -362,17 +414,19 @@ describe("permit + promotion", () => {
 		const ctx = makeCtx();
 		const bundle = await makeBundle();
 		let state = await authorityWithAccept(ctx, bundle);
-		const { state: s2, permit } = await issuePermit(state, "csha1", "acme/api", "dest-head-1", ctx);
+		const { state: s2, permit } = await issuePermit(state, "csha1", "acme/api", BASELINE, ctx);
+		assert.ok(permit);
 		assert.equal(permit.consumed, false);
 
-		const r1 = await attemptPromotion(s2, permit.permit_id, "dest-head-1", "tree1", ctx);
+		const r1 = await attemptPromotion(s2, permit.permit_id, BASELINE, "tree1", ctx);
 		assert.equal(r1.outcome, "PROMOTED");
 		assert.equal(r1.state.task_status, "promoted");
+		// Fast-forward the destination from the permit-bound head to the candidate.
 		assert.deepEqual(r1.effects, [
-			{ kind: "canonical_write", repo: "acme/api", tree_sha256: "tree1", parent: "dest-head-1" },
+			{ kind: "canonical_write", repo: "acme/api", commit: "csha1", tree_sha256: "tree1", base: BASELINE },
 		]);
 
-		const r2 = await attemptPromotion(r1.state, permit.permit_id, "dest-head-1", "tree1", ctx);
+		const r2 = await attemptPromotion(r1.state, permit.permit_id, BASELINE, "tree1", ctx);
 		assert.equal(r2.outcome, "ALREADY_CONSUMED");
 		assert.equal(r2.effects.length, 0);
 	});
@@ -388,7 +442,8 @@ describe("permit + promotion", () => {
 		const ctx = makeCtx();
 		const bundle = await makeBundle();
 		let state = await authorityWithAccept(ctx, bundle);
-		const issued = await issuePermit(state, "csha1", "acme/api", "dest-head-1", ctx);
+		const issued = await issuePermit(state, "csha1", "acme/api", BASELINE, ctx);
+		assert.ok(issued.permit);
 		const r = await attemptPromotion(issued.state, issued.permit.permit_id, "dest-head-2", "tree1", ctx);
 		assert.equal(r.outcome, "EXPIRED_HEAD_MOVED");
 		assert.equal(r.state.permits[issued.permit.permit_id].consumed, false);
@@ -398,8 +453,9 @@ describe("permit + promotion", () => {
 		const ctx = makeCtx();
 		const bundle = await makeBundle();
 		let state = await authorityWithAccept(ctx, bundle);
-		const issued = await issuePermit(state, "csha1", "acme/api", "dest-head-1", ctx);
-		const r = await attemptPromotion(issued.state, issued.permit.permit_id, "dest-head-1", "other-tree", ctx);
+		const issued = await issuePermit(state, "csha1", "acme/api", BASELINE, ctx);
+		assert.ok(issued.permit);
+		const r = await attemptPromotion(issued.state, issued.permit.permit_id, BASELINE, "other-tree", ctx);
 		assert.equal(r.outcome, "TREE_MISMATCH");
 		assert.equal(r.state.permits[issued.permit.permit_id].consumed, false);
 	});
@@ -408,11 +464,21 @@ describe("permit + promotion", () => {
 		const ctx = makeCtx();
 		const bundle = await makeBundle();
 		let state = await authorityWithAccept(ctx, bundle);
-		const issued = await issuePermit(state, "csha1", "acme/api", "dest-head-1", ctx);
+		const issued = await issuePermit(state, "csha1", "acme/api", BASELINE, ctx);
+		assert.ok(issued.permit);
 		const q = await quarantineContender(issued.state, "contender-1", "candidate_sha_substitution", "ev-hash", ctx);
-		const r = await attemptPromotion(q.state, issued.permit.permit_id, "dest-head-1", "tree1", ctx);
+		const r = await attemptPromotion(q.state, issued.permit.permit_id, BASELINE, "tree1", ctx);
 		assert.equal(r.outcome, "QUARANTINED_CANDIDATE");
 		assert.equal(r.state.permits[issued.permit.permit_id].consumed, false);
+		// The quarantine names the permit whose PromotionWorkflow instance it
+		// stops (specs/amendments/promotion-runtime-v1.md); a consumed permit
+		// has nothing left to stop.
+		const cancel = (effects: Effect[]) => effects.find((e) => e.kind === "cancel_workflow");
+		assert.deepEqual(cancel(q.effects), { kind: "cancel_workflow", contender_id: "contender-1", permit_ids: [issued.permit.permit_id] });
+		const consumed = structuredClone(issued.state);
+		consumed.permits[issued.permit.permit_id].consumed = true;
+		const q2 = await quarantineContender(consumed, "contender-1", "candidate_sha_substitution", "ev-hash", ctx);
+		assert.deepEqual(cancel(q2.effects), { kind: "cancel_workflow", contender_id: "contender-1", permit_ids: [] });
 	});
 
 	it("issuePermit requires an ACCEPT verdict for the winner", async () => {
@@ -426,7 +492,7 @@ describe("quarantine", () => {
 	it("quarantine revokes token, cancels workflow, notifies, taints evidence", async () => {
 		const ctx = makeCtx();
 		const bundle = await makeBundle();
-		let state = stateWithContender(ctx);
+		let state = stateWithObservedCandidate(ctx);
 		state = (await submitEvaluation(state, bundle, { zone: "evaluation_domain" }, ctx)).state;
 		const { state: qstate, effects } = await quarantineContender(
 			state,
@@ -440,7 +506,7 @@ describe("quarantine", () => {
 		assert.equal(qstate.evaluations["csha1"].tainted, true);
 		assert.deepEqual(effects, [
 			{ kind: "revoke_token", repo: "fork-1", token_id: "tok-1" },
-			{ kind: "cancel_workflow", contender_id: "contender-1" },
+			{ kind: "cancel_workflow", contender_id: "contender-1", permit_ids: [] },
 			{
 				kind: "notify",
 				to: ["operator-of-record"],
@@ -452,7 +518,7 @@ describe("quarantine", () => {
 	it("RELEASED requires a passing re-check of the firing trigger + signed determination; REVOKED terminates", async () => {
 		const ctx = makeCtx();
 		const bundle = await makeBundle();
-		let state = stateWithContender(ctx);
+		let state = stateWithObservedCandidate(ctx);
 		state = (await submitEvaluation(state, bundle, { zone: "evaluation_domain" }, ctx)).state;
 		const operator = await makeOperator();
 		state = await operator.register(state, ctx);
@@ -488,7 +554,8 @@ describe("quarantine", () => {
 		);
 		assert.equal(rel.state.quarantine["contender-1"].status, "RELEASED");
 		assert.equal(rel.state.contenders["contender-1"].status, "released");
-		assert.equal(rel.state.evaluations["csha1"].tainted, false);
+		// RELEASED does not clear the quarantine epoch. The old bundle stays tainted.
+		assert.equal(rel.state.evaluations["csha1"].tainted, true);
 
 		// Re-check reproduces the violation → RELEASED denied even with a valid signature.
 		const badRelDet = await operator.determine(
@@ -543,7 +610,7 @@ describe("quarantine", () => {
 		// finding is SHA256(canonical_json(presented_config)) != locked digest.
 		const ctx = makeCtx();
 		const bundle = await makeBundle();
-		let state = stateWithContender(ctx);
+		let state = stateWithObservedCandidate(ctx);
 		state = (await submitEvaluation(state, bundle, { zone: "evaluation_domain" }, ctx)).state;
 		const locked = { evaluator_version: "eval-domain/0.3.1", hidden_seed: "9f2c", policy: "strict" };
 		const lockedHash = await ctx.sha256Hex(canonicalJson(locked));
@@ -577,9 +644,55 @@ describe("escalation", () => {
 		state = esc.state;
 		assert.equal(state.task_status, "escalated");
 		await assert.rejects(
-			issuePermit(state, "csha1", "acme/api", "dest-head-1", ctx),
+			issuePermit(state, "csha1", "acme/api", BASELINE, ctx),
 			/BLOCKED/,
 		);
+	});
+});
+
+describe("a promoted task is terminal", () => {
+	it("refuses a new verdict, a new permit, and a different permit's promotion", async () => {
+		const ctx = makeCtx();
+		const bundle = await makeBundle();
+		const state = await authorityWithAccept(ctx, bundle);
+		const { state: s2, permit } = await issuePermit(state, "csha1", "acme/api", BASELINE, ctx);
+		assert.ok(permit);
+		const r1 = await attemptPromotion(s2, permit.permit_id, BASELINE, "tree1", ctx);
+		assert.equal(r1.state.task_status, "promoted");
+		await assert.rejects(
+			runVerdictSeam(
+				r1.state,
+				[{ contender_id: bundle.contender_id, candidate_sha: bundle.candidate_sha, blast_radius: 1, change_surface: 1 }],
+				ctx,
+			),
+			/already promoted/,
+		);
+		// A different selector policy hash yields a NEW permit id at the same head.
+		const ctx2 = { ...ctx, selectorPolicyHash: "other-policy" };
+		await assert.rejects(issuePermit(r1.state, "csha1", "acme/api", BASELINE, ctx2), /already promoted/);
+		const replay = await issuePermit(r1.state, "csha1", "acme/api", BASELINE, ctx);
+		assert.equal(replay.permit?.consumed, true, "the stored record is still returned on retry");
+		const other = { ...permit, permit_id: "f".repeat(64), consumed: false, consumed_at: null };
+		const forged = { ...r1.state, permits: { ...r1.state.permits, [other.permit_id]: other } };
+		const begun = await beginPromotion(forged, other.permit_id, BASELINE, "tree1", ctx);
+		assert.equal(begun.outcome, "TASK_ALREADY_PROMOTED");
+	});
+});
+
+describe("escalation survives a later ACCEPT", () => {
+	it("an unresolved escalation still blocks issuePermit after a new ACCEPT verdict", async () => {
+		const ctx = makeCtx();
+		const bundle = await makeBundle();
+		let state = await authorityWithAccept(ctx, bundle);
+		state = (await escalateToOperator(state, "rebase conflict", ctx)).state;
+		const again = await runVerdictSeam(
+			state,
+			[{ contender_id: bundle.contender_id, candidate_sha: bundle.candidate_sha, blast_radius: 1, change_surface: 1 }],
+			ctx,
+		);
+		assert.equal(again.record.state, "ACCEPT");
+		assert.equal(again.state.task_status, "verdict_reached");
+		await assert.rejects(issuePermit(again.state, "csha1", "acme/api", BASELINE, ctx), /BLOCKED/);
 	});
 });
 

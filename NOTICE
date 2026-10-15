@@ -1,0 +1,13 @@
+Git4agents
+Copyright 2026 Yashwanth Gathuku
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This product includes third-party software:
+
+- TheUstad (third_party/theustad), MIT License. Its license and notice are
+  kept in third_party/theustad/LICENSE and third_party/theustad/NOTICE.
+
+External repositories used as demo baselines (sindresorhus/ky,
+sindresorhus/is-plain-obj, both MIT) are imported at run time into
+Cloudflare Artifacts and are not redistributed in this repository.

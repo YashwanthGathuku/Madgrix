@@ -16,17 +16,42 @@
  *   MADGRIX_BASELINE_COMMIT
  *   MADGRIX_INTENT
  *   MADGRIX_BEHAVIOR_CONTRACT
- *   MADGRIX_AGENT_COMMAND
- *   MADGRIX_MODEL_NAME
+ *   MADGRIX_AGENT_COMMAND          must write the agent's tool-status log
+ *                                  (specs/amendments/tool-status-v1.md)
  *   MADGRIX_HIDDEN_TEST_COMMAND
+ *   MADGRIX_CLAIM_PATHS            the claim's scope.paths, passed to the
+ *                                  contender runner (or MADGRIX_CLAIM_TEMPLATE)
  *
  * Optional:
  *   MADGRIX_DESTINATION_REPO       default baseline repo
- *   MADGRIX_AGENT_IDS              default agent-a,agent-b,agent-c
+ *   MADGRIX_QUEUE_ID               queue that receives per-repo `pushed` subscriptions
+ *   MADGRIX_ARTIFACTS_NAMESPACE    default `default`
+ *   MADGRIX_AGENT_IDS              overrides the Agentfleet roster; otherwise
+ *                                  summary.agent_ids from fleet validate of
+ *                                  configs/git4agents-contenders.yaml
+ *   MADGRIX_FLEET_BIN              fleet executable (default: fleet on PATH)
+ *   MADGRIX_FLEET_CONFIG           swarm manifest (default: that yaml)
  *   MADGRIX_EVENT_TIMEOUT_MS       default 60000
+ *   MADGRIX_PROMOTION_TIMEOUT_MS   how long to poll the promotion's Workflow
+ *                                  instance; default 900000 (15 minutes)
  *   MADGRIX_BUNDLE_PATH            default .madgrix-live/promotion.bundle
  *   MADGRIX_CLAIM_TEMPLATE         passed through to contender runner
+ *   MADGRIX_AGENT_ENV_ALLOWLIST    variables passed through to the agent
+ *                                  command (the agent's own model API key)
+ *   MADGRIX_KEEP_WORKSPACES / MADGRIX_WORK_ROOT / GIT_AUTHOR_NAME /
+ *   GIT_AUTHOR_EMAIL               passed through to contender runner
  *   MADGRIX_REGRESSION_COMMAND / SEMANTIC / STATIC / SECURITY commands
+ *   MADGRIX_HIDDEN_TESTS_DIR / MADGRIX_TEST_GLOBS / MADGRIX_HARNESS_VERSION
+ *                                  passed through to the evaluator
+ *   MADGRIX_SKIP_CF_PREFLIGHT=1    skip the cf whoami / queues list preflight
+ *   MADGRIX_TRUST_KEY              authority public key file pinned when
+ *                                  verifying the bundle (default
+ *                                  keys/authority.pub)
+ *
+ * This process holds all three service tokens; no child inherits its
+ * environment. The contender runner receives only the AGENT token, each
+ * evaluator only the EVALUATION token, and the offline verifier none. See
+ * docs/SECURITY.md "Process environment boundaries".
  */
 
 import {
@@ -34,28 +59,23 @@ import {
 	generateKeyPairSync,
 	randomBytes,
 	sign as cryptoSign,
+	type KeyObject,
 } from "node:crypto";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
+import { existsSync } from "node:fs";
 
-import { canonicalJson, sha256Hex } from "../src/lib/canonical.ts";
+import { sha256Hex } from "../src/lib/canonical.ts";
 import { classifyPair } from "../src/lib/claims.ts";
-import {
-	buildLinkStatement,
-	buildPromotionAuthority,
-	buildTestResultStatement,
-	buildVerificationResultStatement,
-	signEnvelope,
-	verifyBundle,
-	type PromotionBundle,
-} from "../src/lib/attestation.ts";
-import { createEd25519Signer } from "../src/lib/signer-node.ts";
 import { createCommitment } from "../src/lib/verifiers.ts";
 import { verifierReportPayload } from "../src/lib/verifier-keys.ts";
-import { SELECTOR_POLICY_INPUT } from "../src/do/TaskAuthority.ts";
 import { SELECTOR_POLICY_VERSION, type ReferenceReport } from "../src/lib/types.ts";
+import { loadContenderIds } from "./lib/agentfleet-slots.mjs";
+import { crewAgentIds, loadForkCrew } from "./lib/fork-crew.mjs";
+import { agentCounts, theustadVerdict } from "./lib/live-summary.mjs";
+import { cfEnv, minimalEnv, parseAgentEnvAllowlist, pickEnv } from "./lib/child-env.mjs";
 
 const env = process.env;
 const baseUrl = env.MADGRIX_BASE_URL?.replace(/\/$/, "");
@@ -68,11 +88,28 @@ const destinationRepo = env.MADGRIX_DESTINATION_REPO ?? baselineRepo;
 const intent = env.MADGRIX_INTENT;
 const behaviorContract = env.MADGRIX_BEHAVIOR_CONTRACT;
 const agentCommand = env.MADGRIX_AGENT_COMMAND;
-const modelName = env.MADGRIX_MODEL_NAME;
 const hiddenCommand = env.MADGRIX_HIDDEN_TEST_COMMAND;
 const eventTimeoutMs = Number(env.MADGRIX_EVENT_TIMEOUT_MS ?? "60000");
+const promotionTimeoutMs = Number(env.MADGRIX_PROMOTION_TIMEOUT_MS ?? "900000");
+/** Between two polls of the promotion's status. */
+const PROMOTION_POLL_MS = 2000;
 const bundlePath = path.resolve(env.MADGRIX_BUNDLE_PATH ?? ".madgrix-live/promotion.bundle");
 
+if (!env.MADGRIX_CLAIM_PATHS && !env.MADGRIX_CLAIM_TEMPLATE) {
+	console.error("Missing required environment: MADGRIX_CLAIM_PATHS (or MADGRIX_CLAIM_TEMPLATE)");
+	process.exit(2);
+}
+let agentEnvAllowlist: string[];
+try {
+	agentEnvAllowlist = parseAgentEnvAllowlist(env.MADGRIX_AGENT_ENV_ALLOWLIST);
+} catch (err) {
+	console.error((err as Error).message);
+	process.exit(2);
+}
+// Unset MADGRIX_AGENT_IDS is the fork-crew demo: one parent fork, sub-agents
+// on that repo. An explicit roster keeps the sibling race the isolation tests
+// drive.
+const forkCrew = !env.MADGRIX_AGENT_IDS?.trim();
 const required: Record<string, unknown> = {
 	MADGRIX_BASE_URL: baseUrl,
 	MADGRIX_CONTROL_SERVICE_TOKEN: controlToken,
@@ -82,18 +119,92 @@ const required: Record<string, unknown> = {
 	MADGRIX_BASELINE_COMMIT: baselineCommit,
 	MADGRIX_INTENT: intent,
 	MADGRIX_BEHAVIOR_CONTRACT: behaviorContract,
-	MADGRIX_AGENT_COMMAND: agentCommand,
-	MADGRIX_MODEL_NAME: modelName,
 	MADGRIX_HIDDEN_TEST_COMMAND: hiddenCommand,
+	...(forkCrew ? {} : { MADGRIX_AGENT_COMMAND: agentCommand }),
 };
 const missing = Object.entries(required).filter(([, v]) => typeof v !== "string" || v.length === 0);
 if (missing.length) {
 	console.error("Missing required environment:", missing.map(([k]) => k).join(", "));
 	process.exit(2);
 }
+/* ------------------------------------------------------------------ */
+/* Preflight: fail fast, with a clear message, before any task exists. */
+/* Never prints a token value or the cf CLI's output.                  */
+{
+	const problems: string[] = [];
+	const tokens: Array<[string, string]> = [
+		["MADGRIX_CONTROL_SERVICE_TOKEN", controlToken!],
+		["MADGRIX_AGENT_SERVICE_TOKEN", agentToken!],
+		["MADGRIX_EVALUATION_SERVICE_TOKEN", evaluationToken!],
+	];
+	for (const [name, value] of tokens) {
+		// The Worker refuses every configured secret shorter than 16 characters
+		// (src/worker/index.ts requireBearer), so every call would be a 401.
+		if (value.length < 16) problems.push(`${name} is shorter than 16 characters; the Worker refuses it (401)`);
+	}
+	if (new Set(tokens.map(([, v]) => v)).size !== tokens.length) {
+		problems.push("the three service tokens must be distinct (one per trust zone)");
+	}
+	const trustKey = path.resolve(env.MADGRIX_TRUST_KEY ?? "keys/authority.pub");
+	if (!existsSync(trustKey)) {
+		problems.push(
+			`authority public key not found at ${env.MADGRIX_TRUST_KEY ? "MADGRIX_TRUST_KEY" : "keys/authority.pub"}; ` +
+				"set MADGRIX_TRUST_KEY to the public half of AUTHORITY_SIGNING_KEY (keys/README.md)",
+		);
+	}
+	if (env.MADGRIX_QUEUE_ID && env.MADGRIX_SKIP_CF_PREFLIGHT !== "1") {
+		if (!existsSync(path.resolve("node_modules/cf"))) {
+			problems.push("node_modules/cf is missing: run `npm ci` in the repository root (the cf CLI loads cloudflare.config.ts)");
+		} else {
+			const cf = (args: string[]) =>
+				spawnSync("cf", args, { env: cfEnv(), stdio: ["ignore", "pipe", "pipe"], encoding: "utf8", timeout: 60_000 });
+			const who = cf(["auth", "whoami"]);
+			let authed = false;
+			try {
+				authed = who.status === 0 && JSON.parse(who.stdout).authenticated === true;
+			} catch {
+				authed = false;
+			}
+			if (who.error) problems.push("the cf CLI is not on PATH (npm i -g cf, or use npx cf)");
+			else if (!authed) problems.push("cf auth whoami: not authenticated; run `cf auth login` or set CLOUDFLARE_API_TOKEN + CLOUDFLARE_ACCOUNT_ID");
+			else if (cf(["queues", "list"]).status !== 0) {
+				problems.push(
+					"cf queues list failed: the login/token cannot read Queues on the account " +
+						"(needs queues read/write; set CLOUDFLARE_ACCOUNT_ID if cf lists no account)",
+				);
+			}
+		}
+	} else if (!env.MADGRIX_QUEUE_ID) {
+		console.error("[Git4agents] preflight: MADGRIX_QUEUE_ID unset; push subscriptions are skipped and must already exist");
+	}
+	if (problems.length) {
+		console.error("[Git4agents] preflight failed:\n  - " + problems.join("\n  - "));
+		process.exit(2);
+	}
+	console.error("[Git4agents] preflight OK");
+}
+
+let agentIds: string[];
+try {
+	agentIds = forkCrew ? crewAgentIds(loadForkCrew(env.MADGRIX_FORK_CREW_CONFIG)) : loadContenderIds();
+} catch (err) {
+	console.error((err as Error).message);
+	process.exit(2);
+}
 
 function bearer(token: string): Record<string, string> {
 	return { authorization: `Bearer ${token}` };
+}
+
+/** Posts the runner's composition with the control token. The runner never sees that token. */
+async function recordForkComposition(run: { composition?: unknown }): Promise<void> {
+	if (!run.composition || typeof run.composition !== "object") {
+		throw new Error("fork crew result has no composition record for the control plane");
+	}
+	await requestJson(`${baseUrl}/tasks/${encodeURIComponent(taskId)}/composition`, {
+		token: controlToken,
+		body: { composition: run.composition },
+	});
 }
 
 async function requestJson(
@@ -118,7 +229,7 @@ async function requestJson(
 function run(command: string, args: string[], options: { env?: NodeJS.ProcessEnv; stdio?: any } = {}): Promise<void> {
 	return new Promise((resolve, reject) => {
 		const child = spawn(command, args, {
-			env: options.env ?? process.env,
+			env: options.env ?? minimalEnv(),
 			stdio: options.stdio ?? "inherit",
 		});
 		child.on("error", reject);
@@ -140,7 +251,7 @@ interface VerifierIdentity {
 	nonce: string;
 	publicKeyDerHex: string;
 	keyid: string;
-	privateKey: ReturnType<typeof generateKeyPairSync>["privateKey"];
+	privateKey: KeyObject;
 }
 
 function makeVerifier(id: string, aspect: string): VerifierIdentity {
@@ -188,7 +299,7 @@ const verifiers = [
 	makeVerifier("verifier-minimality", "minimality"),
 ];
 
-console.error("[madgrix-live] 1/9 freeze task and verifier identities");
+console.error("[Git4agents] 1/9 freeze task and verifier identities");
 const created = await requestJson(`${baseUrl}/tasks`, {
 	token: controlToken,
 	body: {
@@ -200,13 +311,20 @@ const created = await requestJson(`${baseUrl}/tasks`, {
 			verifier_id: v.id,
 			public_key_der_hex: v.publicKeyDerHex,
 		})),
+		// One secret per agent, issued to the control plane only
+		// (specs/amendments/agent-enrollment-v1.md).
+		agent_ids: agentIds,
 	},
 });
 const taskId = created.task_id as string;
 const taskHash = created.task_hash as string;
+const agentSecrets = created.agent_secrets as Record<string, string> | undefined;
+if (!agentSecrets || !agentIds.every((id) => typeof agentSecrets[id] === "string")) {
+	throw new Error("task creation returned no secret for some enrolled agent");
+}
 if (!taskId || !taskHash) throw new Error("task creation returned no task identity");
 
-console.error("[madgrix-live] 2/9 commit blind-verifier references before candidates exist");
+console.error("[Git4agents] 2/9 commit blind-verifier references before candidates exist");
 for (const v of verifiers) {
 	const commitment = await createCommitment(
 		v.reference,
@@ -232,18 +350,77 @@ for (const v of verifiers) {
 
 const temp = await mkdtemp(path.join(os.tmpdir(), "madgrix-live-"));
 try {
-	console.error("[madgrix-live] 3/9 launch real coding agents concurrently");
+	console.error(
+		forkCrew
+			? "[Git4agents] 3/9 parent forks once; sub-agents commit on that fork"
+			: "[Git4agents] 3/9 launch real coding agents concurrently",
+	);
 	const contenderResultPath = path.join(temp, "contenders.json");
-	await run("node", ["scripts/run-contenders.mjs"], {
-		env: {
-			...env,
-			MADGRIX_BASE_URL: baseUrl,
-			MADGRIX_TASK_ID: taskId,
-			MADGRIX_AGENT_SERVICE_TOKEN: agentToken,
-			MADGRIX_RESULT_PATH: contenderResultPath,
-		},
-	});
+	// Agent zone: the AGENT token only. The runner forwards the allowlisted
+	// variables, and nothing else, to the agent command.
+	const childEnv = {
+		...pickEnv(agentEnvAllowlist),
+		MADGRIX_BASE_URL: baseUrl,
+		MADGRIX_TASK_ID: taskId,
+		MADGRIX_AGENT_SERVICE_TOKEN: agentToken,
+		MADGRIX_AGENT_SECRETS: JSON.stringify(agentSecrets),
+		MADGRIX_AGENT_ENV_ALLOWLIST: env.MADGRIX_AGENT_ENV_ALLOWLIST,
+		MADGRIX_CLAIM_PATHS: env.MADGRIX_CLAIM_PATHS,
+		MADGRIX_CLAIM_TEMPLATE: env.MADGRIX_CLAIM_TEMPLATE,
+		MADGRIX_KEEP_WORKSPACES: env.MADGRIX_KEEP_WORKSPACES,
+		MADGRIX_WORK_ROOT: env.MADGRIX_WORK_ROOT,
+		GIT_AUTHOR_NAME: env.GIT_AUTHOR_NAME,
+		GIT_AUTHOR_EMAIL: env.GIT_AUTHOR_EMAIL,
+		MADGRIX_RESULT_PATH: contenderResultPath,
+		MADGRIX_QUEUE_ID: env.MADGRIX_QUEUE_ID,
+		MADGRIX_ARTIFACTS_NAMESPACE: env.MADGRIX_ARTIFACTS_NAMESPACE,
+		MADGRIX_FLEET_BIN: env.MADGRIX_FLEET_BIN,
+		MADGRIX_FLEET_CONFIG: env.MADGRIX_FLEET_CONFIG,
+		MADGRIX_FORK_CREW_CONFIG: env.MADGRIX_FORK_CREW_CONFIG,
+		MADGRIX_RESOLVER_COMMAND: env.MADGRIX_RESOLVER_COMMAND,
+		// The runner hands these to its `cf queues subscriptions create`
+		// process only (cfEnv()); agent commands never receive them.
+		CLOUDFLARE_API_TOKEN: env.CLOUDFLARE_API_TOKEN,
+		CLOUDFLARE_ACCOUNT_ID: env.CLOUDFLARE_ACCOUNT_ID,
+	};
+	try {
+		await run("node", [forkCrew ? "scripts/run-fork-crew.mjs" : "scripts/run-contenders.mjs"], {
+			env: minimalEnv(
+				forkCrew
+					? childEnv
+					: {
+							...childEnv,
+							MADGRIX_AGENT_COMMAND: agentCommand,
+							MADGRIX_AGENT_IDS: agentIds.join(","),
+						},
+			),
+		});
+	} catch (err) {
+		if (forkCrew) {
+			const blocked = await readFile(contenderResultPath, "utf8").catch(() => "");
+			let parsed: { status?: string; composition?: unknown } | null = null;
+			try {
+				parsed = JSON.parse(blocked);
+			} catch {
+				parsed = null;
+			}
+			if (parsed?.status === "CONFLICTED") {
+				await recordForkComposition(parsed);
+				throw new Error(
+					`fork crew is CONFLICTED and was not pushed. The control plane recorded the conflict. Refusing evaluation and promotion. ${err instanceof Error ? err.message : ""}`,
+				);
+			}
+		}
+		throw err;
+	}
 	const contenderRun = JSON.parse(await readFile(contenderResultPath, "utf8"));
+	if (forkCrew) {
+		if (contenderRun.status === "CONFLICTED") {
+			await recordForkComposition(contenderRun);
+			throw new Error("fork crew is CONFLICTED. The control plane recorded the conflict. Refusing evaluation and promotion.");
+		}
+		await recordForkComposition(contenderRun);
+	}
 	const candidates = contenderRun.candidates as Array<{
 		agent_id: string;
 		contender_id: string;
@@ -253,17 +430,24 @@ try {
 		candidate_sha: string;
 		baseline_sha: string;
 	}>;
-	if (!Array.isArray(candidates) || candidates.length < 2) {
+	if (forkCrew) {
+		const subs = contenderRun.subagent_commits as unknown[];
+		if (candidates.length !== 1 || !Array.isArray(subs) || subs.length < 2) {
+			throw new Error("fork crew did not produce one combined SHA from at least two sub-agent commits");
+		}
+	} else if (!Array.isArray(candidates) || candidates.length < 2) {
 		throw new Error("real contender run produced fewer than two candidates");
 	}
 
-	console.error("[madgrix-live] 4/9 wait for real Artifacts push events through Queue → TaskAuthority");
+	console.error("[Git4agents] 4/9 wait for real Artifacts push events through Queue → TaskAuthority");
 	const deadline = Date.now() + eventTimeoutMs;
 	for (;;) {
 		const context = await requestJson(`${baseUrl}/tasks/${encodeURIComponent(taskId)}/context`, {
 			token: agentToken,
 		});
-		const byId = new Map((context.contenders ?? []).map((x: any) => [x.contender_id, x]));
+		const byId = new Map<string, { latest_commit?: string | null }>(
+			(context.contenders ?? []).map((x: { contender_id: string; latest_commit?: string | null }) => [x.contender_id, x]),
+		);
 		const allObserved = candidates.every((c) => byId.get(c.contender_id)?.latest_commit === c.candidate_sha);
 		if (allObserved) break;
 		if (Date.now() >= deadline) {
@@ -275,27 +459,44 @@ try {
 		await sleep(1000);
 	}
 
-	console.error("[madgrix-live] 5/9 evaluate immutable candidates in the independent evaluation domain");
+	console.error("[Git4agents] 5/9 evaluate immutable candidates in the independent evaluation domain");
 	const evalResults = await Promise.all(
 		candidates.map(async (candidate, i) => {
 			const resultPath = path.join(temp, `evaluation-${i}.json`);
+			// Evaluation domain: the EVALUATION token only.
 			await run("node", ["scripts/evaluate-candidate.ts"], {
-				env: {
-					...env,
+				env: minimalEnv({
 					MADGRIX_BASE_URL: baseUrl,
 					MADGRIX_TASK_ID: taskId,
 					MADGRIX_CONTENDER_ID: candidate.contender_id,
 					MADGRIX_CANDIDATE_SHA: candidate.candidate_sha,
 					MADGRIX_EVALUATION_SERVICE_TOKEN: evaluationToken,
-					MADGRIX_MODEL_NAME: modelName,
+					MADGRIX_HIDDEN_TEST_COMMAND: hiddenCommand,
+					MADGRIX_REGRESSION_COMMAND: env.MADGRIX_REGRESSION_COMMAND,
+					MADGRIX_SEMANTIC_COMMAND: env.MADGRIX_SEMANTIC_COMMAND,
+					MADGRIX_STATIC_COMMAND: env.MADGRIX_STATIC_COMMAND,
+					MADGRIX_SECURITY_COMMAND: env.MADGRIX_SECURITY_COMMAND,
+					MADGRIX_HIDDEN_TESTS_DIR: env.MADGRIX_HIDDEN_TESTS_DIR,
+					MADGRIX_TEST_GLOBS: env.MADGRIX_TEST_GLOBS,
+					MADGRIX_HARNESS_VERSION: env.MADGRIX_HARNESS_VERSION,
 					MADGRIX_RESULT_PATH: resultPath,
-				},
+				}),
 			});
 			return JSON.parse(await readFile(resultPath, "utf8"));
 		}),
 	);
 
-	console.error("[madgrix-live] 6/9 reveal blind references and submit signed independent verdicts");
+	console.error("[Git4agents] 6/9 reveal blind references and submit signed independent verdicts");
+	const counts = agentCounts(forkCrew, contenderRun);
+	const ustad = theustadVerdict(forkCrew, contenderRun);
+	console.error(
+		`[Git4agents] 6/9 TheUstad gate: ${ustad}` +
+			(forkCrew ? ` (combined ${candidates[0].candidate_sha})` : ""),
+	);
+	console.error(
+		`[Git4agents] 6/9 crew: concurrent_agents=${counts.concurrent_agents} ` +
+			`(parent=${counts.parent_agents}, sub_agents=${counts.sub_agents}), contenders=${counts.contenders}`,
+	);
 	await requestJson(`${baseUrl}/tasks/${encodeURIComponent(taskId)}/verifiers/labels`, {
 		token: controlToken,
 		body: { candidate_shas: candidates.map((c) => c.candidate_sha) },
@@ -367,7 +568,7 @@ try {
 		};
 	});
 
-	console.error("[madgrix-live] 7/9 execute Verdict Seam and issue exact-state permit");
+	console.error("[Git4agents] 7/9 execute Verdict Seam and issue exact-state permit");
 	const verdictResponse = await requestJson(`${baseUrl}/tasks/${encodeURIComponent(taskId)}/verdict`, {
 		token: controlToken,
 		body: { candidates: ranked, destination_repo: destinationRepo },
@@ -379,91 +580,67 @@ try {
 	const winnerIndex = candidates.findIndex((c) => c.candidate_sha === verdictResponse.verdict.winner_sha);
 	if (winnerIndex < 0) throw new Error("verdict winner is not in the contender set");
 	const winner = candidates[winnerIndex];
-	const winnerEval = evalResults[winnerIndex];
 
-	console.error("[madgrix-live] 8/9 promote the exact reviewed commit to canonical Artifacts state");
-	const promotion = await requestJson(`${baseUrl}/tasks/${encodeURIComponent(taskId)}/promote`, {
+	console.error("[Git4agents] 8/9 promote the exact reviewed commit to canonical Artifacts state");
+	// POST /promote starts the permit's PromotionWorkflow instance (202); the
+	// promotion's answer is the instance's result once it is complete.
+	const started = await requestJson(`${baseUrl}/tasks/${encodeURIComponent(taskId)}/promote`, {
 		token: controlToken,
 		body: { permit_id: permit.permit_id },
 	});
-	if (promotion.outcome !== "PROMOTED" || promotion.promoted_sha !== winner.candidate_sha) {
-		throw new Error(`exact-state promotion failed: ${JSON.stringify(promotion)}`);
+	if (started.instance_id !== permit.permit_id || typeof started.status_url !== "string") {
+		throw new Error(`POST /promote did not start the permit's promotion: ${JSON.stringify(started)}`);
+	}
+	const promotionDeadline = Date.now() + promotionTimeoutMs;
+	let instance = started;
+	for (;;) {
+		instance = await requestJson(`${baseUrl}${started.status_url}`, { token: controlToken });
+		if (instance.status !== "queued" && instance.status !== "running" && instance.status !== "waiting") break;
+		if (Date.now() >= promotionDeadline) {
+			throw new Error(`promotion still ${instance.status} after ${promotionTimeoutMs} ms: ${JSON.stringify(instance)}`);
+		}
+		await sleep(PROMOTION_POLL_MS);
+	}
+	const promotion = instance.result?.body ?? {};
+	if (
+		instance.status !== "complete" ||
+		instance.result?.status !== 200 ||
+		promotion.outcome !== "PROMOTED" ||
+		promotion.promoted_sha !== winner.candidate_sha
+	) {
+		throw new Error(`exact-state promotion failed: ${JSON.stringify(instance)}`);
 	}
 
-	console.error("[madgrix-live] 9/9 build signed evidence bundle and verify it offline");
-	const policyHash = await sha256Hex(SELECTOR_POLICY_INPUT);
-	const testConfigDigest = await sha256Hex(
-		canonicalJson({
-			hidden: hiddenCommand,
-			regression: env.MADGRIX_REGRESSION_COMMAND ?? hiddenCommand,
-			semantic: env.MADGRIX_SEMANTIC_COMMAND ?? null,
-			static: env.MADGRIX_STATIC_COMMAND ?? null,
-			security: env.MADGRIX_SECURITY_COMMAND ?? null,
-		}),
+	console.error("[Git4agents] 9/9 fetch the authority-signed bundle and verify it offline");
+	// The TaskAuthority signed the ship record at /promotion/finalize from its
+	// own state (amendment authority-signing-v1); nothing is built locally.
+	const bundle = await requestJson(
+		`${baseUrl}/tasks/${encodeURIComponent(taskId)}/bundle?permit_id=${encodeURIComponent(permit.permit_id)}`,
+		{ token: controlToken },
 	);
-	const link = await buildLinkStatement({
-		baselineCommit: baselineCommit as string,
-		candidateCommit: winner.candidate_sha,
-		treeSha256: winnerEval.bundle.tree_sha256,
-	});
-	const testResult = await buildTestResultStatement({
-		treeSha256: winnerEval.bundle.tree_sha256,
-		candidateCommit: winner.candidate_sha,
-		testConfigDigest,
-		result:
-			winnerEval.bundle.hidden_oracle.passed && winnerEval.bundle.regressions.passed ? "PASS" : "FAIL",
-	});
-	const verificationResult = await buildVerificationResultStatement({
-		treeSha256: winnerEval.bundle.tree_sha256,
-		candidateCommit: winner.candidate_sha,
-		policySha256: policyHash,
-		result: "PASSED",
-	});
-	const authority = await buildPromotionAuthority({
-		taskHash,
-		baselineCommit: baselineCommit as string,
-		candidateRepo: winner.fork_repo,
-		candidateCommit: winner.candidate_sha,
-		treeSha256: winnerEval.bundle.tree_sha256,
-		evaluationBundleHash: winnerEval.bundle.bundle_hash,
-		verificationResult: "PASSED",
-		policySha256: policyHash,
-		destinationRepo: destinationRepo as string,
-		expectedParent: permit.expected_destination_head,
-		nonce: permit.nonce,
-		permitId: permit.permit_id,
-		issuedAt: permit.issued_at,
-	});
-	const authoritySigner = createEd25519Signer();
-	const statements = [];
-	for (const statement of [link, testResult, verificationResult, authority]) {
-		statements.push(await signEnvelope(statement, authoritySigner));
+	if (bundle?.ship?.permit_id !== permit.permit_id || bundle?.ship?.commit !== promotion.promoted_sha) {
+		throw new Error("the Worker's promotion bundle does not describe this promotion");
 	}
-	const bundle: PromotionBundle = {
-		version: 1,
-		statements,
-		ship: {
-			repo: destinationRepo as string,
-			commit: winner.candidate_sha,
-			tree_sha256: winnerEval.bundle.tree_sha256,
-			parent: permit.expected_destination_head,
-			permit_id: permit.permit_id,
-		},
-		ledger_hashes: [permit.permit_id],
-		authority_pubkey_der_hex: authoritySigner.publicKeyDerHex,
-	};
-	const verified = await verifyBundle(bundle, authoritySigner, { policyHash });
-	if (!verified.verified) throw new Error(`new promotion bundle failed self-verification: ${JSON.stringify(verified.lines)}`);
 	await mkdir(path.dirname(bundlePath), { recursive: true });
 	await writeFile(bundlePath, JSON.stringify(bundle, null, 2) + "\n", "utf8");
-	await run("node", ["src/cli/verify.ts", bundlePath]);
+	// Offline verification needs no credential. Trust comes from the pinned
+	// authority key (MADGRIX_TRUST_KEY, else keys/authority.pub), never from
+	// the key embedded in the bundle.
+	const trustKeyArgs = env.MADGRIX_TRUST_KEY ? ["--trust-key", path.resolve(env.MADGRIX_TRUST_KEY)] : [];
+	await run("node", ["src/cli/verify.ts", ...trustKeyArgs, bundlePath], { env: minimalEnv() });
 
 	console.log(
 		JSON.stringify(
 			{
+				name: "Git4agents",
 				status: "MADGRIX_LIVE_E2E_OK",
+				public_url: baseUrl,
 				task_id: taskId,
-				concurrent_agents: candidates.length,
+				concurrent_agents: counts.concurrent_agents,
+				contenders: counts.contenders,
+				sub_agents: counts.sub_agents,
+				theustad: ustad,
+				combined_sha: forkCrew ? candidates[0].candidate_sha : null,
 				winner: winner.candidate_sha,
 				promoted_sha: promotion.promoted_sha,
 				permit_id: permit.permit_id,

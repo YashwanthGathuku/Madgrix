@@ -46,6 +46,7 @@ import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { execFile } from "node:child_process";
+import { generateKeyPairSync } from "node:crypto";
 import { promisify } from "node:util";
 
 import {
@@ -59,6 +60,8 @@ import {
 	forkIdempotent,
 } from "../lib/artifacts-port.ts";
 import { FakeArtifacts } from "../lib/fake-artifacts.ts";
+import { treeDigestOfFiles } from "../lib/tree-digest.ts";
+import { fakePromote } from "./fake-container.ts";
 import {
 	attemptPromotion,
 	commitVerifier,
@@ -67,6 +70,7 @@ import {
 	ingestQueueEvent,
 	issuePermit,
 	quarantineContender,
+	recordPromotionBundle,
 	registerClaim,
 	registerOperatorKeys,
 	registerVerifierKeys,
@@ -88,15 +92,8 @@ import {
 } from "../lib/evaluation.ts";
 import { createCommitment, type DeterministicVerifier } from "../lib/verifiers.ts";
 import { tallyVotes } from "../lib/verdict-seam.ts";
-import {
-	buildLinkStatement,
-	buildPromotionAuthority,
-	buildTestResultStatement,
-	buildVerificationResultStatement,
-	signEnvelope,
-	verifyBundle,
-	type PromotionBundle,
-} from "../lib/attestation.ts";
+import { verifyBundle } from "../lib/attestation.ts";
+import { loadAuthoritySigner } from "../lib/authority-key.ts";
 import { createEd25519Signer } from "../lib/signer-node.ts";
 import { SELECTOR_POLICY_INPUT } from "../do/TaskAuthority.ts";
 import {
@@ -136,6 +133,8 @@ export interface SliceResult {
 	replayOutcome: string;
 	permitId: string;
 	bundlePath: string;
+	/** The harness authority's public key (PEM), pinned when verifying the bundle. */
+	trustKeyPath: string;
 	verified: boolean;
 }
 
@@ -375,6 +374,7 @@ export async function runSlice(opts: SliceOptions = {}): Promise<SliceResult> {
 			agent_id: cid,
 			fork_repo: forkName,
 			fork_lineage: { parent_repo: "canonical", parent_commit: baseline },
+			fork_base: baseline,
 			token_id: tok.id,
 			status: "forked",
 			claim_work_id: workIds[cid],
@@ -406,10 +406,8 @@ export async function runSlice(opts: SliceOptions = {}): Promise<SliceResult> {
 		},
 	};
 	const candidateShas: Record<string, string> = {};
-	const candidateMessages: Record<string, string> = {};
 	for (const cid of contenderIds) {
 		const message = `${cid}: fix isTokenExpired`;
-		candidateMessages[cid] = message;
 		const sha = await fake.pushAsToken({
 			repo: forkNames[cid],
 			ref: "main",
@@ -446,7 +444,7 @@ export async function runSlice(opts: SliceOptions = {}): Promise<SliceResult> {
 		check(r.outcome === "ACK_DUP", "duplicate delivery must be ACK_DUP");
 		log(`duplicate delivery of contender-1's event → ${r.outcome} (no state change, no effects)`);
 	}
-	// (b) event for an unknown repo → REJECTED_OUT_OF_ORDER
+	// (b) event for an unknown repo → REJECTED_UNKNOWN_REPO
 	{
 		const r = await ingestQueueEvent(
 			state,
@@ -454,7 +452,7 @@ export async function runSlice(opts: SliceOptions = {}): Promise<SliceResult> {
 			ctx,
 		);
 		state = r.state;
-		check(r.outcome === "REJECTED_OUT_OF_ORDER", "unknown repo must be REJECTED_OUT_OF_ORDER");
+		check(r.outcome === "REJECTED_UNKNOWN_REPO", "unknown repo must be REJECTED_UNKNOWN_REPO");
 		log(`event for unknown repo 'ghost-repo' → ${r.outcome} (ledgered, not applied)`);
 
 	}
@@ -503,7 +501,9 @@ export async function runSlice(opts: SliceOptions = {}): Promise<SliceResult> {
 		});
 		const meta = await repo.readCommit(candidateShas[cid]);
 		check(meta !== null, `commit ${short(candidateShas[cid])} must exist`);
-		const treeSha256 = (meta as { treeHash: string }).treeHash;
+		// tree-digest/v1 (specs/amendments/tree-digest-v1.md), the digest the
+		// promotion container recomputes before it writes.
+		const treeSha256 = await treeDigestOfFiles(tree);
 
 		// The evaluator must NOT be able to write with its read token.
 		let scopeDenied = false;
@@ -613,11 +613,14 @@ export async function runSlice(opts: SliceOptions = {}): Promise<SliceResult> {
 	section("7/11", "BLIND VERIFIERS — commit → anonymized judge → reveal → signed report");
 	// The authority's attestation signer (in-toto envelopes, §10). This is
 	// NOT a verifier key — the verifiers' own signers were created and
-	// their keys registered at task freeze above. SIMULATION SUBSTRATE:
-	// production uses Sigstore per spec 4 §6; the DSSE envelope shape is
-	// identical, only the key backend differs. The key lives in the
-	// control plane only.
-	const signer = createEd25519Signer();
+	// their keys registered at task freeze above. It is the harness's
+	// AUTHORITY_SIGNING_KEY: a fresh Ed25519 PKCS8 key loaded through the
+	// same code the TaskAuthority uses in production. Its public half is
+	// written next to the bundle and pinned by the verifier (§11).
+	const harnessAuthorityKey = generateKeyPairSync("ed25519");
+	const signer = await loadAuthoritySigner(
+		harnessAuthorityKey.privateKey.export({ type: "pkcs8", format: "pem" }).toString(),
+	);
 
 	function makeVerifier(verifier_id: string, aspect: string): DeterministicVerifier {
 		return {
@@ -822,7 +825,8 @@ export async function runSlice(opts: SliceOptions = {}): Promise<SliceResult> {
 	check(canonicalHeadBefore === baseline, "canonical head must still be the baseline");
 	const ip = await issuePermit(state, record.winner_sha as string, "canonical", canonicalHeadBefore as string, ctx);
 	state = ip.state;
-	const permit = ip.permit;
+	check(ip.outcome === "ISSUED" && ip.permit !== null, `a permit at the fork base must be ISSUED (got ${ip.outcome})`);
+	const permit = ip.permit!;
 	log(`permit issued: ${permit.permit_id}`);
 	log(`  binds task + baseline + winning tree + eval bundle + policy + expected destination head`);
 
@@ -833,23 +837,32 @@ export async function runSlice(opts: SliceOptions = {}): Promise<SliceResult> {
 	check(a1.outcome === "PROMOTED", `first attempt must PROMOTE (got ${a1.outcome})`);
 	log(`attemptPromotion #1 → ${a1.outcome}`);
 	let promotedSha = "";
+	let promotedParent = "";
 	for (const e of a1.effects) {
 		if (e.kind === "canonical_write") {
-			// The promotion service is the ONLY canonical writer (spec 3 §2).
-			// The write preserves the candidate commit BIT-FOR-BIT (same
-			// parents, tree, message → same SHA, as in real git): what was
+			// The promotion service is the ONLY canonical writer (spec 3 §2):
+			// the promotion container's procedure (container/promote.sh, run
+			// here over FakeArtifacts by src/harness/fake-container.ts)
+			// fast-forwards the canonical main from the permit-bound head to the
+			// reviewed commit itself. No commit is created, so what was
 			// reviewed at SHA X is what ships at SHA X. verifyBundle's
 			// "candidate digest" line checks exactly this — no substitution
 			// between review and ship (spec 3 §6 attack #7).
 			log(`  executing canonical_write effect via the promotion service (sole canonical writer)`);
-			log(`  promotion preserves the reviewed commit bit-for-bit (same parents/tree/message → same SHA, as in real git)`);
-			promotedSha = await fake.adminPush({
-				repo: "canonical",
-				ref: "main",
-				tree: candidateTrees["contender-1"],
-				message: candidateMessages["contender-1"],
-				parents: [canonicalHeadBefore as string],
+			const promoted = await fakePromote(fake, {
+				source: forkNames["contender-1"],
+				destination: e.repo,
+				candidate_sha: e.commit,
+				expected_head: e.base,
+				winning_tree_sha256: e.tree_sha256,
 			});
+			check(
+				promoted.status === 200 && promoted.body.outcome === "PROMOTED",
+				`the promotion container must promote (got ${promoted.status} ${promoted.body.outcome})`,
+			);
+			promotedSha = promoted.body.promoted_sha as string;
+			promotedParent = promoted.body.parent as string;
+			log(`  fast-forward ${short(e.base)} → ${short(promotedSha)} (base ${short(promoted.body.base as string)}, parent ${short(promotedParent)})`);
 			check(promotedSha === (record.winner_sha as string), "promoted commit must be the reviewed candidate commit (no substitution)");
 		}
 	}
@@ -870,84 +883,36 @@ export async function runSlice(opts: SliceOptions = {}): Promise<SliceResult> {
 	/* ================= [10] ATTESTATION ================= */
 	section("10/11", "ATTESTATION — in-toto chain → signed promotion bundle");
 	const winnerSha = record.winner_sha as string;
-	const winnerBundle = state.evaluations[winnerSha];
-	const testConfigDigest = await sha256Hex(
-		canonicalJson({
-			visible: ["expired token (100,200) -> true", "valid token (300,200) -> false"],
-			hidden: ["boundary (200,200) -> true", "zero (0,0) -> true"],
-			policy: "slice-eval-policy/0.1.0",
-		}),
-	);
-	const link = await buildLinkStatement({
-		baselineCommit: baseline,
-		candidateCommit: winnerSha,
-		treeSha256: winnerTree,
-	});
-	const testResult = await buildTestResultStatement({
-		treeSha256: winnerTree,
-		candidateCommit: winnerSha,
-		testConfigDigest,
-		result: "PASS",
-	});
-	const verificationResult = await buildVerificationResultStatement({
-		treeSha256: winnerTree,
-		candidateCommit: winnerSha,
-		policySha256: selectorPolicyHash,
-		result: "PASSED",
-	});
-	const authority = await buildPromotionAuthority({
-		taskHash: task_hash,
-		baselineCommit: baseline,
-		candidateRepo: forkNames["contender-1"],
-		candidateCommit: winnerSha,
-		treeSha256: winnerTree,
-		evaluationBundleHash: winnerBundle.bundle_hash,
-		verificationResult: "PASSED",
-		policySha256: selectorPolicyHash,
-		destinationRepo: "canonical",
-		expectedParent: canonicalHeadBefore as string,
-		nonce: permit.nonce,
-		permitId: permit.permit_id,
-		issuedAt: permit.issued_at,
-	});
-	const statements = [];
-	for (const st of [link, testResult, verificationResult, authority]) {
-		statements.push(await signEnvelope(st, signer));
-	}
-	log(`signed 4 DSSE envelopes (link → test result → verification result → promotion authority)`);
-	const bundle: PromotionBundle = {
-		version: 1,
-		statements,
-		ship: {
-			repo: "canonical",
-			commit: promotedSha,
-			tree_sha256: winnerTree,
-			parent: canonicalHeadBefore as string,
-			permit_id: permit.permit_id,
-		},
-		ledger_hashes: [permit.permit_id],
-		authority_pubkey_der_hex: signer.publicKeyDerHex,
-	};
-	// Sanity: the bundle verifies with the full signer before writing.
-	const pre = await verifyBundle(bundle, signer, { policyHash: selectorPolicyHash });
+	// The ship record is built and signed from the authority state by the same
+	// function the TaskAuthority runs at /promotion/finalize.
+	const recorded = await recordPromotionBundle(state, permit.permit_id, { commit: promotedSha, parent: promotedParent }, signer, ctx);
+	state = recorded.state;
+	const bundle = recorded.bundle;
+	log(`signed 4 DSSE envelopes (link → test result → verification result → promotion authority) with the harness authority key`);
+	log(`  ledger: ${bundle.ledger.entries.length} hash-chained entries; head ${short(bundle.ledger.head_sha256)} signed into the authority statement`);
+	// Sanity: the bundle verifies against the pinned harness key before writing.
+	const pre = await verifyBundle(bundle, signer, { policyHash: selectorPolicyHash, trustedKeyDerHex: signer.publicKeyDerHex });
 	check(pre.verified, `bundle must verify before writing (failing: ${pre.lines.filter((l) => l.status === "FAIL").map((l) => l.label).join(", ")})`);
 	await mkdir(outDir, { recursive: true });
 	const bundlePath = path.resolve(outDir, "promotion.bundle");
 	await writeFile(bundlePath, JSON.stringify(bundle, null, 2));
+	const trustKeyPath = path.resolve(outDir, "authority.pub");
+	await writeFile(trustKeyPath, harnessAuthorityKey.publicKey.export({ type: "spki", format: "pem" }).toString());
 	log(`promotion bundle written to ${bundlePath}`);
+	log(`harness authority public key (pinned by the verifier) written to ${trustKeyPath}`);
 
 	/* ================= [11] OFFLINE VERIFY ================= */
 	section("11/11", "OFFLINE VERIFY — $ verify promotion.bundle");
 	// Invoke the real CLI as a subprocess (the same command an operator runs).
 	const { stdout, stderr } = await execFileAsync(
 		process.execPath,
-		[path.resolve("src/cli/verify.ts"), bundlePath],
+		[path.resolve("src/cli/verify.ts"), "--trust-key", trustKeyPath, bundlePath],
 		{ cwd: path.resolve(".") },
 	).catch((e: { stdout?: string; stderr?: string; message?: string }) => {
 		throw new Error(`verify CLI failed: ${e.message}\nstdout: ${e.stdout}\nstderr: ${e.stderr}`);
 	});
 	if (stderr.trim() !== "") log(`verify stderr: ${stderr.trim()}`);
-	log(`$ node src/cli/verify.ts ${path.relative(".", bundlePath)}`);
+	log(`$ node src/cli/verify.ts --trust-key ${path.relative(".", trustKeyPath)} ${path.relative(".", bundlePath)}`);
 	for (const line of stdout.split("\n")) log(`  ${line}`);
 	check(stdout.trimEnd().endsWith("VERIFIED"), "verify CLI transcript must end with VERIFIED");
 	check(!stdout.includes("FAIL") && !stdout.includes("NOT VERIFIED"), "verify CLI must show no FAIL");
@@ -963,6 +928,7 @@ export async function runSlice(opts: SliceOptions = {}): Promise<SliceResult> {
 		replayOutcome: a2.outcome,
 		permitId: permit.permit_id,
 		bundlePath,
+		trustKeyPath,
 		verified: true,
 	};
 }

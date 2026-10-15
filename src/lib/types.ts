@@ -97,6 +97,13 @@ export interface WorkClaim {
 	lease: { claimed_at: string; expires_at: string };
 	status: ClaimStatus;
 	version: number;
+	/**
+	 * SHA-256 (hex) of the per-agent secret that /claim returns once.
+	 * Assigned by the authority, never accepted from the caller, never
+	 * returned by the Worker's public routes. Absent on claims registered
+	 * before agent binding (specs/amendments/contender-agent-binding.md).
+	 */
+	agent_secret_sha256?: string;
 }
 
 export type ConflictRisk = "GREEN" | "AMBER" | "RED" | "BLOCKED";
@@ -131,10 +138,45 @@ export interface ContenderRecord {
 	fork_lineage: { parent_repo: string; parent_commit: string };
 	/** Token id (NOT the plaintext) for auditability. */
 	token_id: string;
+	/**
+	 * Every token id minted for this contender; quarantine revokes all of
+	 * them. Absent on records written before this field existed, which
+	 * carry only `token_id`.
+	 */
+	token_ids?: string[];
 	status: ContenderStatus;
 	claim_work_id: string | null;
 	/** Last observed commit SHA on the contender's branch. */
 	latest_commit: string | null;
+	/**
+	 * The commit the contender's fork was created at: the task's baseline
+	 * commit (registerContender refuses any other). Every candidate the
+	 * contender pushes on its fork descends from it, so a permit may bind it
+	 * as the destination head (specs/amendments/rebase-ancestry-v1.md).
+	 */
+	fork_base: string;
+	/**
+	 * What the rebase service (container/rebase.sh) reported for this
+	 * contender, in order: each record says `onto` is an ancestor of
+	 * `new_sha`. Absent until the first rebase.
+	 */
+	rebases?: RebaseRecord[];
+}
+
+/**
+ * One rebase of a contender's candidate onto a destination head
+ * (specs/amendments/rebase-ancestry-v1.md). REBASED: container/rebase.sh
+ * replayed `from_sha` onto `onto` and pushed the result, `new_sha`, to the
+ * contender's fork. UP_TO_DATE: `from_sha` already descended from `onto`;
+ * nothing was pushed and `new_sha` is `from_sha`. Either way the authority
+ * may bind `onto` as the destination head of a permit for `new_sha`.
+ */
+export interface RebaseRecord {
+	outcome: "REBASED" | "UP_TO_DATE";
+	from_sha: string;
+	onto: string;
+	new_sha: string;
+	at: string;
 }
 
 /** Admission gates (spec 1 §6). All boolean; evaluated by the control plane. */
@@ -174,6 +216,57 @@ export interface EvaluationBundle {
 	evaluated_at: string;
 	/** Set true when the contender is quarantined (spec 3 §7). */
 	tainted: boolean;
+	/**
+	 * SHA-256 (64 lowercase hex) of the evaluation domain's canonical
+	 * configuration: the commands, test globs, hidden-test digest, evaluator
+	 * version and runtime it evaluated under (spec 1 §7: all evaluation inputs
+	 * MUST be hashed into the bundle; specs/amendments/evaluation-config-digest-v1.md).
+	 * scripts/evaluate-candidate.ts always sets it. Bundles from the in-process
+	 * slice harness, and bundles recorded before this field existed, lack it.
+	 */
+	evaluation_config_sha256?: string;
+	/**
+	 * The commit whose runner configuration and test material the evaluation
+	 * ran with, and against which it computed the candidate's changes: the
+	 * newest of the contender's known bases (fork base, recorded rebase
+	 * heads) that the candidate descends from. submitEvaluation refuses a
+	 * base the authority does not know (specs/amendments/rebase-ancestry-v1.md).
+	 * scripts/evaluate-candidate.ts always sets it; bundles from the in-process
+	 * harnesses, and bundles recorded before this field existed, lack it.
+	 */
+	evaluation_base?: string;
+	/**
+	 * The evaluation files the candidate changed: runner configuration and
+	 * test material, as the evaluator classifies them
+	 * (specs/amendments/evidence-integrity-v1.md). A non-empty list is an
+	 * "evaluation-file modification attempt" (spec 1 §9.5), so recording the
+	 * bundle quarantines the contender (specs/amendments/tamper-quarantine-v1.md).
+	 * scripts/evaluate-candidate.ts always sets it.
+	 */
+	eval_file_changes?: string[];
+	/**
+	 * Completed merge-artifact scan of this candidate
+	 * (specs/amendments/unresolved-merge-artifact-v1.md). Eligibility
+	 * requires status COMPLETE, scanner madgrix-merge-artifact/v1,
+	 * candidate_sha and tree_sha256 equal to this bundle, and paths an
+	 * array of non-empty strings. This is the evaluation zone's statement.
+	 * It is not a blob the authority fetched. scripts/evaluate-candidate.ts
+	 * always sets it.
+	 */
+	merge_artifact_scan?: {
+		status: string;
+		scanner: string;
+		candidate_sha: string;
+		tree_sha256: string;
+		paths: string[];
+	};
+	/**
+	 * Same paths as merge_artifact_scan.paths, when a producer still sets
+	 * the earlier field. If it is present it must list the same paths in
+	 * the same order. A non-empty list is ineligible. Omitting it does not
+	 * omit the scan.
+	 */
+	unresolved_merge_artifacts?: string[];
 }
 
 /* ------------------------------------------------------------------ */
@@ -259,7 +352,124 @@ export type PromotionOutcome =
 	| "TREE_MISMATCH"
 	| "EVAL_BUNDLE_MISMATCH"
 	| "QUARANTINED_CANDIDATE"
-	| "UNKNOWN_PERMIT";
+	| "REVOKED_CANDIDATE"
+	| "AUTHORITY_EPOCH"
+	| "UNRESOLVED_CONFLICT"
+	| "UNKNOWN_PERMIT"
+	| "RESERVATION_MISMATCH"
+	| "PROMOTION_IN_FLIGHT"
+	| "TASK_ALREADY_PROMOTED"
+	| "BASELINE_MISMATCH"
+	| "UNSUPPORTED_TREE_ENTRY";
+
+/**
+ * Container outcomes whose promote.sh path exits before any destination ref
+ * update. PUSH_REJECTED is not in this list: the script maps every failed
+ * `git push` to it, and a dropped status after the remote accepted the
+ * update is not distinguishable from a rejected update.
+ * specs/amendments/promotion-terminal-abort-v1.md.
+ */
+export type TerminalNoWriteOutcome =
+	| "EXPIRED_HEAD_MOVED"
+	| "TREE_MISMATCH"
+	| "BASELINE_MISMATCH"
+	| "UNRESOLVED_CONFLICT"
+	| "UNSUPPORTED_TREE_ENTRY";
+
+/**
+ * The promotion linearization point (specs/amendments/promotion-reservation-v1.md).
+ * Taken inside the task authority before any canonical write. Finalize consumes
+ * this reservation; it does not re-decide authority for the reserved write.
+ */
+export interface PromotionReservation {
+	permit_id: string;
+	contender_id: string;
+	candidate_sha: string;
+	tree_sha256: string;
+	expected_destination_head: string;
+	evaluation_bundle_hash: string;
+	/** SHA-256 of the refusal-relevant authority snapshot at beginPromotion. */
+	authority_epoch: string;
+	promotion_nonce: string;
+	destination_repo: string;
+	/** Contender fork at reservation time. Token mint uses this, not a later read. */
+	source_repo: string;
+	/** Permit issued_at, so the container request does not re-read the permit. */
+	issued_at: string;
+	task_hash: string;
+	baseline_commit: string;
+	selector_policy_hash: string;
+	status: "IN_FLIGHT" | "FINALIZED" | "ABORTED";
+	/**
+	 * Present only when status is ABORTED. The container outcome that proved
+	 * this promotion did not update the destination ref.
+	 */
+	abort_reason?: TerminalNoWriteOutcome;
+}
+
+/**
+ * Fork-crew composition (specs/amendments/composition-result-v1.md).
+ * Only COMPOSED and RESOLVED name a promotable candidate SHA. CONFLICTED,
+ * PENDING, COMPOSING, and RESOLVING do not. RESOLVED names a new SHA that
+ * still needs its own evaluation.
+ */
+export type CompositionStatus = "PENDING" | "COMPOSING" | "COMPOSED" | "CONFLICTED" | "RESOLVING" | "RESOLVED";
+
+export interface CompositionFile {
+	path: string;
+	classification: "textual-line-overlap";
+	sides: Array<{ agent_id: string; role: string; intent: string; sha: string; excerpt: string }>;
+}
+
+export interface CompositionAgent {
+	id: string;
+	role: string;
+	intent: string;
+	sha: string;
+	paths: string[];
+	claim_work_id: string | null;
+}
+
+export interface CompositionRecord {
+	status: CompositionStatus;
+	contender_id: string;
+	baseline: string;
+	agents: CompositionAgent[];
+	contributing_shas: string[];
+	files: CompositionFile[];
+	/** Set only for COMPOSED and RESOLVED. Null for every other state. */
+	candidate_sha: string | null;
+}
+
+/**
+ * One contender that is a crew, not a single coding agent.
+ * Promotion still binds one exact candidate SHA. This record does not
+ * replace the permit. candidate_sha is that SHA only when the outcome is
+ * COMPOSED or RESOLVED; otherwise it is null.
+ */
+export interface CrewMember {
+	agent_id: string;
+	role: string;
+	intent: string;
+	scope: string[];
+	claim_work_id: string | null;
+	commit_sha: string | null;
+	status: string;
+}
+
+export interface CrewContender {
+	contender_id: string;
+	parent: {
+		agent_id: string;
+		authority: "parent";
+		contender_id: string;
+		fork_repo: string;
+	};
+	members: CrewMember[];
+	baseline: string;
+	outcome: CompositionStatus;
+	candidate_sha: string | null;
+}
 
 /* ------------------------------------------------------------------ */
 /* Quarantine (spec 1 §9.5, spec 3 §7 — FROZEN lifecycle)               */
@@ -293,6 +503,19 @@ export interface QuarantineRecord {
 	status: QuarantineStatus;
 	reviewed_by: string | null;
 	review_note: string | null;
+	/**
+	 * SHAs that can never be promoted for this contender: the candidate SHAs
+	 * at quarantine entry, plus any SHA whose evidence arrived while
+	 * QUARANTINED. Absent on a record that predates the epoch. A RELEASED
+	 * review does not clear the list (specs/amendments/quarantine-authority-epoch-v1.md).
+	 */
+	blocked_candidate_shas?: string[];
+	/**
+	 * Permit ids that existed when quarantine was entered. They never authorize
+	 * a canonical write, including after RELEASED. Absent on a record that
+	 * predates the epoch; a missing list fails closed.
+	 */
+	voided_permit_ids?: string[];
 }
 
 /* ------------------------------------------------------------------ */
@@ -305,6 +528,13 @@ export interface LedgerEntry {
 	ts: string;
 	kind: string;
 	payload_hash: string;
+	/** entry_hash of the previous entry; 64 zeros for the genesis entry. */
+	prev_hash: string;
+	/**
+	 * SHA-256 over canonical JSON of the five fields above (src/lib/ledger.ts).
+	 * "" until sealed: the genesis entry until the first append.
+	 */
+	entry_hash: string;
 }
 
 export interface AuthorityState {
@@ -312,6 +542,16 @@ export interface AuthorityState {
 	task_status: "frozen" | "verdict_reached" | "promoted" | "escalated" | "rejected";
 	contenders: Record<string, ContenderRecord>;
 	claims: WorkClaim[];
+	/**
+	 * Conflict reports from claim registration. Absent on authorities
+	 * created before the work-graph field existed.
+	 */
+	conflict_reports?: ConflictReport[];
+	/**
+	 * Fork-crew composition for this task. Absent until the control plane
+	 * records one. Only COMPOSED and RESOLVED name a promotable candidate.
+	 */
+	composition?: CompositionRecord;
 	/** Keyed by candidate_sha. */
 	evaluations: Record<string, EvaluationBundle>;
 	/** Keyed by verifier_id. */
@@ -329,6 +569,14 @@ export interface AuthorityState {
 	verdicts: VerdictRecord[];
 	/** Keyed by permit_id. */
 	permits: Record<string, PermitRecord>;
+	/**
+	 * Promotion reservations, keyed by permit_id. Absent until the first
+	 * beginPromotion. One IN_FLIGHT reservation per task. ABORTED is terminal
+	 * for that permit and does not block a different permit.
+	 * specs/amendments/promotion-reservation-v1.md,
+	 * specs/amendments/promotion-terminal-abort-v1.md.
+	 */
+	promotion_reservations?: Record<string, PromotionReservation>;
 	/** Keyed by contender_id. */
 	quarantine: Record<string, QuarantineRecord>;
 	/**
@@ -352,8 +600,45 @@ export interface AuthorityState {
 	 */
 	candidate_labels: Record<string, string>;
 	seen_event_keys: string[];
-	escalations: { reason: string; at: string; resolved: boolean }[];
+	escalations: EscalationRecord[];
 	ledger: LedgerEntry[];
+	/**
+	 * Authority-signed promotion bundles (ship records), keyed by the
+	 * consumed permit_id (spec 1 §11; amendment authority-signing-v1).
+	 * Absent until the task's first promotion.
+	 */
+	promotion_bundles?: Record<string, import("./attestation.ts").PromotionBundle>;
+	/**
+	 * Agent id → SHA-256 of the secret the control plane issued that agent at
+	 * task creation (specs/amendments/agent-enrollment-v1.md). When present,
+	 * only these agents may claim, and every claim, the first included, must
+	 * present the agent's secret. Absent on tasks initialized without
+	 * enrollment, whose first claim mints the secret instead.
+	 */
+	agent_enrollment?: Record<string, string>;
+}
+
+/** An escalation to the operator-of-record (spec 1 §9.4). */
+export interface EscalationRecord {
+	reason: string;
+	at: string;
+	resolved: boolean;
+	/**
+	 * Structured detail, kept out of `reason`: a rebase conflict's paths are
+	 * chosen by the contender (specs/amendments/rebase-ancestry-v1.md).
+	 */
+	data?: RebaseConflictData;
+}
+
+export interface RebaseConflictData {
+	kind: "rebase_conflict";
+	contender_id: string;
+	candidate_sha: string;
+	onto: string;
+	/** The conflicting paths as rebase.sh reported them (at most 1000). */
+	paths: string[];
+	/** How many paths rebase.sh reported. */
+	paths_total: number;
 }
 
 /** Queue push event (spec 5 §3). NOTE: event_key is derived from content,
