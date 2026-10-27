@@ -33,11 +33,12 @@ export function locate(repoPath) {
 }
 
 export function call(loc, cmd, params = {}, { interactive = false } = {}) {
-  const b64 = Buffer.from(JSON.stringify(params)).toString('base64');
+  const { credential, ...rest } = params;
+  const b64 = Buffer.from(JSON.stringify(credential ? { ...rest, credential_stdin: true } : rest)).toString('base64');
   const argv = loc.mode === 'system'
     ? ['sudo', ['-n', '-u', SYSTEM_USER, WRAP('g4a-authority'), loc.id, cmd, b64]]
     : [process.execPath, ['--no-warnings', SERVICE, '--root', loc.root, cmd, b64]];
-  const r = spawnSync(argv[0], argv[1], { encoding: 'utf8', stdio: ['ignore', 'pipe', interactive ? 'inherit' : 'pipe'], maxBuffer: 256 << 20 });
+  const r = spawnSync(argv[0], argv[1], { encoding: 'utf8', ...(credential ? { input: credential + '\n' } : {}), stdio: [credential ? 'pipe' : 'ignore', 'pipe', interactive ? 'inherit' : 'pipe'], maxBuffer: 256 << 20 });
   const line = (r.stdout || '').trim().split('\n').pop();
   try { return JSON.parse(line); } catch { return { ok: false, error: `authority call failed (exit ${r.status}): ${(r.stderr || '').trim().split('\n').slice(-2).join(' ') || line}` }; }
 }
@@ -47,8 +48,8 @@ export const uploadPack = (loc) => (loc.mode === 'system' ? `sudo -n -u ${SYSTEM
 const packArgs = (loc, kind) => { const v = kind === 'r' ? receivePack(loc) : uploadPack(loc); return v ? [`--${kind === 'r' ? 'receive' : 'upload'}-pack=${v}`] : []; };
 
 // push the agent branch with a fresh one-time permit to refs/heads/agents/<agent>
-export function pushAgent(loc, worktree, agent, sha) {
-  const pr = call(loc, 'permit', { agent });
+export function pushAgent(loc, worktree, agent, sha, credential) {
+  const pr = call(loc, 'permit', { agent, credential });
   if (!pr.ok) return pr;
   const r = safeGit(worktree, [...PROTO, 'push', '--quiet', '--porcelain', '-o', `permit=${pr.permit}`, ...packArgs(loc, 'r'), loc.url, `${sha}:refs/heads/agents/${agent}`], { allowFailure: true });
   if (r.status !== 0) return { ok: false, error: `authority refused the push: ${(r.stderr || '').split('\n').filter((l) => /refused|error/.test(l)).join(' ').trim() || `exit ${r.status}`}` };

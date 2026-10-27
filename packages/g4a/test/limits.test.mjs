@@ -178,8 +178,8 @@ test('A5 per-repo job queues: promotions in two repos run in parallel', async ()
   } finally { await stop(d); }
 });
 
-test('A5 node:sqlite feature check is explicit', async () => {
+test('A5 SQLite driver resolution is explicit', async () => {
   const A = await import('../src/authority.mjs');
   assert.equal(A.SQLITE.ok, true);
-  assert.equal(typeof A.requireSqlite(), 'function');
+  assert.equal(typeof A.requireSqlite().open, 'function');
 });

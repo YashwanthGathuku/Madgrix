@@ -151,7 +151,7 @@ function opts(args) {
     const a = args[i];
     if (!a.startsWith('--')) { o._.push(a); continue; }
     const k = a.slice(2);
-    if (['allow-overlap', 'system', 'detach', 'remove-worktree', 'no-wait', 'json', 'purge'].includes(k)) { o[k] = true; continue; }
+    if (['allow-overlap', 'system', 'detach', 'remove-worktree', 'no-wait', 'json', 'purge', 'session-credential', 'credential-stdin'].includes(k)) { o[k] = true; continue; }
     const v = args[++i];
     if (k === 'witness' || k === 'witness-path' || k === 'var') (o[k] ||= []).push(v); else o[k] = v;
   }
@@ -174,11 +174,14 @@ async function daemon(args) {
   const d = await startDaemon();
   console.error(`g4a daemon pid ${process.pid} on ${d.sock}${d.requeued ? ` (requeued ${d.requeued} job(s))` : ''}`);
 }
+// per-agent authority credential: --credential-stdin, else G4A_AGENT_CREDENTIAL, else the daemon's
+// file store. Never taken from argv (ps-visible).
+const credArg = (o) => { const c = o['credential-stdin'] ? fs.readFileSync(0, 'utf8').trim() : process.env.G4A_AGENT_CREDENTIAL; return c ? { credential: c } : {}; };
 async function claimCmd(args) {
   const o = opts(args);
-  out(await (await client())('claim', { repo: o.repo, agent: o.agent, paths: (o.paths || '').split(',').filter(Boolean), witnesses: o.witness || [], witnessPaths: o['witness-path'] || [], allowOverlap: !!o['allow-overlap'] }));
+  out(await (await client())('claim', { repo: o.repo, agent: o.agent, paths: (o.paths || '').split(',').filter(Boolean), witnesses: o.witness || [], witnessPaths: o['witness-path'] || [], allowOverlap: !!o['allow-overlap'], ...credArg(o), ...(o['session-credential'] ? { credentialStore: 'session' } : {}) }));
 }
-async function releaseCmd(args) { const o = opts(args); out(await (await client())('release', { repo: o.repo, agent: o.agent, removeWorktree: !!o['remove-worktree'] })); }
+async function releaseCmd(args) { const o = opts(args); out(await (await client())('release', { repo: o.repo, agent: o.agent, removeWorktree: !!o['remove-worktree'], ...credArg(o) })); }
 async function statusCmd(args) { const o = opts(args); out(await (await client())('status', { repo: o.repo })); }
 async function promoteCmd(args) {
   const o = opts(args);
@@ -187,7 +190,7 @@ async function promoteCmd(args) {
   const c = st.claims.find((x) => x.agent === o.agent);
   if (!c) { out({ ok: false, error: `no active claim for ${o.agent}` }); return; }
   const secret = fs.readFileSync(path.join(home, 'secrets', c.id), 'utf8'); // never printed
-  out(await rpc('promote', { repo: o.repo, agent: o.agent, secret, wait: !o['no-wait'] }));
+  out(await rpc('promote', { repo: o.repo, agent: o.agent, secret, wait: !o['no-wait'], ...credArg(o) }));
 }
 async function ledgerCmd(args) {
   const o = opts(args);
@@ -203,7 +206,7 @@ async function verifyCmd(args) {
   const C = await import('../src/authority-client.mjs');
   let bundle;
   if (o._[0]) bundle = JSON.parse(fs.readFileSync(o._[0], 'utf8'));
-  else { const db = A.openDb(home, { readOnly: true }); bundle = A.bundleFromDb(db, A.repoId(o.repo)); db.close(); }
+  else { const db = A.openDb(home, fs.existsSync(path.join(home, 'g4a.db')) ? { readOnly: true } : {}); bundle = A.bundleFromDb(db, A.repoId(o.repo)); db.close(); }
   const loc = o._[0] ? null : C.locate(o.repo);
   const anchors = A.collectAnchors(bundle.repo, A.keyDir(), { remote: o['anchor-remote'] || (loc ? C.clientAnchorRemote(loc) : process.env.G4A_ANCHOR_REMOTE) });
   const { safeGit } = await import('../../../scripts/lib/safe-git.mjs');
@@ -219,6 +222,7 @@ async function verifyCmd(args) {
       const av = await A.verifyBundle(L.bundle, { pinnedPub: apub, anchors: aAnchor ? [{ source: 'authority anchors.git', ...aAnchor }] : [{ source: 'authority anchors.git', missing: true }] });
       if (!av.ok) errors.push(...av.errors.map((e) => `authority: ${e}`));
       if (main !== L.main) errors.push(`local main ${main} differs from authority main ${L.main}`);
+      errors.push(...(await import('../src/refguard.mjs')).refGuardFindings(A.repoTop(o.repo)).map((e) => `out-of-band: ${e}`));
       const amap = new Map(L.bundle.entries.map((e) => [e.seq, e]));
       const aMains = new Set(L.bundle.entries.filter((e) => e.kind === 'promote').map((e) => e.payload.main_after));
       for (const e of bundle.entries.filter((x) => x.kind === 'promote')) {
@@ -281,24 +285,33 @@ async function authorityCmd(args) {
     const top = A.repoTop(o.repo), id = A.repoId(o.repo);
     if (args.includes('--system')) {
       const r = execFileSync('sudo', ['-n', process.execPath, '--no-warnings', path.join(PKG, 'src', 'system-install.mjs'), id, top], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'inherit'] });
-      return out(JSON.parse(r.trim().split('\n').pop()));
+      return out({ ...JSON.parse(r.trim().split('\n').pop()), ref_guard: (await import('../src/refguard.mjs')).installRefGuard(top) });
     }
     const dir = o._[1];
     if (!dir) { console.error('usage: g4a authority init --system [--repo R] | init DIR [--repo R]'); process.exitCode = 2; return; }
     const { initRoot } = await import('../src/authority-service.mjs');
     const r = initRoot({ root: path.resolve(dir), seed: top, clientRepo: id, mode: 'user' });
     safeGit(top, ['config', 'g4a.authority', path.resolve(dir)]);
-    return out({ ...r, note: 'same-user authority: the agent uid can still edit it; violations are DETECTED (audit/verify), not prevented. Use --system to prevent.' });
+    return out({ ...r, ref_guard: (await import('../src/refguard.mjs')).installRefGuard(top), note: 'same-user authority: the agent uid can still edit it; violations are DETECTED (audit/verify), not prevented. Use --system to prevent.' });
   }
   if (sub === 'uninstall' && args.includes('--system')) {
     const flag = args.includes('--purge') ? ['--purge'] : ['--uninstall', o['repo-id'] || A.repoId(o.repo)];
     const r = spawnSync('sudo', ['-n', process.execPath, '--no-warnings', path.join(PKG, 'src', 'system-install.mjs'), ...flag], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'inherit'] });
     try { return out(JSON.parse(r.stdout.trim().split('\n').pop())); } catch { return out({ ok: false, error: `uninstall failed (exit ${r.status})` }); }
   }
+  if (sub === 'rebind' || sub === 'unbind') await refuseAgent();
   const loc = C.locate(o.repo);
   if (!loc) { out({ ok: false, error: 'no authority for this repo (g4a authority init --system)' }); return; }
   if (['audit', 'status', 'ledger'].includes(sub)) return out(C.call(loc, sub));
-  console.error('usage: g4a authority init --system | init DIR | audit | status | ledger  [--repo R]'); process.exitCode = 2;
+  if (sub === 'rebind' || sub === 'unbind') {
+    // human-only: operator passphrase typed on /dev/tty, checked authority-side; logged with an operator signature
+    await refuseAgent();
+    if (!o.agent) { console.error('usage: g4a authority rebind --agent A [--uid N] [--credential-out FILE] | unbind --agent A'); process.exitCode = 2; return; }
+    const r = C.call(loc, sub, { agent: o.agent, ...(o.uid !== undefined ? { uid: Number(o.uid) } : {}) }, { interactive: true });
+    if (r.ok && r.credential && o['credential-out']) { fs.writeFileSync(o['credential-out'], r.credential, { mode: 0o600 }); delete r.credential; r.credential_file = path.resolve(o['credential-out']); }
+    return out(r);
+  }
+  console.error('usage: g4a authority init --system | init DIR | audit | status | ledger | rebind --agent A [--uid N] [--credential-out F] | unbind --agent A  [--repo R]'); process.exitCode = 2;
 }
 
 async function mcpCmd() { await (await import('../src/mcp.mjs')).serve(); }

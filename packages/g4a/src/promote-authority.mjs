@@ -11,19 +11,19 @@ import { call, pushAgent, fetchMain } from './authority-client.mjs';
 const ZERO = '0'.repeat(40);
 const rev = (top, r) => safeGit(top, ['rev-parse', '--verify', '--quiet', r], { allowFailure: true }).stdout.trim();
 
-export async function promoteViaAuthority(auth, claim, jobId, loc) {
+export async function promoteViaAuthority(auth, claim, jobId, loc, credential) {
   const top = repoTop(claim.worktree);
   const done = auth.db.prepare("SELECT 1 FROM ledger WHERE repo = ? AND kind = 'promote' AND json_extract(payload, '$.job') = ?").get(claim.repo, jobId);
   if (done) return { ok: true, status: 'already_recorded' };
   const candidate = rev(top, `refs/heads/${claim.branch}^{commit}`);
   if (!candidate || candidate === claim.baseline) return { ok: false, status: 'refused', reason: 'no commits on the claim branch' };
-  const pushed = pushAgent(loc, top, claim.agent, candidate);
+  const pushed = pushAgent(loc, top, claim.agent, candidate, credential);
   const base = { job: jobId, claim: claim.id, agent: claim.agent, via: `authority:${loc.mode}` };
   if (!pushed.ok) {
     await auth.serial(() => auth.appendLedger(claim.repo, 'promote_refused', { ...base, reason: 'authority_push_refused', detail: pushed.error }));
     return { ok: false, status: 'refused', reason: 'authority_push_refused', detail: pushed.error };
   }
-  const r = call(loc, 'land', { agent: claim.agent, candidate, job: jobId });
+  const r = call(loc, 'land', { agent: claim.agent, candidate, job: jobId, credential });
   if (!(r.ok && (r.status === 'promoted' || r.status === 'recovered' || r.status === 'already_in_main' || r.status === 'already_recorded'))) {
     const kind = r.status === 'review' ? 'promote_review' : 'promote_refused';
     await auth.serial(() => auth.appendLedger(claim.repo, kind, { ...base, verdict: r.verdict ?? (r.status === 'review' ? 'REVIEW' : 'REFUSE'), reason: r.reason ?? r.error ?? 'authority refused', paths: r.paths, authority_entry: r.authority_entry }));

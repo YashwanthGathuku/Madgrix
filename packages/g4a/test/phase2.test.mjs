@@ -99,10 +99,12 @@ test('items 1,3,6: promote via the authority, overlap review case, verify + audi
     assert.deepEqual(accepted(root).filter((x) => x.kind === 'push').map((x) => x.ref).sort(), ['refs/heads/agents/a1', 'refs/heads/agents/a2', 'refs/heads/agents/a3']);
     // item 6: a local main edit is detected against the authority
     const good = git(repo, 'rev-parse', 'main');
-    git(repo, 'update-ref', 'refs/heads/main', git(repo, 'rev-parse', `${good}~1`));
+    // (the git-CLI path is refused by the ref guard; a hook-skipping write is what remains)
+    assert.throws(() => git(repo, 'update-ref', 'refs/heads/main', git(repo, 'rev-parse', `${good}~1`)), /refused/);
+    git(repo, '-c', 'core.hooksPath=/dev/null', 'update-ref', 'refs/heads/main', git(repo, 'rev-parse', `${good}~1`));
     const v2 = cli(home, ['verify', '--repo', repo]);
     assert.equal(v2.json.ok, false); assert.match(JSON.stringify(v2.json.errors), /main/);
-    git(repo, 'update-ref', 'refs/heads/main', good);
+    git(repo, '-c', 'core.hooksPath=/dev/null', 'update-ref', 'refs/heads/main', good);
     // item 6: a local DB edit (delete the newest ledger row) is detected against the authority anchors
     await stop(d);
     const db = new DatabaseSync(path.join(home, 'g4a.db'));
@@ -131,13 +133,15 @@ test('items 3,5,6: pre-receive refuses unpermitted pushes, anchors are append-on
     assert.notEqual(push('-o', `permit=${fb}`, url, 'HEAD:refs/heads/agents/a1').status, 0, 'forged');
     const { call, locate } = await import('../src/authority-client.mjs');
     const loc = locate(repo);
-    const pm = call(loc, 'permit', { agent: 'a1' }).permit;
+    const cdir = path.join(home, 'credentials'); const credential = fs.readFileSync(path.join(cdir, fs.readdirSync(cdir)[0], 'a1'), 'utf8');
+    assert.equal(call(loc, 'permit', { agent: 'a1' }).reason, 'agent_identity', 'no credential: refused');
+    const pm = call(loc, 'permit', { agent: 'a1', credential }).permit;
     assert.equal(push('-o', `permit=${pm}`, url, 'HEAD:refs/heads/agents/a1').status, 0, 'permitted push');
     commitIn(w, 'a.txt', 'y\n');
     assert.notEqual(push('-o', `permit=${pm}`, url, 'HEAD:refs/heads/agents/a1').status, 0, 'replay');
     commitIn(w, 'b.txt', 'out of scope\n');
-    assert.notEqual(push('-o', `permit=${call(loc, 'permit', { agent: 'a1' }).permit}`, url, 'HEAD:refs/heads/agents/a1').status, 0, 'out-of-claim');
-    assert.notEqual(push('-o', `permit=${call(loc, 'permit', { agent: 'a1' }).permit}`, url, ':refs/heads/agents/a1').status, 0, 'delete');
+    assert.notEqual(push('-o', `permit=${call(loc, 'permit', { agent: 'a1', credential }).permit}`, url, 'HEAD:refs/heads/agents/a1').status, 0, 'out-of-claim');
+    assert.notEqual(push('-o', `permit=${call(loc, 'permit', { agent: 'a1', credential }).permit}`, url, ':refs/heads/agents/a1').status, 0, 'delete');
     assert.equal(accepted(root).length, 1, 'only the one permitted push is logged');
     // item 5: the anchor remote is append-only
     const anchors = path.join(root, 'anchors.git');

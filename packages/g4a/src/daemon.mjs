@@ -5,6 +5,7 @@ import net from 'node:net';
 import fs from 'node:fs';
 import path from 'node:path';
 import { EventEmitter } from 'node:events';
+import { createHash } from 'node:crypto';
 import { Authority, repoId, rowClaim } from './authority.mjs';
 import { promote } from './promote.mjs';
 import { promoteViaAuthority } from './promote-authority.mjs';
@@ -30,6 +31,13 @@ export async function startDaemon(home = g4aHome(), { hooks = {}, keyDir } = {})
   const auth = new Authority(home, { ...(keyDir ? { keyDir } : {}), anchorRemote: (repo) => { const l = locate(repo); return l && clientAnchorRemote(l); } });
   const requeued = auth.db.prepare("UPDATE jobs SET status = 'queued' WHERE status = 'running'").run().changes;
   const bus = new EventEmitter();
+  // Per-agent authority credentials. Default store: G4A_HOME/credentials/<repo-hash>/<agent> (0600,
+  // convenience; any process of the same uid can read it). credentialStore:'session' keeps it out of
+  // the daemon entirely: it is returned once to the claimant, who must present it on every call.
+  const credPath = (repo, agent) => path.join(home, 'credentials', createHash('sha256').update(repoId(repo)).digest('hex').slice(0, 16), agent);
+  const readCred = (repo, agent) => { try { return fs.readFileSync(credPath(repo, agent), 'utf8').trim(); } catch { return undefined; } };
+  const credOf = (p) => p.credential || readCred(p.repo, p.agent);
+  const jobCreds = new Map(); // jobId -> credential (memory only; a requeued job falls back to the file store)
   // Per-repo job queues: one worker per repo (promotions in a repo stay serialized so CAS and
   // frozen-intent order are deterministic); different repos run in parallel. Witnesses run in
   // a child process, so the event loop is free while one repo's witnesses execute.
@@ -47,7 +55,7 @@ export async function startDaemon(home = g4aHome(), { hooks = {}, keyDir } = {})
       else {
         const loc = locate(row.worktree);
         // default path: through the authority. Local landing is test-only (phase-1 fixtures).
-        if (loc) result = await promoteViaAuthority(auth, rowClaim(row), job.id, loc);
+        if (loc) { const cred = jobCreds.get(job.id) ?? readCred(row.worktree, row.agent); result = await promoteViaAuthority(auth, rowClaim(row), job.id, loc, cred); jobCreds.delete(job.id); }
         else if (process.env.G4A_LOCAL_LAND === '1') result = await promote(auth, rowClaim(row), job.id, hooks);
         else result = { ok: false, status: 'refused', reason: 'no_authority', hint: 'run `g4a authority init --system` (or `g4a authority init DIR`, same-user detect-only) for this repo' };
       }
@@ -81,15 +89,24 @@ export async function startDaemon(home = g4aHome(), { hooks = {}, keyDir } = {})
       const local = safeGit(p.repo, ['rev-parse', '--verify', '--quiet', 'refs/heads/main'], { allowFailure: true }).stdout.trim();
       const amain = fetchMain(loc, p.repo);
       if (local !== amain) return { ok: false, refused: 'main_out_of_sync', local, authority: amain };
-      const a = call(loc, 'claim', { agent: p.agent, paths: p.paths, witnesses: p.witnesses, witnessPaths: p.witnessPaths, allowOverlap: p.allowOverlap });
+      const a = call(loc, 'claim', { agent: p.agent, paths: p.paths, witnesses: p.witnesses, witnessPaths: p.witnessPaths, allowOverlap: p.allowOverlap, credential: credOf(p) });
       if (!a.ok) return { ...a, via: `authority:${loc.mode}` };
-      try { const r = await auth.claim(p); if (!r.ok) call(loc, 'release', { agent: p.agent }); return { ...r, authority: { mode: loc.mode, claim: a.id } }; }
-      catch (e) { call(loc, 'release', { agent: p.agent }); throw e; }
+      const cred = a.agent_credential ?? credOf(p);
+      let issued = {};
+      if (a.agent_credential) {
+        if (p.credentialStore === 'session') issued = { agent_credential: a.agent_credential, credential_store: 'session' };
+        else { const f = credPath(p.repo, p.agent); fs.mkdirSync(path.dirname(f), { recursive: true, mode: 0o700 }); fs.writeFileSync(f, a.agent_credential, { mode: 0o600 }); issued = { credential_store: 'file' }; }
+      }
+      try { const r = await auth.claim(p); if (!r.ok) call(loc, 'release', { agent: p.agent, credential: cred }); return { ...r, ...issued, authority: { mode: loc.mode, claim: a.id } }; }
+      catch (e) { call(loc, 'release', { agent: p.agent, credential: cred }); throw e; }
     },
     release: async (p) => {
-      const r = await auth.release(p);
+      // the authority decides first: a caller without the agent's credential cannot release it locally either
       const loc = locate(p.repo);
-      if (loc) r.authority = call(loc, 'release', { agent: p.agent });
+      const a = loc ? call(loc, 'release', { agent: p.agent, credential: credOf(p) }) : null;
+      if (a && !a.ok && a.reason === 'agent_identity') return { ok: false, status: 'refused', reason: 'agent_identity', error: a.error, authority: a };
+      const r = await auth.release(p);
+      if (a) r.authority = a;
       return r;
     },
     status: (p) => auth.status(p),
@@ -103,6 +120,7 @@ export async function startDaemon(home = g4aHome(), { hooks = {}, keyDir } = {})
       if (!row) return { ok: false, status: 'refused', reason: `no active claim for ${p.agent}` };
       if (!(await auth.checkSecret(row, p.secret))) return { ok: false, status: 'refused', reason: 'agent secret does not match the claim' };
       const id = p.jobId || `j_${Date.now().toString(36)}_${randomHex(4)}`;
+      if (p.credential) jobCreds.set(id, p.credential);
       auth.db.prepare('INSERT INTO jobs (id, kind, payload, status, created_at) VALUES (?, ?, ?, ?, ?)').run(id, 'promote', JSON.stringify({ claimId: row.id }), 'queued', new Date().toISOString());
       const done = new Promise((res) => bus.once(id, res));
       setImmediate(loop);

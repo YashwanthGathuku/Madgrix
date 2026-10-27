@@ -20,11 +20,12 @@ function mcp(env, cwd) {
   const waiting = new Map(); const lines = [];
   readline.createInterface({ input: c.stdout }).on('line', (l) => { const m = JSON.parse(l); lines.push(m); waiting.get(m.id)?.(m); waiting.delete(m.id); });
   let n = 0;
+  const reqId = (id, method, params) => new Promise((res) => { waiting.set(id, res); c.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n'); });
   const req = (method, params) => new Promise((res) => { const id = ++n; waiting.set(id, res); c.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n'); });
   const raw = (s) => c.stdin.write(s + '\n');
   const call = async (name, args) => (await req('tools/call', { name, arguments: args })).result;
   const close = () => new Promise((r) => { c.once('exit', r); c.stdin.end(); });
-  return { req, raw, call, close, lines };
+  return { req, reqId, raw, call, close, lines };
 }
 function startDaemon(env) {
   const c = spawn(process.execPath, ['--no-warnings', CLI, 'daemon'], { env, stdio: ['ignore', 'ignore', 'pipe'] });
@@ -93,6 +94,54 @@ test('mcp: claim -> commit -> promote (via authority) -> verify -> release round
     assert.equal((await s.call('g4a_status', { repo })).isError, false);
   } finally {
     await s.close(); await stop(d);
+    for (const x of [home, `${home}-keys`, repo, auth]) fs.rmSync(x, { recursive: true, force: true });
+  }
+});
+
+test('mcp: session credentials stay in memory; progress, cancellation and timeout on long promotes', async () => {
+  const home = tmp('g4a-mcp-home-'), repo = tmp('g4a-mcp-repo-'), auth = tmp('g4a-mcp-auth-');
+  const env = { ...process.env, G4A_HOME: home, G4A_KEY_DIR: `${home}-keys` };
+  git(repo, 'init', '-q', '-b', 'main'); for (const f of ['a.txt', 'b.txt', 'c.txt']) fs.writeFileSync(path.join(repo, f), f + '\n');
+  git(repo, 'add', '-A'); git(repo, 'commit', '-qm', 'base'); git(repo, 'checkout', '-q', '--detach');
+  execFileSync(process.execPath, ['--no-warnings', CLI, 'authority', 'init', path.join(auth, 'a'), '--repo', repo], { env, encoding: 'utf8' });
+  const d = await startDaemon(env);
+  const s = mcp({ ...env, G4A_MCP_SESSION_CREDENTIALS: '1' }, repo);
+  const t = mcp({ ...env, G4A_MCP_TIMEOUT_MS: '4000' }, repo);
+  try {
+    await s.req('initialize', { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 't', version: '0' } });
+    const c = await s.call('g4a_claim', { agent: 's1', paths: ['a.txt'], witnesses: ['sleep 3'] });
+    assert.equal(c.isError, false, c.content[0].text);
+    assert.ok(!JSON.stringify(c).includes('agent_credential'), 'credential never returned to the model');
+    assert.equal(fs.existsSync(path.join(home, 'credentials')) && fs.readdirSync(path.join(home, 'credentials'), { recursive: true }).some((f) => f.endsWith('s1')), false, 'session credential not on disk');
+    const wt = c.structuredContent.worktree;
+    fs.writeFileSync(path.join(wt, 'a.txt'), 'A\n'); git(wt, 'add', 'a.txt'); git(wt, 'commit', '-qm', 'edit a');
+    // a plain CLI promote without the credential is refused by the authority
+    const cliNo = (() => { try { return execFileSync(process.execPath, ['--no-warnings', CLI, 'promote', '--repo', repo, '--agent', 's1'], { env, encoding: 'utf8' }); } catch (e) { return e.stdout + e.stderr; } })();
+    assert.doesNotMatch(cliNo, /"status": ?"promoted"/);
+    const p = await s.req('tools/call', { name: 'g4a_promote', arguments: { agent: 's1' }, _meta: { progressToken: 'tok1' } });
+    assert.equal(p.result.structuredContent.status, 'promoted', p.result.content[0].text);
+    const prog = s.lines.filter((m) => m.method === 'notifications/progress' && m.params.progressToken === 'tok1');
+    assert.ok(prog.length >= 1, 'progress notifications sent during a slow witness');
+    assert.ok(prog.every((m, i) => i === 0 || m.params.progress > prog[i - 1].params.progress), 'progress increases');
+    assert.equal(git(repo, 'show', 'main:a.txt'), 'A');
+    // cancellation: no response for the cancelled id, the server keeps serving
+    const c2 = await s.call('g4a_claim', { agent: 's2', paths: ['b.txt'], witnesses: ['sleep 4'] });
+    const wt2 = c2.structuredContent.worktree; fs.writeFileSync(path.join(wt2, 'b.txt'), 'B\n'); git(wt2, 'add', 'b.txt'); git(wt2, 'commit', '-qm', 'edit b');
+    let answered = false; s.reqId(900, 'tools/call', { name: 'g4a_promote', arguments: { agent: 's2' } }).then(() => { answered = true; });
+    await new Promise((r) => setTimeout(r, 800));
+    s.raw(JSON.stringify({ jsonrpc: '2.0', method: 'notifications/cancelled', params: { requestId: 900, reason: 'user' } }));
+    assert.deepEqual((await s.req('ping', {})).result, {});
+    await new Promise((r) => setTimeout(r, 1000)); assert.equal(answered, false, 'cancelled request gets no response');
+    await new Promise((r) => setTimeout(r, 3500)); // let the daemon finish the cancelled client's job
+    // timeout: bounded, reported as a tool error that points at g4a_status
+    await t.req('initialize', { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 't', version: '0' } });
+    const c3 = await t.call('g4a_claim', { agent: 't1', paths: ['c.txt'], witnesses: ['sleep 12'] });
+    assert.equal(c3.isError, false, c3.content[0].text);
+    const wt3 = c3.structuredContent.worktree; fs.writeFileSync(path.join(wt3, 'c.txt'), 'C\n'); git(wt3, 'add', 'c.txt'); git(wt3, 'commit', '-qm', 'edit c');
+    const to = await t.call('g4a_promote', { agent: 't1' });
+    assert.equal(to.isError, true); assert.match(to.content[0].text, /timed out after 4000ms.*g4a_status/s);
+  } finally {
+    await s.close(); await t.close(); await stop(d);
     for (const x of [home, `${home}-keys`, repo, auth]) fs.rmSync(x, { recursive: true, force: true });
   }
 });

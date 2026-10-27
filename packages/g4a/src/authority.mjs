@@ -13,13 +13,10 @@ import { canonicalJson, sha256Hex, randomHex } from '../../../src/lib/canonical.
 import { safeGit } from '../../../scripts/lib/safe-git.mjs';
 import { witnessSignerFromKey } from '../../../scripts/lib/admission.mjs';
 
-// node:sqlite is experimental (Node >= 22.5). Feature-check it so an older or flag-less runtime
-// gets a clear error instead of a module-resolution crash. There is no non-SQLite fallback store.
-export const SQLITE = await import('node:sqlite').then((m) => ({ ok: true, DatabaseSync: m.DatabaseSync }), (e) => ({ ok: false, error: String(e.message || e) }));
-export function requireSqlite() {
-  if (!SQLITE.ok) throw new Error(`g4a needs node:sqlite (Node >= 22.5; this is ${process.version}): ${SQLITE.error}`);
-  return SQLITE.DatabaseSync;
-}
+// SQLite access goes through src/sqlite-driver.mjs (node:sqlite or better-sqlite3).
+import { driver, openSqlite, NODE_SQLITE } from './sqlite-driver.mjs';
+export const SQLITE = { ok: true, get driver() { return driver().name; }, node: NODE_SQLITE.ok };
+export function requireSqlite() { return driver(); }
 
 export { globMatchesPath };
 
@@ -43,8 +40,7 @@ CREATE TABLE IF NOT EXISTS jobs (
 
 export function openDb(home, { readOnly = false } = {}) {
   fs.mkdirSync(home, { recursive: true, mode: 0o700 });
-  const DatabaseSync = requireSqlite();
-  const db = new DatabaseSync(path.join(home, 'g4a.db'), readOnly ? { readOnly: true } : {});
+  const db = openSqlite(path.join(home, 'g4a.db'), { readOnly });
   if (!readOnly) {
     db.exec('PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA busy_timeout=5000;'); db.exec(SCHEMA);
     // additive migrations

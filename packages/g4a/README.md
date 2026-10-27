@@ -262,7 +262,7 @@ Claims and releases are mirrored. The authority claims first, and a claim is ref
 ### Phase 2 limits
 - **Separation is only as strong as the agent's own privileges.** On a box where the agent user has `sudo ALL` (this dev box), it can become root or `g4a-authority` anyway. Prevention holds against a non-sudo agent uid, and that is what the system test checks.
 - **Same-user mode is detect-only by design.**
-- **Agent names are bound to OS uids, not to processes.** In system mode the wrappers pass the sudo-provided `SUDO_UID`, which the caller cannot forge. The first claim binds the name to that uid in `state/agents.json`. Another uid is then refused for claim, permit, land and release (`agent_identity`), and pre-receive rejects a permit pushed by a uid other than the one it was issued to. Root may act for any name. Two agents running as the same uid can still act as each other, so give each agent its own OS user. Bindings outlive release; there is no command to rebind a name. In same-user mode everything is one uid, so the binding adds nothing there.
+- **Agent names are bound to OS uids, not to processes.** In system mode the wrappers pass the sudo-provided `SUDO_UID`, which the caller cannot forge. The first claim binds the name to that uid in `state/agents.json`. Another uid is then refused for claim, permit, land and release (`agent_identity`), and pre-receive rejects a permit pushed by a uid other than the one it was issued to. Root may act for any name. Since the limits work, a name is also bound to a per-agent credential (see *Limits fixes* below), and an operator can rebind or unbind it. In same-user mode everything is one uid, so the binding adds nothing there.
 - **Witnesses run as `g4a-authority`** inside bwrap, with the authority keys, state and nonces dirs hidden. They see the authority's repo checkout.
 - **Re-running `init --system`** on an already-initialised repo keeps the existing root and its state. `g4a authority uninstall --system [--repo R | --repo-id GITDIR]` removes one repo's root, pub dir and map entry. When no mapped repo remains, it also removes the code copy, sudoers rule, `/etc/g4a` and the `g4a-authority` user. `--purge` removes everything. The system test and the e2e uninstall their own repo, and the system test deletes the agent users it created. `npm test` runs with a private TMPDIR that is removed afterwards.
 - **Everything is local.** No Cloudflare and no network authority. A remote host would be the next step.
@@ -277,6 +277,54 @@ Config snippets for Claude Code (`.mcp.json`), Codex (`~/.codex/config.toml`) an
 - argument validation;
 - that a stopped daemon gives a tool error;
 - a full claim → commit → promote (through a same-user authority) → verify → release round trip;
-- that the snippets parse.
+- that the snippets parse;
+- in-memory session credentials, progress notifications, cancellation and timeouts on a slow promote.
 
-The snippets were not loaded in a live editor, because none is installed on the build box.
+Real-editor handshakes were run on the box (see *Limits fixes*).
+
+## Limits fixes
+This section says which limits are now **prevented**, which are only **detected**, and which are still **open**.
+
+### 1. Same-user impersonation
+- **What changed.** The first claim of an agent name returns a 32-byte random credential once. The authority stores only its sha256 next to the uid, in `state/agents.json`. Every later claim, permit, land and release for that name has to present the credential, checked in constant time, as well as the uid check. The credential goes to the authority on stdin, never in argv.
+- **Where the client keeps it.**
+  - By default the daemon writes it to `G4A_HOME/credentials/<repo>/<agent>` with mode 0600.
+  - With `claim --session-credential`, it is returned to the caller and not written. The MCP server's `G4A_MCP_SESSION_CREDENTIALS=1` uses this mode: the credential stays in server memory, goes to the CLI with `--credential-stdin`, and is stripped from every tool result.
+  - A credential can also come from `G4A_AGENT_CREDENTIAL`.
+- **Rebind and unbind.** `g4a authority rebind --agent A [--uid N] [--credential-out F]` and `g4a authority unbind --agent A` are human-only: the agent marker is refused. They need the operator passphrase on the tty, authority-side. Each event is appended to `state/identity.jsonl` with an Ed25519 `operator_sig`. Legacy uid-only bindings are upgraded on their next claim.
+- **Status: prevented between agents that do not share a credential store.** In system mode, a second process running as the same uid without the credential is refused.
+- **Still open: a same-uid process that can read the credential.** With the file store, any same-uid process can read the 0600 file. In session mode it can still ptrace the holder or read its `/proc` memory. Real isolation still needs one OS user per agent. In same-user authority mode the agent can edit the authority itself, so there this stays detect-only.
+
+### 2. MCP in real editors
+- **New behaviour on long tool calls.** A `tools/call` that carries `_meta.progressToken` gets `notifications/progress` every 2 s while the CLI runs. `notifications/cancelled` kills the CLI child and sends no response. A timeout (`G4A_MCP_TIMEOUT_MS`, default 600000) returns a tool error that points at `g4a_status`. Neither cancelling nor a timeout stops a promote job the daemon has already queued; it runs to completion.
+- **Checked on the box with real clients.** None of these runs made a model call and none was logged in:
+
+  | Client | What was checked | Result |
+  |---|---|---|
+  | Claude Code 2.1.311 | `claude mcp add -s user` + `claude mcp list` / `get` | `g4a … ✔ Connected` (real stdio handshake). Project-scope `.mcp.json` shows "Pending approval" until it is approved interactively. |
+  | Codex CLI 0.164.0 | `codex mcp add` + `codex exec` with no API key | Codex sent `initialize` (protocol 2025-06-18), `notifications/initialized` and `tools/list`, and g4a answered all three, captured by a tee wrapper. The model request then failed 401, as expected without a key. Tool calls from a model were not run. |
+  | Cursor CLI (cursor-agent 2026.10.22) | `.cursor/mcp.json` + `cursor-agent mcp enable g4a` + `mcp list-tools g4a` | `g4a: ready`, all 6 tools listed. Cursor offered protocol 2025-11-25 and g4a negotiated down to 2025-06-18. |
+
+- **Status.** Handshake and tools/list are verified in all three clients. Tool calls driven by a model inside an editor were **not** run, because that needs a login or paid key.
+
+### 3. Bypasses (other git binaries, git libraries, cloud agents)
+- **Prevented: pushes to the authority.** The authority's main moves only through a signed permit: its pre-receive hook checks the permit, the uid, the credential-bound claim, the baseline and the paths. This holds whatever client pushes, whether git, libgit2 or isomorphic-git, because the check runs on the receiving side. In system mode the agent uid cannot write the authority repo.
+- **Prevented for the git CLI: local main writes.** `authority init` installs a `reference-transaction` hook in the client repo. It honours `core.hooksPath` and chains any existing hook as `reference-transaction.g4a-prev`. It refuses any transaction that moves `refs/heads/main` or `refs/g4a/*`, whichever git binary path runs it, and logs the refusal. g4a's own git runs with hooks disabled and is unaffected.
+- **Detected: writes that skip hooks.** These are `git -c core.hooksPath=/dev/null`, libgit2, isomorphic-git and raw ref-file writes. `g4a verify` reports:
+  - hook refusals from the log;
+  - reflog entries on main since install that g4a did not write;
+  - a missing guard;
+  - local main ≠ authority main.
+
+  This was checked against real isomorphic-git 1.x: `writeRef` moved local main, and verify then failed with "local main … differs from authority main". Nothing on the client can prevent a same-uid library write.
+- **Cloud agents (GitHub Copilot coding agent, Codex cloud, Cursor background agents).** They run on the vendor's machines and push straight to the git host, so local g4a sees nothing. Use server-side protection on the host:
+  - a branch protection rule or ruleset on `main` that requires pull requests and status checks, blocks force-push and deletion, and allows no bypass actors;
+  - for Copilot, which may only push to `copilot/*` branches, a rule on everything else;
+  - required reviews from a human or CODEOWNERS before merge.
+
+  That is prevention on the host, outside g4a. g4a's local authority does not cover these agents.
+
+### 4. `node:sqlite` is experimental
+- **What changed.** Storage goes through `src/sqlite-driver.mjs`, which is used by authority `openDb` and the authority pre-receive hook. `G4A_SQLITE_DRIVER=auto|node|better-sqlite3`: the default is node:sqlite when present, else better-sqlite3. better-sqlite3 is an optional native module; point `G4A_BETTER_SQLITE3` at a directory that holds `node_modules/better-sqlite3`. Both drivers read and write the same file.
+- **Supported Node versions.** `package.json` pins `engines.node` to `>=22.13 <25`.
+- **Tests.** The full g4a suite passes with `G4A_SQLITE_DRIVER=node` and with `G4A_SQLITE_DRIVER=better-sqlite3` (better-sqlite3 12, SQLite 3.53). `test/limits2.test.mjs` checks the cross-driver round trip. It skips the better-sqlite3 half when that driver is not installed and says so. Some tamper tests open the DB directly with node:sqlite.
