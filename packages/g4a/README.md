@@ -90,3 +90,63 @@ Savings depend on the workload. They shrink as a share of an agent's total token
   `git status`/`git log` human output, instead of porcelain or `--format`, will see the compact form.
   Use `G4A_RAW=1` or `G4A_AGENT=0` to opt out.
 - POSIX only (sh shim). Not tested on Windows or macOS.
+
+## Phase 1: local coordination daemon (no Cloudflare)
+
+Phase 1 replaces the Cloudflare control plane with local pieces: the Durable Object becomes
+`g4a daemon` + SQLite, Artifacts become git worktrees, and Queues become an in-daemon job loop.
+It reuses `src/lib/claims.ts`, `src/lib/ledger.ts`, `src/lib/canonical.ts` and the
+resolution-hardening scripts (`scripts/lib/sandbox.mjs`, `scripts/resolvers/mergiraf-resolver.mjs`,
+`scripts/lib/fork-crew.mjs`, `scripts/lib/safe-git.mjs`). It does not reimplement them.
+
+```sh
+g4a daemon --detach                      # per-user: $G4A_HOME/g4a.sock (0600, dir 0700), g4a.db
+g4a claim --agent alice --paths src/calc.js --witness 'npm test' [--allow-overlap]
+#   -> worktree <repo>/.g4a/worktrees/alice on branch g4a/alice; secret in $G4A_HOME/secrets/<id> (0600)
+g4a status | g4a release --agent alice [--remove-worktree]
+g4a promote --agent alice                # queued job; waits for the result
+g4a ledger --out bundle.json             # export
+g4a verify [bundle.json] [--pin SPKIHEX] # offline: no daemon; reads the bundle or the db read-only
+g4a stop
+```
+
+**Claims.** Claims are serialized in the daemon. A claim overlapping an active claim (using `globsOverlap`) is refused
+unless both claims set `--allow-overlap`. Globs are exact paths or `dir/**`, and `**` alone is
+rejected. Every claim, refusal, release and scope warning is appended to a hash-chained ledger.
+
+**Promotion** (one job at a time). The steps are:
+1. Check the agent secret (only its sha256 is stored).
+2. Scope check: files changed since the claim baseline must match the claim globs.
+3. Ladder: fast-forward, then `git merge-tree`, then Mergiraf run through `runContained` (bwrap). An unresolved
+   conflict is refused with a conflict capsule, and the ledger records it.
+4. Run the witness commands (at least one is required) in bwrap on a detached checkout of the merged
+   commit. The report is signed with a local Ed25519 key, `$G4A_HOME/witness-ed25519.pem`. The key is
+   generated on first start and its public key is pinned in the db. The daemon refuses to start if the key does not match the pin.
+5. `git update-ref refs/heads/main NEW OLD` (CAS), retried up to 3 times if main moved.
+6. A `promote_intent` entry is written before the CAS and a `promote` entry after it. If the daemon is killed,
+   `running` jobs are requeued at the next start. A CAS that already landed is recorded from
+   the intent (`recovered: true`) and is not merged a second time.
+
+**Verify.** Verification recomputes every payload hash and the chain, checks each witness signature
+(optionally against `--pin`), and requires every witness exit code to be 0.
+
+**Shim wiring.** Inside `*/.g4a/worktrees/*`, write subcommands (commit, push, merge, rebase,
+reset, checkout, switch, cherry-pick, am, apply, revert, pull) ask the daemon to `check` them first, with a 500 ms timeout.
+The check flags staged files outside the claim, pushes to main, and moving onto main. The default is to warn
+(`[g4a] warning:` on stderr plus a ledger entry). `G4A_ENFORCE=1` blocks instead. If the daemon is down, the shim warns
+and lets the command run (fail open).
+
+### Phase 1 limits (what it does not do)
+- The ledger has no external anchor. Deleting the newest entries leaves a valid shorter chain, and a
+  test asserts this. Anyone who can write `$G4A_HOME` (the key plus the db) can forge history. This is
+  tamper evidence against edits, not a defense against the local user.
+- Enforcement is advisory by default. Agents can bypass the shim with `G4A_RAW=1`, by calling the real
+  git path, or by editing files without git. Claims gate promotion to main, not edits.
+- `update-ref` moves `refs/heads/main` but does not update a checkout of main. Use a bare repo or keep
+  the main worktree detached. The tests do the latter.
+- Mergiraf resolves concurrent class-member and JSON-key additions. It does not resolve concurrent top-level
+  insertions. It can also merge two edits of one expression structurally, for example `a + b + 0` with
+  `Number(a) + Number(b)`. Witnesses are the guard against such merges, so choose them accordingly.
+- There is one daemon per user, and jobs run one at a time across all repos. There is no multi-host coordination.
+- `node:sqlite` is experimental in Node 22. The CLI runs it with `--no-warnings`.
+- The crash-test hooks `G4A_TEST_CRASH_AFTER_INTENT` and `G4A_TEST_CRASH_AFTER_CAS` are env vars read by the daemon, and they exist for tests only.

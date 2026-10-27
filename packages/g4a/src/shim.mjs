@@ -15,6 +15,18 @@ const base = { event: 'git', ts: new Date().toISOString(), cwd: process.cwd(), a
 
 if (!REAL || !fs.existsSync(REAL)) { process.stderr.write('g4a: real git not configured (G4A_REAL_GIT); run g4a doctor\n'); process.exit(127); }
 
+// Phase 1: inside a claimed worktree, ask the daemon to check write commands first.
+// Default is log + warn; G4A_ENFORCE=1 blocks. Daemon down => warn and fail open.
+const WRITE_SUBS = new Set(['commit', 'push', 'merge', 'rebase', 'reset', 'checkout', 'switch', 'cherry-pick', 'am', 'apply', 'revert', 'pull']);
+if (p?.sub && WRITE_SUBS.has(p.sub) && `${process.cwd()}/`.includes('/.g4a/worktrees/')) {
+  const { checkWithDaemon } = await import('./check-client.mjs');
+  const r = await checkWithDaemon({ cwd: process.cwd(), argv }, { home: g4aHome(), timeoutMs: Number(process.env.G4A_CHECK_TIMEOUT_MS || 500) });
+  if (r.unavailable) process.stderr.write(`[g4a] warning: daemon unavailable (${r.unavailable}); scope not checked\n`);
+  for (const w of r.warnings ?? []) process.stderr.write(`[g4a] warning: ${w}\n`);
+  appendLog({ ...base, event: 'scope_check', warnings: r.warnings ?? [], unavailable: r.unavailable ?? null });
+  if ((r.warnings ?? []).length && process.env.G4A_ENFORCE === '1') { process.stderr.write('[g4a] blocked (G4A_ENFORCE=1)\n'); process.exit(1); }
+}
+
 const kind = classify(argv);
 
 if (!kind) {

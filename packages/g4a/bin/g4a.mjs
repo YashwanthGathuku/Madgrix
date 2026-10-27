@@ -1,10 +1,11 @@
-#!/usr/bin/env node
+#!/usr/bin/env -S node --no-warnings
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { g4aHome, readLog, stats, appendLog, agentMarker } from '../src/lib.mjs';
+import { spawn } from 'node:child_process';
 
 const PKG = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const BEGIN = '# >>> g4a >>>', END = '# <<< g4a <<<';
@@ -35,7 +36,10 @@ function shimScript(real) {
 G4A_REAL_GIT=${shq(real)}
 export G4A_REAL_GIT
 # Fast path: exec real git untouched unless an agent marker is set and stdout is not a TTY.
-if [ -n "$G4A_RAW" ] || [ -n "$G4A_ACTIVE" ] || [ -t 1 ]; then exec "$G4A_REAL_GIT" "$@"; fi
+if [ -n "$G4A_RAW" ] || [ -n "$G4A_ACTIVE" ]; then exec "$G4A_REAL_GIT" "$@"; fi
+# Inside a claimed worktree every command goes through the node shim (daemon scope checks).
+case "$PWD/" in */.g4a/worktrees/*) exec ${shq(process.execPath)} ${shq(path.join(PKG, 'src', 'shim.mjs'))} "$@" ;; esac
+[ -t 1 ] && exec "$G4A_REAL_GIT" "$@"
 case "\${G4A_AGENT:-}\${CLAUDECODE:-}\${GEMINI_CLI:-}\${G4A_NONTTY_IS_AGENT:-}" in
   "") if ! env | grep -q '^CODEX_'; then exec "$G4A_REAL_GIT" "$@"; fi ;;
 esac
@@ -139,8 +143,71 @@ function hooks(args) {
   console.log(JSON.stringify(out[which], null, 2));
 }
 
+function opts(args) {
+  const o = { _: [] };
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (!a.startsWith('--')) { o._.push(a); continue; }
+    const k = a.slice(2);
+    if (['allow-overlap', 'detach', 'remove-worktree', 'no-wait', 'json'].includes(k)) { o[k] = true; continue; }
+    const v = args[++i];
+    if (k === 'witness') (o.witness ||= []).push(v); else o[k] = v;
+  }
+  o.repo = path.resolve(o.repo || '.');
+  return o;
+}
+const out = (r) => { console.log(JSON.stringify(r, null, 2)); if (r && r.ok === false) process.exitCode = 1; };
+const client = async () => (await import('../src/daemon.mjs')).rpc;
+
+async function daemon(args) {
+  const o = opts(args);
+  if (o.detach) {
+    const c = spawn(process.execPath, ['--no-warnings', path.join(PKG, 'bin', 'g4a.mjs'), 'daemon'], { detached: true, stdio: 'ignore', env: process.env });
+    c.unref();
+    const rpc = await client();
+    for (let i = 0; i < 100; i++) { try { out(await rpc('ping')); return; } catch { await new Promise((r) => setTimeout(r, 50)); } }
+    console.error('g4a: daemon did not start'); process.exitCode = 1; return;
+  }
+  const { startDaemon } = await import('../src/daemon.mjs');
+  const d = await startDaemon();
+  console.error(`g4a daemon pid ${process.pid} on ${d.sock}${d.requeued ? ` (requeued ${d.requeued} job(s))` : ''}`);
+}
+async function claimCmd(args) {
+  const o = opts(args);
+  out(await (await client())('claim', { repo: o.repo, agent: o.agent, paths: (o.paths || '').split(',').filter(Boolean), witnesses: o.witness || [], allowOverlap: !!o['allow-overlap'] }));
+}
+async function releaseCmd(args) { const o = opts(args); out(await (await client())('release', { repo: o.repo, agent: o.agent, removeWorktree: !!o['remove-worktree'] })); }
+async function statusCmd(args) { const o = opts(args); out(await (await client())('status', { repo: o.repo })); }
+async function promoteCmd(args) {
+  const o = opts(args);
+  const rpc = await client();
+  const st = await rpc('status', { repo: o.repo });
+  const c = st.claims.find((x) => x.agent === o.agent);
+  if (!c) { out({ ok: false, error: `no active claim for ${o.agent}` }); return; }
+  const secret = fs.readFileSync(path.join(home, 'secrets', c.id), 'utf8'); // never printed
+  out(await rpc('promote', { repo: o.repo, agent: o.agent, secret, wait: !o['no-wait'] }));
+}
+async function ledgerCmd(args) {
+  const o = opts(args);
+  const b = await (await client())('export', { repo: o.repo });
+  if (o.out) { fs.writeFileSync(o.out, JSON.stringify(b, null, 2)); console.log(`wrote ${b.entries.length} entries to ${o.out}`); } else console.log(JSON.stringify(b, null, 2));
+}
+// Offline: needs no daemon. Reads a bundle file, or the SQLite db read-only.
+async function verifyCmd(args) {
+  const o = opts(args);
+  const A = await import('../src/authority.mjs');
+  let bundle;
+  if (o._[0]) bundle = JSON.parse(fs.readFileSync(o._[0], 'utf8'));
+  else { const db = A.openDb(home, { readOnly: true }); bundle = A.bundleFromDb(db, A.repoId(o.repo)); db.close(); }
+  let pinnedPub;
+  if (o.pin) pinnedPub = o.pin;
+  const r = await A.verifyBundle(bundle, { pinnedPub });
+  out(r);
+}
+async function stopCmd() { try { out(await (await client())('shutdown')); } catch (e) { out({ ok: false, error: e.message }); } }
+
 const [cmd, ...rest] = process.argv.slice(2);
-({ install, uninstall, doctor, stats: showStats, hook, hooks }[cmd] ?? (() => {
-  console.log('usage: g4a install [--rc FILE] | uninstall [--rc FILE] | doctor | stats | hooks claude|codex|gemini | hook <agent>');
+({ install, uninstall, doctor, stats: showStats, hook, hooks, daemon, claim: claimCmd, release: releaseCmd, status: statusCmd, promote: promoteCmd, ledger: ledgerCmd, verify: verifyCmd, stop: stopCmd }[cmd] ?? (() => {
+  console.log('usage: g4a install [--rc FILE] | uninstall [--rc FILE] | doctor | stats | hooks claude|codex|gemini | hook <agent>\n       g4a daemon [--detach] | stop | claim --agent A --paths p1,p2 --witness CMD [--allow-overlap] [--repo R]\n       g4a release --agent A [--remove-worktree] | status | promote --agent A [--no-wait] | ledger [--out F] | verify [BUNDLE] [--pin SPKIHEX]');
   process.exitCode = cmd ? 2 : 0;
-}))(rest);
+}))(rest)?.catch?.((e) => { console.error(`g4a: ${e.message}`); process.exitCode = 1; });
