@@ -4,6 +4,13 @@
 // the server adds no new path around the daemon, authority, permits or the shim: it has exactly
 // the privileges of the editor process that launched it. Claim secrets stay in G4A_HOME and are
 // never returned. Repo defaults to G4A_MCP_REPO or the server's cwd (the editor workspace).
+// Agent credentials (authority mode): by default the daemon keeps them in G4A_HOME/credentials
+// (0600). With G4A_MCP_SESSION_CREDENTIALS=1 the server claims with --session-credential, keeps the
+// credential only in this process's memory, hands it to the CLI on stdin (--credential-stdin), and
+// strips it from every tool result, so it never reaches the model or the disk. Long calls emit
+// notifications/progress when the client sent a progressToken, honour notifications/cancelled
+// (the CLI child is killed; an already-queued promote job keeps running in the daemon), and are
+// bounded by G4A_MCP_TIMEOUT_MS (default 600000).
 import { spawn } from 'node:child_process';
 import path from 'node:path';
 import readline from 'node:readline';
@@ -47,23 +54,44 @@ function validate(t, a) {
   for (const k of ['allow_overlap', 'no_wait', 'remove_worktree']) if (a[k] !== undefined && typeof a[k] !== 'boolean') bad(`${k} must be boolean`);
 }
 
-function runCli(argv, cwd, timeoutMs) {
+function runCli(argv, cwd, timeoutMs, { stdin, signal, onTick } = {}) {
   return new Promise((resolve) => {
-    const c = spawn(process.execPath, ['--no-warnings', CLI, ...argv], { cwd, env: process.env, stdio: ['ignore', 'pipe', 'pipe'] });
-    let so = '', se = ''; c.stdout.on('data', (d) => { so += d; }); c.stderr.on('data', (d) => { se += d; });
-    const t = setTimeout(() => c.kill('SIGTERM'), timeoutMs);
-    c.on('close', (code) => { clearTimeout(t); resolve({ code, stdout: so, stderr: se }); });
-    c.on('error', (e) => { clearTimeout(t); resolve({ code: -1, stdout: '', stderr: e.message }); });
+    const c = spawn(process.execPath, ['--no-warnings', CLI, ...argv], { cwd, env: process.env, stdio: [stdin === undefined ? 'ignore' : 'pipe', 'pipe', 'pipe'] });
+    if (stdin !== undefined) c.stdin.end(stdin);
+    let so = '', se = '', why = null; c.stdout.on('data', (d) => { so += d; }); c.stderr.on('data', (d) => { se += d; });
+    const kill = (w) => { why ??= w; c.kill('SIGTERM'); };
+    const t = setTimeout(() => kill('timeout'), timeoutMs);
+    const t0 = Date.now(); const tick = onTick ? setInterval(() => onTick(Date.now() - t0), 2000) : null;
+    const onAbort = () => kill('cancelled'); signal?.addEventListener('abort', onAbort);
+    const done = (r) => { clearTimeout(t); if (tick) clearInterval(tick); signal?.removeEventListener('abort', onAbort); resolve({ ...r, why }); };
+    c.on('close', (code) => done({ code, stdout: so, stderr: se }));
+    c.on('error', (e) => done({ code: -1, stdout: '', stderr: e.message }));
   });
 }
 
-export async function callTool(name, args = {}, { cwd = process.env.G4A_MCP_REPO || process.cwd(), timeoutMs = Number(process.env.G4A_MCP_TIMEOUT_MS || 600_000) } = {}) {
+const SESSION = process.env.G4A_MCP_SESSION_CREDENTIALS === '1';
+const creds = new Map(); // `${repo}\0${agent}` -> credential, memory only
+const scrub = (j) => { if (j && typeof j === 'object') { delete j.agent_credential; for (const v of Object.values(j)) scrub(v); } return j; };
+
+export async function callTool(name, args = {}, { cwd = process.env.G4A_MCP_REPO || process.cwd(), timeoutMs = Number(process.env.G4A_MCP_TIMEOUT_MS || 600_000), signal, onProgress, session = SESSION } = {}) {
   const t = TOOLS.find((x) => x.name === name);
   if (!t) throw Object.assign(new Error(`unknown tool ${name}`), { code: -32602 });
   validate(t, args);
   const repo = path.resolve(cwd, args.repo || '.');
-  const r = await runCli([...t.argv(args), '--repo', repo], repo, timeoutMs);
+  const key = `${repo}\0${args.agent}`;
+  const argv = [...t.argv(args), '--repo', repo];
+  let stdin;
+  if (session && args.agent && ['g4a_claim', 'g4a_promote', 'g4a_release'].includes(name)) {
+    if (name === 'g4a_claim') argv.push('--session-credential');
+    if (creds.has(key)) { argv.push('--credential-stdin'); stdin = creds.get(key); }
+  }
+  const r = await runCli(argv, repo, timeoutMs, { stdin, signal, onTick: onProgress && ((ms) => onProgress(ms, `g4a ${t.argv(args)[0]} running ${Math.round(ms / 1000)}s`)) });
+  if (r.why === 'cancelled') throw Object.assign(new Error('cancelled'), { cancelled: true });
   let json = null; try { json = JSON.parse(r.stdout); } catch {}
+  if (json?.agent_credential && session) creds.set(key, json.agent_credential);
+  if (name === 'g4a_release' && json?.ok !== false && r.code === 0) creds.delete(key);
+  scrub(json);
+  if (r.why === 'timeout') return { content: [{ type: 'text', text: `g4a timed out after ${timeoutMs}ms (G4A_MCP_TIMEOUT_MS). A queued promote keeps running in the daemon; check g4a_status.` }], isError: true };
   const daemonDown = /ECONNREFUSED|ENOENT.*sock|daemon/i.test(r.stderr) && !json;
   const text = json ? JSON.stringify(json, null, 2) : (r.stdout || r.stderr || `g4a exited ${r.code}`).trim() + (daemonDown ? '\n(hint: start the daemon with `g4a daemon --detach`)' : '');
   return { content: [{ type: 'text', text }], ...(json ? { structuredContent: json } : {}), isError: r.code !== 0 || json?.ok === false };
@@ -72,7 +100,7 @@ export async function callTool(name, args = {}, { cwd = process.env.G4A_MCP_REPO
 export function serve(input = process.stdin, output = process.stdout) {
   const send = (m) => output.write(JSON.stringify(m) + '\n');
   const rl = readline.createInterface({ input });
-  const pending = new Set();
+  const pending = new Set(); const inflight = new Map();
   rl.on('line', (line) => {
     if (!line.trim()) return;
     let m; try { m = JSON.parse(line); } catch { return send({ jsonrpc: '2.0', id: null, error: { code: -32700, message: 'parse error' } }); }
@@ -87,9 +115,14 @@ export function serve(input = process.stdin, output = process.stdout) {
       case 'ping': return reply({});
       case 'tools/list': return reply({ tools: TOOLS.map(({ argv, ...t }) => t) });
       case 'tools/call': {
-        const p = callTool(m.params?.name, m.params?.arguments ?? {}).then(reply, (e) => fail(e.code ?? -32603, e.message));
-        pending.add(p); p.finally(() => pending.delete(p)); return;
+        const ac = new AbortController(); const tok = m.params?._meta?.progressToken;
+        const onProgress = tok === undefined ? undefined : (ms, message) => send({ jsonrpc: '2.0', method: 'notifications/progress', params: { progressToken: tok, progress: Math.round(ms / 1000), message } });
+        inflight.set(m.id, ac);
+        const p = callTool(m.params?.name, m.params?.arguments ?? {}, { signal: ac.signal, onProgress })
+          .then(reply, (e) => { if (!e.cancelled) fail(e.code ?? -32603, e.message); }); // cancelled requests get no response (MCP spec)
+        pending.add(p); p.finally(() => { pending.delete(p); inflight.delete(m.id); }); return;
       }
+      case 'notifications/cancelled': inflight.get(m.params?.requestId)?.abort(); return;
       default: if (m.method.startsWith('notifications/')) return; return fail(-32601, `method not found: ${m.method}`);
     }
   });
