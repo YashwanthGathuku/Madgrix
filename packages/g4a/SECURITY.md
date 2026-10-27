@@ -17,7 +17,8 @@ see PRIVACY.md.
   - Log, tee, credential and pid writes use `O_NOFOLLOW`, so a planted symlink at the target
     fails the write instead of redirecting it.
   - `G4A_HOME` and its subdirectories must be real directories owned by the current uid.
-  - Temp dirs come from `mkdtemp` (`0700`).
+  - Temp dirs come from `mkdtemp` (`0700`). The system installer's seed bundle is `0600` in a
+    `0700` dir, owned only by the authority user, and removed on success, failure, exit or signal.
   - Nonce files are created with `wx`.
 - **Shell injection in generated hooks.** Authority hook wrappers single-quote every path. The
   old double quotes allowed `$()` and backticks to run.
@@ -52,8 +53,6 @@ see PRIVACY.md.
   diff content and therefore source code.
 - Paths, cwd and worktree paths are stored as they are, so usernames in home paths are kept.
 - The daemon db and ledger have no retention limit.
-- The system installer briefly makes a seed bundle world-readable (`0755` tmp dir, `0644` bundle)
-  so the authority uid can read it during `init --system`. It is deleted straight afterwards.
 - g4a has no runtime npm dependencies. It uses only `node:` builtins, plus `better-sqlite3` when
   available (optional). `npm audit` findings in the repo root affect development tooling only:
   vite, wrangler/miniflare, sharp, undici and zod. g4a does not load any of them at runtime.

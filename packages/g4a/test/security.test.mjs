@@ -12,6 +12,7 @@ import { redact, redactDeep, minimiseArgv, ensurePrivateDir, appendPrivate, writ
 import { appendLog } from '../src/lib.mjs';
 import { checkClaimInputs } from '../src/authority.mjs';
 import { hookWrapper } from '../src/authority-service.mjs';
+import { seedBundle } from '../src/system-install.mjs';
 
 const BIN = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'bin', 'g4a.mjs');
 const tmp = () => fs.mkdtempSync(path.join(os.tmpdir(), 'g4a-sec-'));
@@ -143,4 +144,30 @@ test('CLI errors are redacted and carry no stack trace by default', () => {
     assert.ok(!(r.stdout + r.stderr).includes(FAKE.gh));
     assert.ok(!/\n\s+at /.test(r.stderr));
   } finally { fs.rmSync(env.G4A_HOME, { recursive: true, force: true }); }
+});
+
+test('system-install seed bundle: 0700 dir, 0600 bundle, removed by cleanup, on error and on exit', () => {
+  const d = tmp();
+  try {
+    const repo = path.join(d, 'r'); fs.mkdirSync(repo);
+    const g = (...a) => spawnSync('git', ['-C', repo, ...a], { encoding: 'utf8' });
+    g('init', '-q', '-b', 'main'); g('-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-q', '--allow-empty', '-m', 'i');
+    const old = process.umask(0);
+    let s; try { s = seedBundle(repo, { tmpdir: d }); } finally { process.umask(old); }
+    assert.equal(mode(s.dir), 0o700); assert.equal(mode(s.bundle), 0o600);
+    assert.equal(fs.statSync(s.bundle).uid, process.getuid());
+    assert.equal(spawnSync('git', ['bundle', 'verify', s.bundle], { cwd: repo }).status, 0);
+    s.cleanup(); assert.ok(!fs.existsSync(s.dir)); s.cleanup();
+    // failure while bundling: nothing left behind
+    const before = fs.readdirSync(d).filter((n) => n.startsWith('g4a-seed-')).length;
+    assert.throws(() => seedBundle(path.join(d, 'not-a-repo'), { tmpdir: d }));
+    assert.equal(fs.readdirSync(d).filter((n) => n.startsWith('g4a-seed-')).length, before);
+    // process exit without cleanup(): exit handler removes it
+    const mod = new URL('../src/system-install.mjs', import.meta.url).href;
+    const r = spawnSync(process.execPath, ['--no-warnings', '--input-type=module', '-e', `import { seedBundle } from ${JSON.stringify(mod)}; const s = seedBundle(${JSON.stringify(repo)}, { tmpdir: ${JSON.stringify(d)} }); console.log(s.dir); process.exit(0);`], { encoding: 'utf8' });
+    const dir = r.stdout.trim(); assert.ok(dir.startsWith(d), r.stderr); assert.ok(!fs.existsSync(dir), 'seed dir survived process exit');
+    // SIGTERM without cleanup(): signal handler removes it
+    const r2 = spawnSync(process.execPath, ['--no-warnings', '--input-type=module', '-e', `import { seedBundle } from ${JSON.stringify(mod)}; const s = seedBundle(${JSON.stringify(repo)}, { tmpdir: ${JSON.stringify(d)} }); console.log(s.dir); process.kill(process.pid, 'SIGTERM'); setTimeout(() => {}, 5000);`], { encoding: 'utf8' });
+    const dir2 = r2.stdout.trim(); assert.equal(r2.signal, 'SIGTERM'); assert.ok(dir2.startsWith(d)); assert.ok(!fs.existsSync(dir2), 'seed dir survived SIGTERM');
+  } finally { fs.rmSync(d, { recursive: true, force: true }); }
 });
