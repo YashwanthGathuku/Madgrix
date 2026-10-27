@@ -113,17 +113,27 @@ test('humans untouched: no agent marker => exact output even when piped', () => 
   assert.equal(Buffer.compare(a.stdout, b.stdout), 0);
 });
 
-test('TTY untouched: agent marker but stdout is a terminal => not compacted', { skip: !fs.existsSync('/usr/bin/script') }, () => {
+test('TTY: agent marker + terminal => still routed through the node shim (enforced), but output is not compacted', { skip: !fs.existsSync('/usr/bin/script') }, () => {
   const before = logRecs().length;
   const r = spawnSync('script', ['-qec', `${SHIM} status`, '/dev/null'], { cwd: REPO, env: agentEnv, encoding: 'utf8' });
   assert.equal(r.status, 0);
   assert.match(r.stdout, /On branch main/);
-  assert.equal(logRecs().length, before); // fast path exec'd real git directly
+  const recs = logRecs().slice(before);
+  assert.equal(recs.length, 1); assert.equal(recs[0].mode, 'passthrough'); // a TTY is no longer a bypass for agents
 });
 
-test('G4A_RAW=1 escape hatch', () => {
-  const a = real(['status']), b = shim(['status'], { ...agentEnv, G4A_RAW: '1' });
-  assert.equal(Buffer.compare(a.stdout, b.stdout), 0);
+test('G4A_RAW=1: honored for humans, IGNORED (and logged) for agents without an operator override', () => {
+  const a = real(['status']);
+  const human = shim(['status'], { ...shimEnv, G4A_RAW: '1' });
+  assert.equal(Buffer.compare(a.stdout, human.stdout), 0);
+  const before = logRecs().length;
+  const ag = shim(['status'], { ...agentEnv, G4A_RAW: '1' });
+  assert.match(ag.stderr.toString(), /ignoring G4A_RAW in an agent context/);
+  assert.equal(ag.stdout.toString(), real(['status', '--porcelain=v1', '-b']).stdout.toString()); // still compacted
+  assert.ok(logRecs().slice(before).some((r) => r.event === 'opt_out' && r.vars.includes('G4A_RAW') && r.honored === false));
+  // the old G4A_ACTIVE recursion guard is no longer an escape hatch either
+  const act = shim(['status'], { ...agentEnv, G4A_ACTIVE: '1' });
+  assert.equal(act.stdout.toString(), real(['status', '--porcelain=v1', '-b']).stdout.toString());
 });
 
 test('compaction: status == porcelain v1 -b, log capped with tee, stat bars dropped', () => {

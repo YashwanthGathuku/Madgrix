@@ -262,8 +262,29 @@ test('shim enforcement: agents blocked by default out of scope, G4A_ENFORCE=0 op
     const blocked = spawnSync('git', ['commit', '-qm', 'x'], { cwd: wt, env, encoding: 'utf8' });
     assert.equal(blocked.status, 1, blocked.stderr); assert.match(blocked.stderr, /\[g4a\] blocked: .*other\.txt/);
     assert.equal(git(wt, 'rev-list', '--count', 'HEAD'), '1');
+    // G4A_ENFORCE=0 in an agent context is ignored without an operator override (and logged)
+    const noOv = spawnSync('git', ['commit', '-qm', 'y'], { cwd: wt, env: { ...env, G4A_ENFORCE: '0' }, encoding: 'utf8' });
+    assert.equal(noOv.status, 1, noOv.stderr); assert.match(noOv.stderr, /ignoring G4A_ENFORCE/);
+    const spoof = spawnSync('git', ['commit', '-qm', 'y'], { cwd: wt, env: { ...env, CLAUDECODE: '1', G4A_AGENT: '0' }, encoding: 'utf8' });
+    assert.equal(spoof.status, 1, spoof.stderr); assert.match(spoof.stderr, /ignoring G4A_AGENT/);
+    // operator commands are human-only: refused with an agent marker, refused without a TTY
+    assert.match(cli(home, ['operator', 'init'], { env: { G4A_AGENT: '1' } }).stderr, /human-only/);
+    assert.match(cli(home, ['operator', 'init'], { env: humanEnv(home) }).stderr, /interactive terminal/);
+    const tty = (args) => spawnSync('script', ['-qec', [process.execPath, '--no-warnings', CLI, ...args].map((x) => `'${x}'`).join(' '), '/dev/null'], { env: humanEnv(home), encoding: 'utf8' });
+    assert.equal(tty(['operator', 'init']).status, 0);
+    const forged = path.join(keysOf(home), 'overrides');
+    // a forged (unsigned) override file is ignored
+    const { overrideFile } = await import('../src/override.mjs');
+    const common = fs.realpathSync(path.join(repo, '.git'));
+    fs.mkdirSync(forged, { recursive: true });
+    fs.writeFileSync(overrideFile(common, keysOf(home)), JSON.stringify({ override: { version: 'g4a-override/v1', repo: common, vars: ['G4A_ENFORCE'], until: '2999-01-01T00:00:00Z', reason: 'x' }, signature: Buffer.alloc(64).toString('base64') }));
+    assert.equal(spawnSync('git', ['commit', '-qm', 'y'], { cwd: wt, env: { ...env, G4A_ENFORCE: '0' }, encoding: 'utf8' }).status, 1);
+    const g = tty(['override', '--repo', repo, '--minutes', '5', '--reason', 'test', '--var', 'G4A_ENFORCE']);
+    assert.equal(g.status, 0, g.stdout + g.stderr);
     const opt = spawnSync('git', ['commit', '-qm', 'y'], { cwd: wt, env: { ...env, G4A_ENFORCE: '0' }, encoding: 'utf8' });
     assert.equal(opt.status, 0, opt.stderr); assert.match(opt.stderr, /\[g4a\] warning: .*other\.txt/);
+    const optOuts = (await rpc(home, 'export', { repo })).entries.filter((e) => e.kind === 'opt_out');
+    assert.ok(optOuts.some((e) => e.payload.honored === false) && optOuts.some((e) => e.payload.honored === true), JSON.stringify(optOuts.map((e) => e.payload)));
     // in-scope commit passes
     fs.writeFileSync(path.join(wt, 'f.txt'), '2\n');
     spawnSync('git', ['add', 'f.txt'], { cwd: wt, env });

@@ -27,26 +27,39 @@ export async function startDaemon(home = g4aHome(), { hooks = {}, keyDir } = {})
   const auth = new Authority(home, keyDir ? { keyDir } : {});
   const requeued = auth.db.prepare("UPDATE jobs SET status = 'queued' WHERE status = 'running'").run().changes;
   const bus = new EventEmitter();
-  let busy = false;
-
-  async function loop() {
-    if (busy) return;
-    busy = true;
+  // Per-repo job queues: one worker per repo (promotions in a repo stay serialized so CAS and
+  // frozen-intent order are deterministic); different repos run in parallel. Witnesses run in
+  // a child process, so the event loop is free while one repo's witnesses execute.
+  const workers = new Map(); // repo -> Promise
+  const jobRepo = (job) => {
+    try { const row = auth.db.prepare('SELECT repo FROM claims WHERE id = ?').get(JSON.parse(job.payload).claimId); return row?.repo ?? '?'; } catch { return '?'; }
+  };
+  async function runJob(job) {
+    auth.db.prepare("UPDATE jobs SET status = 'running', attempts = attempts + 1 WHERE id = ?").run(job.id);
+    let result;
     try {
-      for (;;) {
-        const job = auth.db.prepare("SELECT * FROM jobs WHERE status = 'queued' ORDER BY created_at, id LIMIT 1").get();
-        if (!job) break;
-        auth.db.prepare("UPDATE jobs SET status = 'running', attempts = attempts + 1 WHERE id = ?").run(job.id);
-        let result;
+      const { claimId } = JSON.parse(job.payload);
+      const row = auth.db.prepare('SELECT * FROM claims WHERE id = ?').get(claimId);
+      result = row ? await promote(auth, rowClaim(row), job.id, hooks) : { ok: false, status: 'refused', reason: 'claim not found' };
+    } catch (e) { result = { ok: false, status: 'error', error: String(e.message || e) }; }
+    auth.db.prepare("UPDATE jobs SET status = 'done', result = ? WHERE id = ?").run(JSON.stringify(result), job.id);
+    bus.emit(job.id, result);
+  }
+  function loop() {
+    const queued = auth.db.prepare("SELECT * FROM jobs WHERE status = 'queued' ORDER BY created_at, id").all();
+    for (const job of queued) {
+      const repo = jobRepo(job);
+      if (workers.has(repo)) continue;
+      const w = (async () => {
         try {
-          const { claimId } = JSON.parse(job.payload);
-          const row = auth.db.prepare('SELECT * FROM claims WHERE id = ?').get(claimId);
-          result = row ? await promote(auth, rowClaim(row), job.id, hooks) : { ok: false, status: 'refused', reason: 'claim not found' };
-        } catch (e) { result = { ok: false, status: 'error', error: String(e.message || e) }; }
-        auth.db.prepare("UPDATE jobs SET status = 'done', result = ? WHERE id = ?").run(JSON.stringify(result), job.id);
-        bus.emit(job.id, result);
-      }
-    } finally { busy = false; }
+          for (let j = job; j; ) {
+            await runJob(j);
+            j = auth.db.prepare("SELECT * FROM jobs WHERE status = 'queued' ORDER BY created_at, id").all().find((x) => jobRepo(x) === repo);
+          }
+        } finally { workers.delete(repo); }
+      })();
+      workers.set(repo, w);
+    }
   }
 
   const methods = {
@@ -55,6 +68,7 @@ export async function startDaemon(home = g4aHome(), { hooks = {}, keyDir } = {})
     release: (p) => auth.release(p),
     status: (p) => auth.status(p),
     check: (p) => auth.check(p),
+    opt_out: (p) => auth.optOut(p),
     export: (p) => auth.exportBundle(repoId(p.repo)),
     job: (p) => { const j = auth.db.prepare('SELECT id, status, attempts, result FROM jobs WHERE id = ?').get(p.id); return j ? { ...j, result: j.result && JSON.parse(j.result) } : null; },
     promote: async (p) => {

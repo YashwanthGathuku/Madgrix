@@ -170,6 +170,20 @@ and lets the command run (fail open).
 - **No test switches in production.** Crash points are injected through `promote(..., hooks)` and
   `startDaemon(home, { hooks })` by `test/fixtures/crash-daemon.mjs` only.
 
+### Phase 1 limits fixes (Part A)
+
+- **Witness pinning.** On promote, each claim's witness paths (`--witness-path`, or the script files that witness commands execute, tracked on main) are frozen at their blob hashes. A claim that overlaps another agent's frozen or claimed witness paths is refused (`claim_refused`, reason `witness_paths`). If an agent changes its own frozen witness, the result is REVIEW (`witness_modified` / `witness_tamper`). Commands like `npm test` derive no paths; pass `--witness-path` yourself.
+- **Opt-out variables in agent contexts.** `G4A_RAW`, `G4A_ENFORCE=0` and `G4A_AGENT=0` are ignored when an agent marker is present. They take effect only with a valid, unexpired override that the operator signed (`g4a operator init`, then `g4a override --repo --minutes --reason --var`). Both commands are human-only: they refuse when an agent marker is set or when stdin is not a TTY. Every attempt is logged as an `opt_out` ledger entry, whether it was honored or not.
+- **External anchor witness.** If `G4A_ANCHOR_REMOTE` is set, each anchor is pushed to that remote. `verify --anchor-remote` then compares against it. If `G4A_KEY_PASSPHRASE_FILE` is set, the witness key is stored encrypted.
+- **Main checked out.** If main is checked out and clean, it is updated in place after the CAS. If it is dirty, the promote is refused (`main_checked_out_dirty`).
+- **Concurrency and SQLite.** Each repo has its own job queue, and different repos run in parallel. If `node:sqlite` is missing, you get a clear error.
+
+**What a same-uid attacker can still do.** The following are not fixed:
+- A process running as the same uid can read the operator key unless it is passphrase-protected, and it can read the passphrase file if that file is readable.
+- `script` can fake a TTY.
+- An anchor remote on the same machine and uid can be rewritten. Real protection needs a remote on another host or uid.
+- Such a process can edit the DB or refs directly. Verify and the anchors detect this; they do not prevent it.
+
 ### Phase 1 limits (what it still does not do)
 - Bypasses remain. An agent can run the real git binary by absolute path, set `G4A_RAW=1` or
   `G4A_ENFORCE=0`, or edit files without git. Claims gate promotion to main, not edits. Closing these

@@ -9,7 +9,7 @@
 // scripts/lib/resolve-ladder.mjs (findMergiraf), scripts/lib/fork-crew.mjs
 // (conflictHunks, strayConflictMarkers), scripts/lib/safe-git.mjs.
 import fs from 'node:fs';
-import { spawnSync } from 'node:child_process';
+import { spawnSync, spawn } from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -154,15 +154,27 @@ function mergirafRung(files, log) {
 }
 
 // Run each witness command in bubblewrap on a detached checkout of `sha`.
-function runWitnesses(top, sha, intents) {
+const RUNNER = path.join(path.dirname(fileURLToPath(import.meta.url)), 'witness-runner.mjs');
+function runOne(spec) {
+  return new Promise((resolve) => {
+    const ch = spawn(process.execPath, ['--no-warnings', RUNNER], { stdio: ['pipe', 'pipe', 'inherit'] });
+    let out = '';
+    ch.stdout.on('data', (d) => { out += d; });
+    ch.on('close', () => { try { resolve(JSON.parse(out)); } catch { resolve({ status: null, signal: null, timedOut: false, sandbox: 'runner_failed' }); } });
+    ch.stdin.end(JSON.stringify(spec));
+  });
+}
+async function runWitnesses(top, sha, intents) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'g4a-witness-'));
   const wt = path.join(dir, 'tree');
   safeGit(top, ['worktree', 'add', '--quiet', '--detach', wt, sha]);
   try {
-    return intents.map(({ cmd, agents }) => {
-      const r = runContained({ command: cmd, cwd: wt, writable: [wt], timeoutMs: 300_000, purpose: 'witness', env: { PATH: process.env.PATH ?? '/usr/bin:/bin', HOME: dir } });
-      return { cmd, agents, exit: r.status, signal: r.signal, timedOut: r.timedOut, sandbox: r.sandbox };
-    });
+    const out = [];
+    for (const { cmd, agents } of intents) {
+      const r = await runOne({ command: cmd, cwd: wt, writable: [wt], timeoutMs: 300_000, purpose: 'witness', env: { PATH: process.env.PATH ?? '/usr/bin:/bin', HOME: dir } });
+      out.push({ cmd, agents, exit: r.status, signal: r.signal, timedOut: r.timedOut, sandbox: r.sandbox });
+    }
+    return out;
   } finally {
     safeGit(top, ['worktree', 'remove', '--force', wt], { allowFailure: true });
     fs.rmSync(dir, { recursive: true, force: true });
@@ -195,6 +207,14 @@ export async function promote(auth, claim, jobId, hooks = {}) {
     await auth.serial(() => auth.appendLedger(claim.repo, 'promote_refused', { job: jobId, claim: claim.id, agent: claim.agent, reason: 'out_of_scope', paths: out }));
     return { ok: false, status: 'refused', reason: 'out_of_scope', paths: out };
   }
+  // witness tamper guard: frozen witness files (pinned by blob hash at freeze) may not be
+  // changed by a later promotion, including by the agent that owns them => REVIEW
+  const pins = frozenPins(auth, claim.repo);
+  const touched = changed.filter((f) => pins.has(f));
+  if (touched.length) {
+    await auth.serial(() => auth.appendLedger(claim.repo, 'promote_review', { job: jobId, claim: claim.id, agent: claim.agent, verdict: 'REVIEW', reason: 'witness_modified', paths: touched, owners: touched.map((f) => pins.get(f).agent) }));
+    return { ok: false, status: 'review', verdict: 'REVIEW', reason: 'witness_modified', paths: touched };
+  }
   if (!claim.witnesses.length) return { ok: false, status: 'refused', reason: 'claim has no witness commands; witnesses are required' };
   for (let attempt = 0; attempt <= MAX_CAS_RETRIES; attempt++) {
     const main = readMain(top);
@@ -204,7 +224,7 @@ export async function promote(auth, claim, jobId, hooks = {}) {
       const intent = auth.db.prepare("SELECT payload FROM ledger WHERE repo = ? AND kind = 'promote_intent' AND json_extract(payload, '$.job') = ? ORDER BY seq DESC LIMIT 1").get(claim.repo, jobId);
       const p = intent && JSON.parse(intent.payload);
       if (p && isAncestor(top, p.main_after, main)) {
-        const e = await auth.serial(async () => { const r = await auth.appendLedger(claim.repo, 'promote', { ...p, recovered: true }); freezeIntent(auth, claim); return r; });
+        const e = await auth.serial(async () => { const r = await auth.appendLedger(claim.repo, 'promote', { ...p, recovered: true }); freezeIntent(auth, claim, p.main_after); return r; });
         return { ok: true, status: 'recovered', main: p.main_after, entry: e.seq };
       }
       const e = await auth.serial(() => auth.appendLedger(claim.repo, 'promote_noop', { job: jobId, claim: claim.id, agent: claim.agent, candidate, main }));
@@ -226,7 +246,12 @@ export async function promote(auth, claim, jobId, hooks = {}) {
       await auth.serial(() => auth.appendLedger(claim.repo, 'promote_refused', { job: jobId, claim: claim.id, agent: claim.agent, verdict: 'REFUSE', reason: 'unresolved_conflict', capsule_sha256, files: c.conflict.files.map((f) => f.path) }));
       return { ok: false, status: 'refused', verdict: 'REFUSE', reason: 'unresolved_conflict', capsule: c.conflict, log };
     }
-    const results = runWitnesses(top, c.sha, intentWitnesses(auth, claim));
+    const drift = [...pins].filter(([f, p]) => blobAt(top, c.sha, f) !== p.blob).map(([f]) => f);
+    if (drift.length) {
+      await auth.serial(() => auth.appendLedger(claim.repo, 'promote_review', { job: jobId, claim: claim.id, agent: claim.agent, verdict: 'REVIEW', reason: 'witness_tamper', paths: drift }));
+      return { ok: false, status: 'review', verdict: 'REVIEW', reason: 'witness_tamper', paths: drift };
+    }
+    const results = await runWitnesses(top, c.sha, intentWitnesses(auth, claim));
     const tree = safeGit(top, ['rev-parse', `${c.sha}^{tree}`]).stdout.trim();
     const report = { version: 'g4a-witness-report/v1', merged: c.sha, tree, candidate, main_before: main, rung: c.rung, results };
     const signer = await auth.signer();
@@ -238,18 +263,61 @@ export async function promote(auth, claim, jobId, hooks = {}) {
     const payload = { job: jobId, claim: claim.id, agent: claim.agent, candidate, main_before: main, main_after: c.sha, rung: c.rung, verdict: 'ADMIT', witness: { report, signature, keyId: signer.keyId }, attempts: attempt + 1 };
     await auth.serial(() => auth.appendLedger(claim.repo, 'promote_intent', payload));
     hooks.afterIntent?.();
+    // a non-bare checkout of main: update-ref alone would leave its index/worktree stale
+    const mco = mainCheckout(top, main);
+    if (mco?.dirty) {
+      await auth.serial(() => auth.appendLedger(claim.repo, 'promote_refused', { job: jobId, claim: claim.id, agent: claim.agent, verdict: 'REFUSE', reason: 'main_checked_out_dirty', worktree: mco.path, detail: mco.dirty }));
+      return { ok: false, status: 'refused', verdict: 'REFUSE', reason: 'main_checked_out_dirty', worktree: mco.path };
+    }
     // compare-and-swap: only moves main if it is still where we merged against
     const cas = safeGit(top, ['update-ref', '-m', `g4a promote ${claim.agent}`, 'refs/heads/main', c.sha, main || ZERO], { allowFailure: true });
     if (cas.status !== 0) { log.push(`CAS lost on attempt ${attempt}: main moved`); continue; }
+    if (mco) {
+      // clean and at main_before: two-way read-tree moves index+files; refuses rather than clobbers
+      const rt = safeGit(mco.path, ['read-tree', '-u', '-m', main, c.sha], { allowFailure: true });
+      payload.main_checkout = { path: mco.path, updated: rt.status === 0 };
+      if (rt.status !== 0) log.push(`main checkout ${mco.path} not updated: ${rt.stderr.trim()}`);
+    }
     hooks.afterCas?.();
-    const e = await auth.serial(async () => { const r = await auth.appendLedger(claim.repo, 'promote', payload); freezeIntent(auth, claim); return r; });
+    const e = await auth.serial(async () => { const r = await auth.appendLedger(claim.repo, 'promote', payload); freezeIntent(auth, claim, c.sha); return r; });
     return { ok: true, status: 'promoted', verdict: 'ADMIT', main: c.sha, rung: c.rung, attempts: attempt + 1, entry: e.seq, log };
   }
   await auth.serial(() => auth.appendLedger(claim.repo, 'promote_refused', { job: jobId, claim: claim.id, agent: claim.agent, reason: 'cas_retries_exhausted' }));
   return { ok: false, status: 'refused', reason: 'cas_retries_exhausted', log };
 }
 
-function freezeIntent(auth, claim) {
-  auth.db.prepare('INSERT OR IGNORE INTO intents (repo, claim, agent, witnesses, frozen_at) VALUES (?, ?, ?, ?, ?)')
-    .run(claim.repo, claim.id, claim.agent, JSON.stringify(claim.witnesses), new Date().toISOString());
+function freezeIntent(auth, claim, mainAfter) {
+  // pin every witness-referenced file (globs expanded on the promoted tree) by blob hash
+  const top = repoTop(claim.worktree);
+  const pins = {};
+  const files = splitNul(safeGit(top, ['ls-tree', '-r', '--name-only', '-z', mainAfter]).stdout);
+  for (const g of claim.witness_paths ?? []) for (const f of files) if (f === g || globMatchesPath(g, f)) pins[f] = blobAt(top, mainAfter, f);
+  auth.db.prepare('INSERT OR IGNORE INTO intents (repo, claim, agent, witnesses, frozen_at, pins) VALUES (?, ?, ?, ?, ?, ?)')
+    .run(claim.repo, claim.id, claim.agent, JSON.stringify(claim.witnesses), new Date().toISOString(), JSON.stringify(pins));
+}
+function frozenPins(auth, repo) {
+  const m = new Map();
+  for (const r of auth.db.prepare('SELECT agent, pins FROM intents WHERE repo = ? ORDER BY frozen_at').all(repo))
+    for (const [f, blob] of Object.entries(JSON.parse(r.pins || '{}'))) m.set(f, { agent: r.agent, blob });
+  return m;
+}
+function blobAt(top, sha, f) {
+  const r = safeGit(top, ['rev-parse', '--verify', '--quiet', `${sha}:${f}`], { allowFailure: true });
+  return r.status === 0 ? r.stdout.trim() : null;
+}
+// the worktree (if any) that has refs/heads/main checked out; {dirty} when it is unsafe to move
+function mainCheckout(top, main) {
+  const lines = safeGit(top, ['worktree', 'list', '--porcelain']).stdout.split('\n');
+  let cur = null, found = null;
+  for (const l of lines) {
+    if (l.startsWith('worktree ')) cur = { path: l.slice(9) };
+    else if (l === 'bare' && cur) cur.bare = true;
+    else if (l === 'branch refs/heads/main' && cur && !cur.bare) found = cur;
+  }
+  if (!found) return null;
+  const head = safeGit(found.path, ['rev-parse', 'HEAD'], { allowFailure: true }).stdout.trim();
+  if (head !== main) return { ...found, dirty: `HEAD ${head} != main ${main}` };
+  safeGit(found.path, ['update-index', '-q', '--refresh'], { allowFailure: true });
+  const st = safeGit(found.path, ['status', '--porcelain', '--untracked-files=no']).stdout;
+  return st.trim() ? { ...found, dirty: 'uncommitted changes' } : found;
 }
