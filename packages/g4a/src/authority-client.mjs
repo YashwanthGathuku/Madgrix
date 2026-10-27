@@ -5,6 +5,7 @@
 //                config, so an agent cannot "downgrade" the repo to same-user mode.
 //   user mode:   git config g4a.authority=DIR (same uid; DETECT-ONLY fallback).
 import fs from 'node:fs';
+import { redact } from './privacy.mjs';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
@@ -40,7 +41,7 @@ export function call(loc, cmd, params = {}, { interactive = false } = {}) {
     : [process.execPath, ['--no-warnings', SERVICE, '--root', loc.root, cmd, b64]];
   const r = spawnSync(argv[0], argv[1], { encoding: 'utf8', ...(credential ? { input: credential + '\n' } : {}), stdio: [credential ? 'pipe' : 'ignore', 'pipe', interactive ? 'inherit' : 'pipe'], maxBuffer: 256 << 20 });
   const line = (r.stdout || '').trim().split('\n').pop();
-  try { return JSON.parse(line); } catch { return { ok: false, error: `authority call failed (exit ${r.status}): ${(r.stderr || '').trim().split('\n').slice(-2).join(' ') || line}` }; }
+  try { return JSON.parse(line); } catch { return { ok: false, error: redact(`authority call failed (exit ${r.status}): ${(r.stderr || '').trim().split('\n').slice(-2).join(' ') || line}`) }; }
 }
 
 export const receivePack = (loc) => (loc.mode === 'system' ? `sudo -n -u ${SYSTEM_USER} ${WRAP('g4a-receive-pack')}` : null);
@@ -52,7 +53,7 @@ export function pushAgent(loc, worktree, agent, sha, credential) {
   const pr = call(loc, 'permit', { agent, credential });
   if (!pr.ok) return pr;
   const r = safeGit(worktree, [...PROTO, 'push', '--quiet', '--porcelain', '-o', `permit=${pr.permit}`, ...packArgs(loc, 'r'), loc.url, `${sha}:refs/heads/agents/${agent}`], { allowFailure: true });
-  if (r.status !== 0) return { ok: false, error: `authority refused the push: ${(r.stderr || '').split('\n').filter((l) => /refused|error/.test(l)).join(' ').trim() || `exit ${r.status}`}` };
+  if (r.status !== 0) return { ok: false, error: redact(`authority refused the push: ${(r.stderr || '').split('\n').filter((l) => /refused|error/.test(l)).join(' ').trim() || `exit ${r.status}`}`) };
   return { ok: true };
 }
 

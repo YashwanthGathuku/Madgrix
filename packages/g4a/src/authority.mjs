@@ -10,6 +10,7 @@ import { generateKeyPairSync, createPrivateKey, createPublicKey, createHash, sig
 import { globsOverlap, globMatchesPath } from '../../../src/lib/claims.ts';
 import { ledgerEntryHash, verifyLedgerChain, LEDGER_GENESIS_PREV_HASH } from '../../../src/lib/ledger.ts';
 import { canonicalJson, sha256Hex, randomHex } from '../../../src/lib/canonical.ts';
+import { redact } from './privacy.mjs';
 import { safeGit } from '../../../scripts/lib/safe-git.mjs';
 import { witnessSignerFromKey } from '../../../scripts/lib/admission.mjs';
 
@@ -40,9 +41,17 @@ CREATE TABLE IF NOT EXISTS jobs (
 
 export function openDb(home, { readOnly = false } = {}) {
   fs.mkdirSync(home, { recursive: true, mode: 0o700 });
-  const db = openSqlite(path.join(home, 'g4a.db'), { readOnly });
+  const f = path.join(home, 'g4a.db');
+  // owner-only db/WAL/SHM regardless of the caller's umask (holds claims, paths, witnesses, jobs)
+  const um = readOnly ? null : process.umask(0o077);
+  let db;
+  try {
+    db = openSqlite(f, { readOnly });
+    if (!readOnly) db.exec('PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA busy_timeout=5000;');
+  } finally { if (um !== null) process.umask(um); }
   if (!readOnly) {
-    db.exec('PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA busy_timeout=5000;'); db.exec(SCHEMA);
+    for (const x of [f, `${f}-wal`, `${f}-shm`]) try { if (fs.statSync(x).mode & 0o077) fs.chmodSync(x, 0o600); } catch {}
+    db.exec(SCHEMA);
     // additive migrations
     const cols = (t) => db.prepare(`PRAGMA table_info(${t})`).all().map((c) => c.name);
     if (!cols('claims').includes('witness_paths')) db.exec("ALTER TABLE claims ADD COLUMN witness_paths TEXT NOT NULL DEFAULT '[]'");
@@ -65,6 +74,20 @@ export function repoTop(repo) {
 // $XDG_CONFIG_HOME/g4a-keys), so copying or rolling back the db does not carry the key or anchor.
 export { keyDir } from './lib.mjs';
 import { keyDir } from './lib.mjs';
+// Claim inputs are repo-relative globs and witness commands; both end up in the signed ledger
+// (which cannot be redacted later), so refuse traversal/absolute paths and secret-bearing witnesses.
+export function checkClaimInputs(paths, witnesses = [], witnessPaths = []) {
+  for (const p of [...paths, ...witnessPaths]) {
+    if (typeof p !== 'string' || !p || p.length > 512 || p.includes('\0')) throw new Error('claim path must be a non-empty string (<=512 chars)');
+    if (p.startsWith('/') || /^[A-Za-z]:[\\/]/.test(p) || p.startsWith('~')) throw new Error(`claim path ${JSON.stringify(p)} must be repo-relative`);
+    if (p.split(/[\\/]/).includes('..')) throw new Error(`claim path ${JSON.stringify(p)} must not contain ".."`);
+  }
+  if (!Array.isArray(witnesses)) throw new Error('witnesses must be an array');
+  for (const w of witnesses) {
+    if (typeof w !== 'string' || !w || w.length > 4096 || w.includes('\0')) throw new Error('witness must be a non-empty command string (<=4096 chars)');
+    if (redact(w) !== w) throw new Error('witness command looks like it contains a secret (token, credential URL or auth header); pass secrets via the environment instead');
+  }
+}
 const within = (child, parent) => { const r = path.relative(parent, child); return r === '' || (!r.startsWith('..') && !path.isAbsolute(r)); };
 export const ANCHOR_REF = 'refs/g4a/ledger-head';
 // safe-git denies all transports; the anchor remote may use file:// (tests, other-uid dirs) or ssh
@@ -258,6 +281,7 @@ export class Authority {
       if (!/^[A-Za-z0-9._-]{1,64}$/.test(agent || '')) throw new Error('agent must match [A-Za-z0-9._-]{1,64}');
       if (!Array.isArray(paths) || paths.length === 0) throw new Error('claim needs at least one path');
       if (paths.includes('**')) throw new Error('unbounded claim "**" refused');
+      checkClaimInputs(paths, witnesses, witnessPaths);
       const repo = repoId(repoPath), top = repoTop(repoPath);
       const active = this.activeClaims(repo);
       if (active.some((c) => c.agent === agent)) throw new Error(`agent ${agent} already holds an active claim`);

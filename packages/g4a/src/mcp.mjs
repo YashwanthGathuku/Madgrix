@@ -12,6 +12,7 @@
 // (the CLI child is killed; an already-queued promote job keeps running in the daemon), and are
 // bounded by G4A_MCP_TIMEOUT_MS (default 600000).
 import { spawn } from 'node:child_process';
+import { redact, redactDeep } from './privacy.mjs';
 import path from 'node:path';
 import readline from 'node:readline';
 import { fileURLToPath } from 'node:url';
@@ -90,10 +91,10 @@ export async function callTool(name, args = {}, { cwd = process.env.G4A_MCP_REPO
   let json = null; try { json = JSON.parse(r.stdout); } catch {}
   if (json?.agent_credential && session) creds.set(key, json.agent_credential);
   if (name === 'g4a_release' && json?.ok !== false && r.code === 0) creds.delete(key);
-  scrub(json);
+  scrub(json); if (json) json = redactDeep(json);
   if (r.why === 'timeout') return { content: [{ type: 'text', text: `g4a timed out after ${timeoutMs}ms (G4A_MCP_TIMEOUT_MS). A queued promote keeps running in the daemon; check g4a_status.` }], isError: true };
   const daemonDown = /ECONNREFUSED|ENOENT.*sock|daemon/i.test(r.stderr) && !json;
-  const text = json ? JSON.stringify(json, null, 2) : (r.stdout || r.stderr || `g4a exited ${r.code}`).trim() + (daemonDown ? '\n(hint: start the daemon with `g4a daemon --detach`)' : '');
+  const text = json ? JSON.stringify(json, null, 2) : redact((r.stdout || r.stderr || `g4a exited ${r.code}`).trim()) + (daemonDown ? '\n(hint: start the daemon with `g4a daemon --detach`)' : '');
   return { content: [{ type: 'text', text }], ...(json ? { structuredContent: json } : {}), isError: r.code !== 0 || json?.ok === false };
 }
 

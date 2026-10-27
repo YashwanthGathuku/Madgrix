@@ -8,6 +8,7 @@
 // (append-only), keys/ (0700), state/ (Authority DB), nonces/, accepted.jsonl, authority.json;
 // public dir P (readable by clients): permit/witness/operator *.pub.hex, overrides/, seed.
 import fs from 'node:fs';
+import { redact } from './privacy.mjs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -34,8 +35,10 @@ const permitKeyFile = (L) => path.join(L.keys, 'permit-ed25519.pem');
 const operatorKeyFile = (L) => path.join(L.keys, 'operator-ed25519.pem');
 const pubHex = (k) => createPublicKey(k).export({ type: 'spki', format: 'der' }).toString('hex');
 
-function hookWrapper(file, script, L) {
-  fs.writeFileSync(file, `#!/bin/sh\nexec ${JSON.stringify(process.execPath)} --no-warnings ${JSON.stringify(path.join(HOOKS, script))} ${JSON.stringify(L.root)} ${JSON.stringify(L.pub)}\n`, { mode: 0o755 });
+// single-quote for sh: JSON.stringify gives double quotes, where $() and backticks still expand
+const shq = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`;
+export function hookWrapper(file, script, L) {
+  fs.writeFileSync(file, `#!/bin/sh\nexec ${shq(process.execPath)} --no-warnings ${shq(path.join(HOOKS, script))} ${shq(L.root)} ${shq(L.pub)}\n`, { mode: 0o755 });
 }
 
 // Create (or repair) an authority root. `seed` is a path or bundle readable by this uid; `clientRepo`
@@ -265,5 +268,5 @@ if (process.argv[1] && fs.realpathSync(process.argv[1]) === fileURLToPath(import
   if (!pub && fs.existsSync(L.conf)) L = layout(root, readConf(L).pub);
   const work = cmd === 'init-root' ? Promise.resolve(initRoot({ root, pub, seed: p.seed, clientRepo: p.clientRepo, mode: p.mode || 'user' })) : run(L, cmd, p);
   work.then((r) => { process.stdout.write(JSON.stringify(r) + '\n'); process.exitCode = r && r.ok === false ? 1 : 0; },
-    (e) => { process.stdout.write(JSON.stringify({ ok: false, error: String(e.message || e) }) + '\n'); process.exitCode = 1; });
+    (e) => { process.stdout.write(JSON.stringify({ ok: false, error: redact(String(e.message || e)) }) + '\n'); process.exitCode = 1; });
 }

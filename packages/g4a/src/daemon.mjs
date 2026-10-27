@@ -2,6 +2,7 @@
 // in-daemon job loop (replaces Cloudflare Queues/Workflows). Survives kill -9:
 // claims/ledger/jobs are in SQLite (WAL, synchronous=FULL); running jobs are requeued at start.
 import net from 'node:net';
+import { ensurePrivateDir, writePrivate, redact, redactDeep } from './privacy.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
 import { EventEmitter } from 'node:events';
@@ -18,8 +19,7 @@ export const socketPath = (home = g4aHome()) => path.join(home, 'g4a.sock');
 
 // opts.hooks: test-only promotion hooks (see test/fixtures/crash-daemon.mjs); never set by the CLI.
 export async function startDaemon(home = g4aHome(), { hooks = {}, keyDir } = {}) {
-  fs.mkdirSync(home, { recursive: true, mode: 0o700 });
-  fs.chmodSync(home, 0o700);
+  ensurePrivateDir(home);
   // control-plane git must reach the real git, never the shim
   process.env.PATH = (process.env.PATH || '').split(':').filter((d) => path.resolve(d) !== path.resolve(home, 'bin')).join(':');
   const sock = socketPath(home);
@@ -59,8 +59,8 @@ export async function startDaemon(home = g4aHome(), { hooks = {}, keyDir } = {})
         else if (process.env.G4A_LOCAL_LAND === '1') result = await promote(auth, rowClaim(row), job.id, hooks);
         else result = { ok: false, status: 'refused', reason: 'no_authority', hint: 'run `g4a authority init --system` (or `g4a authority init DIR`, same-user detect-only) for this repo' };
       }
-    } catch (e) { result = { ok: false, status: 'error', error: String(e.message || e) }; }
-    auth.db.prepare("UPDATE jobs SET status = 'done', result = ? WHERE id = ?").run(JSON.stringify(result), job.id);
+    } catch (e) { result = { ok: false, status: 'error', error: redact(String(e.message || e)) }; }
+    auth.db.prepare("UPDATE jobs SET status = 'done', result = ? WHERE id = ?").run(JSON.stringify(redactDeep(result)), job.id);
     bus.emit(job.id, result);
   }
   function loop() {
@@ -95,7 +95,7 @@ export async function startDaemon(home = g4aHome(), { hooks = {}, keyDir } = {})
       let issued = {};
       if (a.agent_credential) {
         if (p.credentialStore === 'session') issued = { agent_credential: a.agent_credential, credential_store: 'session' };
-        else { const f = credPath(p.repo, p.agent); fs.mkdirSync(path.dirname(f), { recursive: true, mode: 0o700 }); fs.writeFileSync(f, a.agent_credential, { mode: 0o600 }); issued = { credential_store: 'file' }; }
+        else { const f = credPath(p.repo, p.agent); ensurePrivateDir(path.dirname(path.dirname(f))); ensurePrivateDir(path.dirname(f)); writePrivate(f, a.agent_credential); issued = { credential_store: 'file' }; }
       }
       try { const r = await auth.claim(p); if (!r.ok) call(loc, 'release', { agent: p.agent, credential: cred }); return { ...r, ...issued, authority: { mode: loc.mode, claim: a.id } }; }
       catch (e) { call(loc, 'release', { agent: p.agent, credential: cred }); throw e; }
@@ -142,7 +142,7 @@ export async function startDaemon(home = g4aHome(), { hooks = {}, keyDir } = {})
           const m = methods[req.method];
           if (!m) throw new Error(`unknown method ${req.method}`);
           return m(req.params || {});
-        }).then((result) => conn.write(JSON.stringify({ id: req.id, result }) + '\n'), (e) => conn.write(JSON.stringify({ id: req.id, error: String(e.message || e) }) + '\n'))
+        }).then((result) => conn.write(JSON.stringify({ id: req.id, result }) + '\n'), (e) => conn.write(JSON.stringify({ id: req.id, error: redact(String(e.message || e)) }) + '\n'))
           .catch(() => {});
       }
     });
@@ -152,7 +152,7 @@ export async function startDaemon(home = g4aHome(), { hooks = {}, keyDir } = {})
   await new Promise((res, rej) => server.listen(sock, res).on('error', rej));
   process.umask(old);
   fs.chmodSync(sock, 0o600);
-  fs.writeFileSync(path.join(home, 'g4a.pid'), String(process.pid));
+  writePrivate(path.join(home, 'g4a.pid'), String(process.pid));
   for (const s of ['SIGINT', 'SIGTERM']) process.on(s, () => { server.close(); fs.rmSync(sock, { force: true }); process.exit(0); });
   setImmediate(loop); // resume requeued jobs
   return { server, auth, sock, requeued };

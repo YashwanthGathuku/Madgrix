@@ -3,6 +3,7 @@
 // caller inside a .g4a/worktrees/ checkout.
 // Everything not classified as a safe read command is spawned with inherited stdio.
 import { spawn, spawnSync } from 'node:child_process';
+import { ensurePrivateDir, pruneTee, writePrivate, redact } from './privacy.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
 import { classify, parseArgs, altArgs, compactors, appendLog, estTokens, g4aHome, agentMarker, keyDir } from './lib.mjs';
@@ -131,9 +132,16 @@ if (!kind) {
       if (after >= before) emitRaw('raw-nogain');
       else {
         // tee: keep the full raw output so nothing is lost
-        const teeDir = path.join(g4aHome(), 'tee');
+        // tee: keep the full raw output (redacted, 0600, pruned by age/count) so nothing is lost.
+        // G4A_TEE=0 disables it.
         let tee = '';
-        try { fs.mkdirSync(teeDir, { recursive: true }); tee = path.join(teeDir, `${Date.now()}-${process.pid}.txt`); fs.writeFileSync(tee, Buffer.concat([rawOut, rawErr])); } catch { tee = '(tee failed)'; }
+        if (process.env.G4A_TEE === '0') tee = '(tee disabled; rerun with G4A_RAW=1)';
+        else try {
+          const teeDir = ensurePrivateDir(path.join(ensurePrivateDir(g4aHome()), 'tee'));
+          pruneTee(teeDir);
+          tee = path.join(teeDir, `${Date.now()}-${process.pid}.txt`);
+          writePrivate(tee, redact(Buffer.concat([rawOut, rawErr]).toString('utf8')));
+        } catch { tee = '(tee failed)'; }
         const o = outC.replaceAll('{TEE}', tee), e = errC.replaceAll('{TEE}', tee);
         after = Buffer.byteLength(o) + Buffer.byteLength(e);
         process.stdout.write(o); process.stderr.write(e);

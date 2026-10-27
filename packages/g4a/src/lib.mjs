@@ -1,6 +1,7 @@
 // g4a Phase 0 core: agent detection, safe-command classification, compactors,
 // token estimate, JSONL log. Deterministic; no network, no LLM.
 import fs from 'node:fs';
+import { ensurePrivateDir, rotateLog, minimiseArgv, redactDeep, appendPrivate } from './privacy.mjs';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -121,9 +122,12 @@ export function altArgs(kind, p) {
 
 export function appendLog(rec, env = process.env) {
   try {
-    const home = g4aHome(env);
-    fs.mkdirSync(home, { recursive: true });
-    fs.appendFileSync(path.join(home, 'log.jsonl'), JSON.stringify(rec) + '\n');
+    const home = ensurePrivateDir(g4aHome(env));
+    const f = path.join(home, 'log.jsonl');
+    rotateLog(f, env);
+    const r = { ...rec };
+    if (Array.isArray(r.argv)) r.argv = minimiseArgv(r.argv, env);
+    appendPrivate(f, JSON.stringify(redactDeep(r, env)) + '\n');
   } catch { /* logging must never break git */ }
 }
 
