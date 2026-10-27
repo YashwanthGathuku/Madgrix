@@ -81,6 +81,12 @@ const WITNESS_SECRET = [
   /(^|\s)(-H|--header|--proxy-header)(\s+|=)?['"]?[^'":\n]*(tok|auth|key|secret|pass|cookie|session|sig|cred)[^'":\n]*:/i,
   /(^|\s)(--oauth2-bearer|--cookie)(\s+|=)\S/,
   /\bx-[a-z0-9-]*(tok|auth|key|secret)[a-z0-9-]*\s*:/i,
+  // any request header other than a short list of harmless ones (covers glued -Hname:value)
+  /(^|\s)(-H|--header|--proxy-header)(\s+|=)?['"]?(?!(accept|accept-encoding|accept-language|content-type|user-agent|cache-control|if-none-match|if-modified-since)\s*:)[^\s'":]+\s*:/i,
+  /\b(mysql|mariadb|mysqldump|mysqladmin|mysqlimport)\b[^|;&]*\s(-p\S|--password(=|\s+)\S)/,
+  /\bsshpass\b[^|;&]*\s-(p|P)/,
+  /\bcurl\b[^|;&]*\s(-[a-zA-Z]*b|--cookie|--cookie-jar)(\s+|=)?\S/,
+  /(^|\s)--password(=|\s+)\S/,
 ];
 // overlap is checked case-insensitively too: a case variant would collide on macOS/Windows
 export const claimOverlap = (a, b) => globsOverlap(a, b) || globsOverlap(a.toLowerCase(), b.toLowerCase());
@@ -101,7 +107,7 @@ export function checkClaimInputs(paths, witnesses = [], witnessPaths = []) {
   if (!Array.isArray(witnesses)) throw new Error('witnesses must be an array');
   for (const w of witnesses) {
     if (typeof w !== 'string' || !w || w.length > 4096 || w.includes('\0')) throw new Error('witness must be a non-empty command string (<=4096 chars)');
-    if (WITNESS_SECRET.some((re) => re.test(w))) throw new Error('witness command passes credentials (-u/--user user:pass, an auth-like -H header, a bearer or cookie); witnesses are stored in the permanent signed ledger, so pass secrets via the environment instead');
+    if (WITNESS_SECRET.some((re) => re.test(w))) throw new Error('witness command passes credentials (-u/--user user:pass, a -H header other than Accept/Content-Type/User-Agent-style ones, a bearer or cookie, mysql -p/--password, sshpass -p); witnesses are stored in the permanent signed ledger, so pass secrets via the environment instead');
     if (redact(w) !== w) throw new Error('witness command looks like it contains a secret (token, credential URL or auth header); pass secrets via the environment instead');
   }
 }
@@ -292,7 +298,7 @@ export class Authority {
     for (const c of this.activeClaims(repo)) if (c.agent !== agent) for (const p of c.witness_paths) out.push({ owner: c.agent, path: p, frozen: false });
     return out;
   }
-  claim({ repo: repoPath, agent, paths, witnesses = [], witnessPaths = [], allowOverlap = false }) {
+  claim({ repo: repoPath, agent, paths, witnesses = [], witnessPaths = [], allowOverlap = false, expectBaseline = null }) {
     return this.serial(async () => {
       if (!/^[A-Za-z0-9._-]{1,64}$/.test(agent || '')) throw new Error('agent must match [A-Za-z0-9._-]{1,64}');
       if (!Array.isArray(paths) || paths.length === 0) throw new Error('claim needs at least one path');
@@ -319,6 +325,9 @@ export class Authority {
         return { ok: false, refused: 'witness_paths', guarded };
       }
       const baseline = safeGit(top, ['rev-parse', '--verify', 'refs/heads/main^{commit}']).stdout.trim();
+      // mirrored claims: the authority already fixed the baseline its permit will check; a local
+      // worktree on any other main would carry foreign paths into the push (refused out-of-claim)
+      if (expectBaseline && expectBaseline !== baseline) return { ok: false, refused: 'main_out_of_sync', local: baseline, authority: expectBaseline };
       const branch = `g4a/${agent}`;
       const worktree = path.join(top, '.g4a', 'worktrees', agent);
       excludeG4a(top);
@@ -399,6 +408,14 @@ export class Authority {
         const out = [...files].filter((f) => !c.paths.some((g) => globMatchesPath(g, f)));
         if (out.length) warnings.push(`commit touches paths outside claim ${c.id} (${c.paths.join(', ')}): ${out.join(', ')}`);
       }
+      // history-importing writes: check the content they would bring in, like commit (promote
+      // refuses the same out-of-claim paths later; this stops them locally first)
+      if (['cherry-pick', 'merge', 'am', 'reset', 'rebase', 'pull'].includes(sub)) {
+        const r = importedPaths(wtTop, sub, rest);
+        if (r.warning) warnings.push(r.warning);
+        const out = [...r.files].filter((f) => !c.paths.some((g) => globMatchesPath(g, f)));
+        if (out.length) warnings.push(`${sub} brings in paths outside claim ${c.id} (${c.paths.join(', ')}): ${out.join(', ')}`);
+      }
       if (sub === 'push' && (rest.some(isMain) || rest.some((a) => /^--(mirror|all|delete)$|^-d$/.test(a)))) warnings.push('pushing to main (or --mirror/--all/--delete) bypasses g4a promotion; use `g4a promote`');
       if (sub === 'update-ref' && (rest.some((a) => a === 'main' || a === 'refs/heads/main' || a.startsWith('refs/g4a/')) || rest.includes('--stdin'))) warnings.push('update-ref on main or refs/g4a/* (or --stdin) is reserved to the g4a daemon');
       if (sub === 'symbolic-ref' && rest.some((a) => a === 'main' || a === 'refs/heads/main' || a.startsWith('refs/g4a/'))) warnings.push('symbolic-ref onto main or refs/g4a/* is reserved to the g4a daemon');
@@ -442,6 +459,61 @@ export function commitPathspecs(rest) {
   return { specs, fromFile };
 }
 export function rowClaim(r) { return { ...r, paths: JSON.parse(r.paths), witnesses: JSON.parse(r.witnesses), witness_paths: JSON.parse(r.witness_paths ?? '[]'), allow_overlap: !!r.allow_overlap }; }
+// Paths a cherry-pick/merge/am/reset/rebase/pull would change in the worktree's history, from
+// the arguments alone (before git runs). Continuation forms (--continue/--abort/--skip/--quit)
+// bring nothing new in; pull cannot be checked before it fetches, so it is refused.
+const IMPORT_VAL = new Set(['-m', '--mainline', '-s', '--strategy', '-X', '--strategy-option', '-S', '--gpg-sign', '--onto', '--exec', '-x', '--cleanup', '-F', '--file', '--into-name', '-C', '-p', '--directory', '--exclude', '--include', '--patch-format', '--message', '--rerere-autoupdate']);
+export function importedPaths(top, sub, rest) {
+  const files = new Set();
+  const git = (args) => safeGit(top, args, { allowFailure: true });
+  if (rest.some((a) => /^--(continue|abort|skip|quit|show-current-patch)$/.test(a))) return { files };
+  if (sub === 'pull') return { files, warning: 'git pull cannot be scope-checked before it fetches; run `git fetch` and then `git merge`/`git rebase` (both are checked)' };
+  const pos = [], onto = [];
+  for (let i = 0; i < rest.length; i++) {
+    const a = rest[i];
+    if (a === '--') { if (sub !== 'reset') pos.push(...rest.slice(i + 1)); else return { files }; break; }
+    if (a === '--onto') { onto.push(rest[++i]); continue; }
+    if (/^--onto=/.test(a)) { onto.push(a.slice(7)); continue; }
+    if (IMPORT_VAL.has(a)) { i++; continue; }
+    if (a.startsWith('-')) continue;
+    pos.push(a);
+  }
+  const commit = (r) => git(['rev-parse', '--verify', '--quiet', '--end-of-options', `${r}^{commit}`]).stdout.trim();
+  const add = (out) => { for (const f of splitNul(out)) files.add(f); };
+  if (sub === 'am') {
+    if (!pos.length) return { files, warning: 'git am from stdin cannot be scope-checked; pass the patch file(s)' };
+    for (const f of pos) {
+      let txt; try { txt = fs.readFileSync(path.resolve(top, f), 'utf8'); } catch { return { files, warning: `git am: cannot read ${f} to scope-check it` }; }
+      for (const m of txt.matchAll(/^diff --git a\/(.+?) b\/(.+)$/gm)) { files.add(m[1]); files.add(m[2]); }
+      for (const m of txt.matchAll(/^(?:\+\+\+|---) [ab]\/(.+)$/gm)) files.add(m[1].trim());
+    }
+    return { files };
+  }
+  if (sub === 'reset') {
+    const t = pos[0]; if (!t) return { files };
+    if (!commit(t)) return { files }; // `reset <path>`: unstaging only
+    if (pos.length > 1) return { files }; // `reset <tree-ish> <paths>`: index only; commit is checked
+    add(git(['diff', '--name-only', '-z', 'HEAD', commit(t)]).stdout);
+    return { files };
+  }
+  if (sub === 'cherry-pick') {
+    for (const r of pos) {
+      if (r.includes('..')) { add(git(['log', '--format=', '--name-only', '-z', '--end-of-options', r]).stdout); continue; }
+      const c = commit(r); if (!c) return { files, warning: `cannot resolve ${r} to scope-check the cherry-pick` };
+      add(git(['diff-tree', '-m', '--no-commit-id', '-r', '--name-only', '-z', '--root', c]).stdout);
+    }
+    return { files };
+  }
+  // merge / rebase: what the target(s) changed since they diverged from HEAD
+  const targets = sub === 'rebase' ? [...onto, ...(pos[0] ? [pos[0]] : [])] : pos;
+  if (sub === 'rebase' && pos[1]) { const b = commit(pos[1]); if (b) for (const t of targets) { const c = commit(t); if (c) add(git(['diff', '--name-only', '-z', `${c}...${b}`]).stdout); } }
+  for (const t of targets) {
+    const c = commit(t); if (!c) return { files, warning: `cannot resolve ${t} to scope-check the ${sub}` };
+    add(git(['diff', '--name-only', '-z', `HEAD...${c}`]).stdout);
+  }
+  if (!targets.length && sub === 'rebase') { const u = commit('@{upstream}'); if (u) add(git(['diff', '--name-only', '-z', `HEAD...${u}`]).stdout); }
+  return { files };
+}
 export function splitNul(s) { return s.split('\0').filter(Boolean); }
 
 function excludeG4a(top) {

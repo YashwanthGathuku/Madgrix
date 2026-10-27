@@ -63,8 +63,10 @@ if sudo -n true 2>/dev/null; then
   [ "$(g4a verify --repo "$W/rb" | field ok)" = true ] || fail "verify B"
   [ "$(g4a authority audit --repo "$W/rb" | field ok)" = true ] || fail "audit B"
   echo "B ok: 2 promoted via sudo wrappers, verify+audit ok; now agent-user bypass attempts:"
-  (cd "$HERE" && node --test test/system.test.mjs) | grep -E '^# (pass|fail)'
-  (cd "$HERE" && node --test test/system.test.mjs) | grep -qx '# fail 0' || fail "system separation test"
+  # capture first: `| grep -q` exits on the first match and the test runner then dies of EPIPE
+  sysout=$(cd "$HERE" && node --test test/system.test.mjs 2>&1) || true
+  printf '%s\n' "$sysout" | grep -E '^# (pass|fail)'
+  printf '%s\n' "$sysout" | grep -qx '# fail 0' || fail "system separation test"
 else
   echo "== B skipped: no passwordless sudo (system authority not exercised) =="
 fi

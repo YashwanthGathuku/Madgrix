@@ -18,7 +18,11 @@ see PRIVACY.md.
     their `.pub.hex`, anchors, overrides) use `O_NOFOLLOW` plus an owner check, so a planted
     symlink at the target fails the write instead of redirecting it.
   - `G4A_KEY_DIR` and its `anchors/` and `overrides/` subdirectories must be real directories
-    owned by the current uid; a symlinked key dir is refused.
+    owned by the current uid; a symlinked key dir is refused, and so is a key dir with any
+    symlinked parent (each component is checked with `lstat`; root-owned system symlinks such
+    as `/tmp` on some distros are allowed).
+  - Private files with a link count above 1 (a planted hardlink to another file) are refused
+    instead of being written, so a hardlink cannot redirect a key or log write.
   - `G4A_HOME` and its subdirectories must be real directories owned by the current uid.
   - Temp dirs come from `mkdtemp` (`0700`). The system installer's seed bundle is `0600` in a
     `0700` dir, owned only by the authority user, and removed on success, failure, exit or signal.
@@ -34,7 +38,11 @@ see PRIVACY.md.
 - **Secrets in the signed ledger.** Witness commands that look like they contain a secret are
   refused at claim time, including credentials passed to curl-style tools (`-u`/`--user
   user:pass`, `-H`/`--header` with an auth-, token-, key-, secret- or cookie-like name,
-  `--oauth2-bearer`, `--cookie`) and `scheme://token@` URLs of any length.
+  `--oauth2-bearer`, `-b`/`--cookie`/`--cookie-jar`), any `-H`/`--header` other than a short
+  allowlist of plain headers (Accept, Accept-Encoding, Accept-Language, Content-Type,
+  User-Agent, Cache-Control, If-None-Match, If-Modified-Since), including glued `-Hname:v`,
+  `mysql`/`mariadb`/`mysqldump`/`mysqladmin`/`mysqlimport` `-pX`/`--password`, `sshpass -p`/`-P`,
+  any `--password=`, and `scheme://token@` URLs of any length.
 - **Shim scope enforcement in an agent context** (git reached through `PATH`).
   - Every git global option is parsed (`-C`, `-c`, `--config-env`, `--git-dir`,
     `--work-tree`, `--exec-path`, `-p`/`--paginate`, `--no-advice`, the pathspec flags and the
@@ -44,15 +52,23 @@ see PRIVACY.md.
   - In a g4a-managed repo, agents may not override `core.hooksPath`, `core.logAllRefUpdates`,
     `core.fsmonitor`, `core.worktree`, `core.sshCommand`, `alias.*`, `include.*` or
     `includeIf.*`, whether through `-c`, `--config-env`, `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_n`,
-    `GIT_CONFIG_PARAMETERS`, `GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM`, or `git config` writes.
+    `GIT_CONFIG_PARAMETERS` (both git's `'key=value'` and `'key'='value'` forms are parsed; a
+    value that does not parse is refused, fail-closed), `GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM`, or `git config` writes.
     `--exec-path`/`GIT_EXEC_PATH` are refused; so are `--git-dir`/`--work-tree` (and the `GIT_DIR`
     family) on writes, and `GIT_INDEX_FILE` on commits.
   - Aliases from git config are resolved and the expanded command is checked. Shell (`!`)
-    aliases run their own `git` calls, which re-enter the shim and are checked there.
+    aliases are refused for agents in a g4a-managed repo: git runs them with git-core first on
+    `PATH`, so their nested `git` calls would not re-enter the shim.
   - Write subcommands include tag, stash, notes, symbolic-ref, replace, commit-tree, worktree,
     rm, mv, restore, clean, reflog expire/delete, update-index, read-tree and filter-branch, as
     well as commit, push, merge, rebase, reset, checkout, switch, cherry-pick, am, apply, revert,
     pull, update-ref and branch. Read forms (`tag -l`, `stash list`, `worktree list`) are not.
+  - History-importing writes are content-checked like commit: `cherry-pick` (each commit or
+    range), `merge` and `rebase` (what the target changed since it diverged from HEAD,
+    including `--onto`), `reset <commit>` (the diff between HEAD and the target) and `am` (the
+    paths in the patch files) are blocked when they would bring in paths outside the claim.
+    `pull` cannot be checked before it fetches, so agents must `fetch` and then `merge`/`rebase`;
+    `am` from stdin is refused for the same reason. Promote still refuses any out-of-claim land.
   - The daemon gets the parsed subcommand and arguments; commit pathspecs (`git commit -m x
     b.txt`), `update-ref --stdin`, `symbolic-ref` onto main and `git replace` are checked too.
   - An operator-signed `G4A_ENFORCE` override turns these blocks into warnings.
@@ -65,6 +81,59 @@ see PRIVACY.md.
   - The CLI prints only the redacted error message.
   - Stack traces are shown only with `G4A_DEBUG=1`, and they are redacted too.
   - Daemon, authority and MCP errors are redacted before they are returned or stored.
+
+## Agent OS users (default for system mode)
+
+To set an agent up, run `g4a agent add <name>` once as the operator. You need passwordless sudo,
+and the repo must already be under a system authority. The command:
+
+- creates a non-sudo system user `g4a-a-<name>` with a private `0700` home at
+  `/var/lib/g4a-agents/<name>`;
+- gives that user its own clone of authority main at `~/repo`, so there are no shared worktrees
+  and no group permissions to manage, plus its own `G4A_HOME`, shim and daemon;
+- writes a `0600` credential owned by the agent user, inside a `0700` directory;
+- binds name→uid at the authority (root-only `os-bind`).
+
+`g4a run --agent <name> -- <cmd>` starts the command as that user. It goes through a single
+sudoers rule, `<operator> ALL=(g4a-a-<name>) NOPASSWD: /usr/local/lib/g4a/bin/g4a-agent-exec`,
+which `visudo` checks. The rule uses `env_reset`, and only a short allowlist of variables is kept.
+
+Once a repo has agent users, claim, permit, land and release are refused for the operator uid,
+and for any uid acting under another agent's name. The operator can turn this back on with
+`g4a agent policy --allow-operator on`. Agent writes through the shim started as the operator are
+refused too, and both `g4a run` and the launcher refuse root.
+
+Each agent also anchors its client ledger under its own `refs/g4a/client-ledgers/<name>`, and
+only the bound uid may append to that ref.
+
+`g4a agent remove <name>` cleans up completely:
+
+- kills the agent's processes;
+- releases its claim and deletes its branch, and deletes its `refs/g4a/client-ledgers/<name>`
+  anchor ref (the final tip stays recorded in `accepted.jsonl`, so `authority audit` still holds);
+- unbinds it at the authority;
+- removes its sudoers line, crontab, user, group and home;
+- deletes its files in `/tmp`, `/var/tmp` and `/dev/shm`.
+
+`authority uninstall` removes every agent first. test/system.test.mjs covers all of this: two
+agents can't read each other's credential or home, can't write each other's worktree or anchor,
+and can't impersonate each other; the launcher can't escalate and doesn't evaluate arguments; and
+removal leaves nothing behind.
+
+### Privileged operator bootstrap (system mode)
+
+The operator key signs `G4A_ENFORCE` overrides, so whoever creates it controls enforcement. In
+system mode `operator-init` and `override` are not in the any-uid `g4a-authority` sudo wrapper's
+allowlist. `g4a operator init` and `g4a override` reach the authority only through
+`sudo runuser -u g4a-authority` with a cleared environment, which needs root (agent users have
+no such sudo rule; the operator is asked for a password unless they have passwordless sudo).
+The authority service also refuses both commands whenever `G4A_CALLER_UID` or `SUDO_USER` is
+present, so a call through the wrapper or a sudo'd non-root shell is rejected even if the
+wrapper changed. Run `g4a operator init` once, as the operator, right after
+`g4a authority init --system`, before adding agents. If an operator key was created before this
+fix, have root delete `<root>/keys/operator-ed25519.*` and run `g4a operator init` again.
+test/system.test.mjs checks that an agent and the operator get `bad command` through the wrapper
+and that the service refuses both commands with a caller uid or `SUDO_USER` set.
 
 ## Detected only (not prevented)
 
@@ -84,13 +153,24 @@ see PRIVACY.md.
 
 ## Known gaps and risks
 
-- **No isolation between same-uid agents with the default file credential store.** The
-  per-agent credential in `G4A_HOME/credentials/<hash>/<agent>` is a `0600` file, and the CLI
-  reads it automatically. Any process running as your uid can therefore release or promote
-  another agent's claim just by naming it. Release and promote do require the credential, but
-  in the file store every same-uid process has it. For real separation, run agents with
-  `G4A_MCP_SESSION_CREDENTIALS=1` (memory-only credentials held by one MCP server) or, better,
-  as separate uids against a system-mode authority.
+- **Same-uid agents are not isolated from each other.** This is why one OS user per agent is now
+  the default for system mode (see "Agent OS users" below). If you still run several agents as
+  your own uid, the per-agent credential in `G4A_HOME/credentials/<hash>/<agent>` is a `0600`
+  file that every process running as your uid can read. Any of them can then release or promote
+  another agent's claim. `G4A_MCP_SESSION_CREDENTIALS=1` narrows this but does not close it:
+  ptrace and `/proc` are still open to same-uid processes.
+- **Limits of agent OS users:**
+  - The operator account still has sudo. It installs, adds and removes agents, so anything
+    running as the operator can do the same, and agents must never run as the operator.
+  - The launcher's `env_keep` allowlist passes `ANTHROPIC_API_KEY`, `OPENAI_API_KEY` and
+    `GEMINI_API_KEY` to the agent, so each agent sees the key you launch it with.
+  - `no_new_privs` cannot be set, because agents need sudo to reach the authority wrappers.
+  - Agent CLIs (Codex, Claude Code, …) need their own login inside the agent home, and their
+    binaries must be readable by the agent user. A `0700` operator home hides them.
+  - A witness command runs as `g4a-authority`, unsandboxed where bwrap is unavailable. It could
+    therefore write `state/os-agents.json` directly. This is the same exposure as the existing
+    witness and `init-root` risk.
+  - Detect-only (same-user) mode still only detects.
 
 - Redaction is pattern-based (see PRIVACY.md). Tee files hold raw git output, which can include
   diff content and therefore source code.

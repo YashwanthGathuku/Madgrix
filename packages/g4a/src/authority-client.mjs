@@ -33,10 +33,15 @@ export function locate(repoPath) {
   return { mode: 'user', repo: id, root, pub: path.join(root, 'pub'), url: path.join(root, 'repo'), anchors: path.join(root, 'anchors.git') };
 }
 
+export const ROOT_OPERATOR_CMDS = ['operator-init', 'override'];
 export function call(loc, cmd, params = {}, { interactive = false } = {}) {
   const { credential, ...rest } = params;
   const b64 = Buffer.from(JSON.stringify(credential ? { ...rest, credential_stdin: true } : rest)).toString('base64');
-  const argv = loc.mode === 'system'
+  // operator-init / override are a privileged bootstrap: never via the any-uid sudo wrapper, only
+  // through root (sudo runuser, which agent users cannot run), with a clean env and the TTY prompt
+  const argv = loc.mode === 'system' && ROOT_OPERATOR_CMDS.includes(cmd)
+    ? ['sudo', ['runuser', '-u', SYSTEM_USER, '--', '/usr/bin/env', '-i', `PATH=${LIB}/bin:/usr/bin:/bin`, `HOME=/var/lib/${SYSTEM_USER}`, 'LANG=C.UTF-8', `${LIB}/bin/node`, '--no-warnings', `${LIB}/packages/g4a/src/authority-service.mjs`, '--root', loc.root, '--pub', loc.pub, cmd, b64]]
+    : loc.mode === 'system'
     ? ['sudo', ['-n', '-u', SYSTEM_USER, WRAP('g4a-authority'), loc.id, cmd, b64]]
     : [process.execPath, ['--no-warnings', SERVICE, '--root', loc.root, cmd, b64]];
   const r = spawnSync(argv[0], argv[1], { encoding: 'utf8', ...(credential ? { input: credential + '\n' } : {}), stdio: [credential ? 'pipe' : 'ignore', 'pipe', interactive ? 'inherit' : 'pipe'], maxBuffer: 256 << 20 });
@@ -64,6 +69,9 @@ export function fetchMain(loc, repo) {
   return safeGit(repo, ['rev-parse', 'refs/g4a/authority-main']).stdout.trim();
 }
 
-export const clientAnchorRemote = (loc) => ({ url: loc.anchors, ref: CLIENT_ANCHOR_REF, receivePack: receivePack(loc), uploadPack: uploadPack(loc) });
+// an agent OS user (g4a run --agent) anchors its own ledger under its own ref; the anchor hook
+// only lets the bound uid write it, so agents cannot clobber each other's anchor chains
+const clientRef = (loc) => (loc.mode === 'system' && /^[a-z0-9][a-z0-9-]{0,23}$/.test(process.env.G4A_AGENT_NAME || '') ? `${CLIENT_ANCHOR_REF}s/${process.env.G4A_AGENT_NAME}` : CLIENT_ANCHOR_REF);
+export const clientAnchorRemote = (loc) => ({ url: loc.anchors, ref: clientRef(loc), receivePack: receivePack(loc), uploadPack: uploadPack(loc) });
 export const authorityAnchorRemote = (loc) => ({ url: loc.anchors, ref: AUTH_ANCHOR_REF, uploadPack: uploadPack(loc) });
 export const pubFile = (loc, name) => path.join(loc.pub, name);

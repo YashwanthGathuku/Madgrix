@@ -80,7 +80,7 @@ export function sandboxMode(env = process.env, purpose = "resolver") {
 }
 
 /**
- * @param {{ command: string, cwd: string, writable: string[], readOnly?: string[], env: Record<string, string>, timeoutMs?: number, purpose?: "resolver" | "witness" }} opts
+ * @param {{ command: string, cwd: string, writable: string[], readOnly?: string[], hidden?: string[], env: Record<string, string>, timeoutMs?: number, purpose?: "resolver" | "witness" }} opts
  * @returns {{ status: number | null, signal: string | null, timedOut: boolean, error: string | null, stderrTail: string, sandbox: "bwrap" | "none" }}
  */
 export function runContained(opts) {

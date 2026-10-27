@@ -304,6 +304,20 @@ async function authorityCmd(args) {
   const loc = C.locate(o.repo);
   if (!loc) { out({ ok: false, error: 'no authority for this repo (g4a authority init --system)' }); return; }
   if (['audit', 'status', 'ledger'].includes(sub)) return out(C.call(loc, sub));
+  if (sub === 'sync') {
+    // fast-forward local main to authority main (no merge; refuses a diverged local main)
+    const top = A.repoTop(o.repo);
+    const am = C.fetchMain(loc, top);
+    const lm = safeGit(top, ['rev-parse', '--verify', '--quiet', 'refs/heads/main'], { allowFailure: true }).stdout.trim();
+    if (lm === am) return out({ ok: true, main: am, moved: false });
+    if (lm && safeGit(top, ['merge-base', '--is-ancestor', lm, am], { allowFailure: true }).status !== 0) { out({ ok: false, error: 'local main is not an ancestor of authority main; not moving it', local: lm, authority: am }); process.exitCode = 1; return; }
+    const { mainCheckout } = await import('../src/promote.mjs');
+    const wt = mainCheckout(top, lm);
+    if (wt?.dirty) { out({ ok: false, error: 'main is checked out with local changes; commit or stash first' }); process.exitCode = 1; return; }
+    safeGit(top, ['update-ref', '-m', 'g4a promote sync (authority main)', 'refs/heads/main', am, lm || '0'.repeat(40)]);
+    if (wt) safeGit(wt.path, ['read-tree', '-u', '-m', lm, am], { allowFailure: true });
+    return out({ ok: true, main: am, moved: true, from: lm || null });
+  }
   if (sub === 'rebind' || sub === 'unbind') {
     // human-only: operator passphrase typed on /dev/tty, checked authority-side; logged with an operator signature
     await refuseAgent();
@@ -313,6 +327,51 @@ async function authorityCmd(args) {
     return out(r);
   }
   console.error('usage: g4a authority init --system | init DIR | audit | status | ledger | rebind --agent A [--uid N] [--credential-out F] | unbind --agent A  [--repo R]'); process.exitCode = 2;
+}
+
+// g4a agent add|remove|list|policy (system mode): one OS user per agent (src/agent-users.mjs, root
+// part via sudo). g4a run --agent NAME -- CMD: run CMD as g4a-a-NAME through the root-owned launcher.
+const AGENT_NAME_RE = /^[a-z0-9][a-z0-9-]{0,23}$/;
+const AGENTS_MAP = process.env.G4A_AGENTS_MAP_TEST || '/etc/g4a/agents.json';
+const readAgentsMap = () => { try { return JSON.parse(fs.readFileSync(AGENTS_MAP, 'utf8')); } catch { return { agents: {}, policy: {} }; } };
+function rootHelper(args) {
+  const r = spawnSync('sudo', ['-n', process.execPath, '--no-warnings', path.join(PKG, 'src', 'agent-users.mjs'), ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'inherit'] });
+  try { return JSON.parse(r.stdout.trim().split('\n').pop()); } catch { return { ok: false, error: `agent helper failed (exit ${r.status}; needs sudo)` }; }
+}
+async function agentCmd(args) {
+  const o = opts(args); const sub = o._[0], name = o._[1];
+  if (sub === 'list') { const m = readAgentsMap(); return out({ ok: true, agents: Object.entries(m.agents ?? {}).map(([n, a]) => ({ name: n, user: a.user, uid: a.uid, clone: a.clone, repo: a.repo, operator: a.operator })), policy: m.policy ?? {} }); }
+  await refuseAgent();
+  if (process.getuid() === 0) { out({ ok: false, error: 'run g4a agent as your own (operator) user, not root; it uses sudo for the root part' }); process.exitCode = 1; return; }
+  const me = os.userInfo().username;
+  if (sub === 'add' || sub === 'remove') {
+    if (!AGENT_NAME_RE.test(String(name ?? ''))) { out({ ok: false, error: 'bad agent name: use 1-24 of [a-z0-9-], starting with a letter or digit' }); process.exitCode = 2; return; }
+    const { repoId } = await import('../src/authority.mjs');
+    const r = sub === 'add' ? rootHelper(['add', name, repoId(o.repo), me]) : rootHelper(['remove', name]);
+    out(r); if (!r.ok) process.exitCode = 1; return;
+  }
+  if (sub === 'policy') {
+    const v = o['allow-operator'];
+    if (v !== 'on' && v !== 'off') { console.error('usage: g4a agent policy --allow-operator on|off [--repo R]'); process.exitCode = 2; return; }
+    const { repoId } = await import('../src/authority.mjs');
+    const r = rootHelper(['policy', repoId(o.repo), v]); out(r); if (!r.ok) process.exitCode = 1; return;
+  }
+  console.error('usage: g4a agent add NAME [--repo R] | remove NAME | list | policy --allow-operator on|off [--repo R]'); process.exitCode = 2;
+}
+function runCmd(args) {
+  const dd = args.indexOf('--');
+  const head = dd < 0 ? args : args.slice(0, dd), cmd = dd < 0 ? [] : args.slice(dd + 1);
+  const ai = head.indexOf('--agent'), name = ai >= 0 ? head[ai + 1] : undefined;
+  const fail = (e, code = 2) => { console.error(`g4a: refused: ${e}`); process.exitCode = code; };
+  if (head.length !== 2 || ai !== 0) return fail('usage: g4a run --agent NAME -- COMMAND [ARGS...]');
+  if (!AGENT_NAME_RE.test(String(name ?? ''))) return fail('bad agent name');
+  if (!cmd.length) return fail('no command (g4a run --agent NAME -- COMMAND [ARGS...])');
+  if (process.getuid() === 0) return fail('do not launch agents from root; run g4a run as the operator user');
+  const a = (readAgentsMap().agents ?? {})[name];
+  if (!a) return fail(`no agent user for ${name} (g4a agent add ${name})`);
+  const r = spawnSync('sudo', ['-n', '-u', `g4a-a-${name}`, '--', '/usr/local/lib/g4a/bin/g4a-agent-exec', ...cmd], { stdio: 'inherit' });
+  if (r.signal) process.kill(process.pid, r.signal);
+  process.exitCode = r.status ?? 1;
 }
 
 // g4a privacy: what g4a has stored locally under G4A_HOME (sizes/modes only, never contents).
@@ -342,7 +401,7 @@ function purgeCmd(args) {
 }
 
 async function mcpCmd() { await (await import('../src/mcp.mjs')).serve(); }
-({ mcp: mcpCmd, authority: authorityCmd, install, uninstall, doctor, stats: showStats, hook, hooks, daemon, claim: claimCmd, release: releaseCmd, status: statusCmd, promote: promoteCmd, ledger: ledgerCmd, verify: verifyCmd, stop: stopCmd, privacy: privacyCmd, purge: purgeCmd, operator: operatorCmd, override: overrideCmd }[cmd] ?? (() => {
-  console.log('usage: g4a install [--rc FILE] | uninstall [--rc FILE] | doctor | stats | hooks claude|codex|gemini | hook <agent> | privacy | purge [--logs|--tee|--credentials|--all]\n       g4a daemon [--detach] | stop | claim --agent A --paths p1,p2 --witness CMD [--allow-overlap] [--repo R]\n       g4a release --agent A [--remove-worktree] | status | promote --agent A [--no-wait] | ledger [--out F] | verify [BUNDLE] [--pin SPKIHEX] [--anchor-remote R]\n       g4a operator init [--passphrase-file F] | override --repo R --minutes N --reason TEXT [--var G4A_ENFORCE|G4A_RAW|G4A_AGENT]  (human-only)\n       g4a authority init --system | init DIR (same-user, detect-only) | audit | status | ledger  [--repo R]\n       g4a mcp   (stdio MCP server: g4a_claim/status/promote/verify/release/authority_status)');
+({ mcp: mcpCmd, authority: authorityCmd, install, uninstall, doctor, stats: showStats, hook, hooks, daemon, claim: claimCmd, release: releaseCmd, status: statusCmd, promote: promoteCmd, ledger: ledgerCmd, verify: verifyCmd, stop: stopCmd, privacy: privacyCmd, purge: purgeCmd, operator: operatorCmd, override: overrideCmd, agent: agentCmd, run: runCmd }[cmd] ?? (() => {
+  console.log('usage: g4a install [--rc FILE] | uninstall [--rc FILE] | doctor | stats | hooks claude|codex|gemini | hook <agent> | privacy | purge [--logs|--tee|--credentials|--all]\n       g4a daemon [--detach] | stop | claim --agent A --paths p1,p2 --witness CMD [--allow-overlap] [--repo R]\n       g4a release --agent A [--remove-worktree] | status | promote --agent A [--no-wait] | ledger [--out F] | verify [BUNDLE] [--pin SPKIHEX] [--anchor-remote R]\n       g4a operator init [--passphrase-file F] | override --repo R --minutes N --reason TEXT [--var G4A_ENFORCE|G4A_RAW|G4A_AGENT]  (human-only)\n       g4a authority init --system | init DIR (same-user, detect-only) | audit | status | ledger | sync  [--repo R]\n       g4a agent add NAME | remove NAME | list | policy --allow-operator on|off  (system mode: one OS user per agent)\n       g4a run --agent NAME -- COMMAND [ARGS...]   (run an agent CLI as its own OS user g4a-a-NAME)\n       g4a mcp   (stdio MCP server: g4a_claim/status/promote/verify/release/authority_status)');
   process.exitCode = cmd ? 2 : 0;
 }))(rest)?.catch?.((e) => { console.error(`g4a: ${redact(String(e?.message ?? e))}`); if (process.env.G4A_DEBUG === '1') console.error(redact(String(e?.stack ?? ''))); process.exitCode = 1; });
