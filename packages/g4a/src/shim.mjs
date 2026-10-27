@@ -126,6 +126,14 @@ if (managed) {
     if (writes && (pos.some((k) => DANGEROUS_CONFIG.test(k)) || rest.some((x) => /^(-e|--edit)$/.test(x)) || pos[0] === 'edit')) block('setting core.hooksPath, core.logAllRefUpdates, alias.*, include.* (or editing config) is not allowed for agents in a g4a-managed repo');
   }
 }
+// OS agent users (g4a agent add): once a repo has agent users, an agent context running as any
+// other uid (the operator, root) is refused on writes; agents start via `g4a run --agent NAME`.
+if (sub && isWrite(sub, rest) && managed) {
+  let am = null; try { am = JSON.parse(fs.readFileSync(process.env.G4A_AGENTS_MAP_TEST || '/etc/g4a/agents.json', 'utf8')); } catch {}
+  const repo = am && repoCommonDir(fs.existsSync(eff) ? eff : process.cwd());
+  const mine = repo ? Object.values(am.agents ?? {}).filter((a) => a.repo === repo || a.cloneId === repo) : [];
+  if (mine.length && !mine.some((a) => a.uid === process.getuid()) && !mine.some((a) => am.policy?.[a.repo]?.allowOperator)) block(`this repo runs agents as their own OS users; start the agent with \`g4a run --agent <name> -- <command>\` instead of as uid ${process.getuid()} (or: g4a agent policy --allow-operator on)`);
+}
 if (sub && isWrite(sub, rest) && managed) {
   const enforce = !honored.G4A_ENFORCE;
   const { checkWithDaemon } = await import('./check-client.mjs');

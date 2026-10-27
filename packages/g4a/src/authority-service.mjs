@@ -134,6 +134,31 @@ export function unbindAgent(L, agent, key) {
   identityLog(L, { event: 'unbind', agent, removed: had }, key);
   return { ok: true, agent, removed: had };
 }
+// OS agent users (`g4a agent add`, root only): state/os-agents.json { agents: { name: uid }, allowOperator }.
+// While any OS agent exists, claim/permit/land/release are accepted only from an agent user acting
+// under its own name (root and the operator uid are refused) unless root set allowOperator.
+const osFile = (L) => path.join(L.state, 'os-agents.json');
+export const readOs = (L) => { try { const o = JSON.parse(fs.readFileSync(osFile(L), 'utf8')); return { agents: o.agents ?? {}, allowOperator: !!o.allowOperator }; } catch { return { agents: {}, allowOperator: false }; } };
+const writeOs = (L, o) => { fs.writeFileSync(osFile(L) + '.tmp', JSON.stringify(o, null, 2), { mode: 0o600 }); fs.renameSync(osFile(L) + '.tmp', osFile(L)); };
+export function osPolicyCheck(L, agent, uid) {
+  const o = readOs(L);
+  const names = Object.keys(o.agents);
+  if (!names.length) return { ok: true };
+  const mine = names.find((n) => o.agents[n] === uid);
+  if (mine) return mine === agent ? { ok: true } : { ok: false, error: `OS agent user g4a-a-${mine} may only act as agent ${mine}, not ${agent}` };
+  if (o.allowOperator) return { ok: true };
+  return { ok: false, error: `this repo runs agents as their own OS users (uid ${uid} is not one); start the agent with \`g4a run --agent <name> -- <cmd>\`` };
+}
+export function osBind(L, agent, uid) {
+  if (!/^[a-z0-9][a-z0-9-]{0,23}$/.test(String(agent ?? ''))) return { ok: false, error: 'bad agent name' };
+  if (!Number.isInteger(uid) || uid <= 0) return { ok: false, error: 'uid must be a positive integer' };
+  const m = readAgents(L); const before = m[agent] ?? null;
+  const c = randomBytes(32).toString('base64url');
+  m[agent] = { uid, cred: credHash(c).toString('hex') }; writeAgents(L, m);
+  const o = readOs(L); o.agents[agent] = uid; writeOs(L, o);
+  identityLog(L, { event: 'os_bind', agent, uid, before_uid: typeof before === 'number' ? before : before?.uid ?? null });
+  return { ok: true, agent, uid, credential: c };
+}
 const claimRow = (auth, repo, agent) => { const r = auth.db.prepare("SELECT * FROM claims WHERE repo = ? AND agent = ? AND status = 'active'").get(repo, agent); return r && rowClaim(r); };
 const strip = ({ secret_sha256, secretFile, ...c }) => c;
 
@@ -187,6 +212,28 @@ export async function run(L, cmd, p = {}) {
     try { key = createPrivateKey({ key: fs.readFileSync(operatorKeyFile(L), 'utf8'), passphrase: readTtyLine('g4a operator passphrase: ') }); } catch (e) { return { ok: false, error: /tty/.test(e.message) ? e.message : 'operator key unavailable or wrong passphrase' }; }
     return withLock(L, () => (cmd === 'rebind' ? rebindAgent(L, p.agent, p.uid ?? callerUid(), key) : unbindAgent(L, p.agent, key)));
   }
+  if (['os-bind', 'os-unbind', 'os-policy'].includes(cmd)) {
+    // root only: the wrapper (the only sudo path) always sets G4A_CALLER_UID and never lists these
+    if (process.env.G4A_CALLER_UID !== undefined || process.env.SUDO_USER) return { ok: false, error: `${cmd} is root-only (g4a agent add/remove/policy)` };
+    if (cmd === 'os-bind') return withLock(L, () => osBind(L, p.agent, p.uid));
+    if (cmd === 'os-policy') return withLock(L, () => { const o = readOs(L); o.allowOperator = !!p.allowOperator; writeOs(L, o); identityLog(L, { event: 'os_policy', allowOperator: o.allowOperator }); return { ok: true, allowOperator: o.allowOperator }; });
+    return withLock(L, async () => {
+      const auth = new Authority(L.state, { keyDir: L.keys, anchorRemote: { url: L.anchors, ref: AUTH_ANCHOR_REF } });
+      try {
+        const c = claimRow(auth, repoId(L.repo), p.agent);
+        if (c) {
+          await auth.release({ repo: L.repo, agent: p.agent, removeWorktree: true });
+          safeGit(L.repo, ['branch', '-D', c.branch], { allowFailure: true });
+        }
+        const old = safeGit(L.repo, ['rev-parse', '--verify', '--quiet', `refs/heads/agents/${p.agent}`], { allowFailure: true }).stdout.trim();
+        if (old) { safeGit(L.repo, ['update-ref', '-d', `refs/heads/agents/${p.agent}`, old]); fs.appendFileSync(L.accepted, JSON.stringify({ ref: `refs/heads/agents/${p.agent}`, old, new: ZERO, kind: 'release', at: new Date().toISOString() }) + '\n'); }
+        const m = readAgents(L); const had = p.agent in m; delete m[p.agent]; writeAgents(L, m);
+        const o = readOs(L); delete o.agents[p.agent]; writeOs(L, o);
+        identityLog(L, { event: 'os_unbind', agent: p.agent, removed: had, released: !!c });
+        return { ok: true, agent: p.agent, removed: had, released: !!c };
+      } finally { auth.db.close(); }
+    });
+  }
   return withLock(L, async () => {
     const auth = new Authority(L.state, { keyDir: L.keys, anchorRemote: { url: L.anchors, ref: AUTH_ANCHOR_REF } });
     const repo = repoId(L.repo);
@@ -194,6 +241,8 @@ export async function run(L, cmd, p = {}) {
       // Agent identity: an agent name is bound to the OS uid that first claimed it (system mode:
       // the uid sudo reports via the wrapper; same-user mode: always the one uid, so detect-only).
       if (['claim', 'permit', 'land', 'release'].includes(cmd)) {
+        const pol = osPolicyCheck(L, p.agent, callerUid());
+        if (!pol.ok) return { ok: false, status: 'refused', reason: 'agent_identity', error: pol.error };
         var id = bindAgent(L, p.agent, callerUid(), cmd === 'claim', p.credential);
         if (!id.ok) return { ok: false, status: 'refused', reason: 'agent_identity', error: id.error };
       }

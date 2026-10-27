@@ -66,6 +66,43 @@ see PRIVACY.md.
   - Stack traces are shown only with `G4A_DEBUG=1`, and they are redacted too.
   - Daemon, authority and MCP errors are redacted before they are returned or stored.
 
+## Agent OS users (default for system mode)
+
+To set an agent up, run `g4a agent add <name>` once as the operator. You need passwordless sudo,
+and the repo must already be under a system authority. The command:
+
+- creates a non-sudo system user `g4a-a-<name>` with a private `0700` home at
+  `/var/lib/g4a-agents/<name>`;
+- gives that user its own clone of authority main at `~/repo`, so there are no shared worktrees
+  and no group permissions to manage, plus its own `G4A_HOME`, shim and daemon;
+- writes a `0600` credential owned by the agent user, inside a `0700` directory;
+- binds name→uid at the authority (root-only `os-bind`).
+
+`g4a run --agent <name> -- <cmd>` starts the command as that user. It goes through a single
+sudoers rule, `<operator> ALL=(g4a-a-<name>) NOPASSWD: /usr/local/lib/g4a/bin/g4a-agent-exec`,
+which `visudo` checks. The rule uses `env_reset`, and only a short allowlist of variables is kept.
+
+Once a repo has agent users, claim, permit, land and release are refused for the operator uid,
+and for any uid acting under another agent's name. The operator can turn this back on with
+`g4a agent policy --allow-operator on`. Agent writes through the shim started as the operator are
+refused too, and both `g4a run` and the launcher refuse root.
+
+Each agent also anchors its client ledger under its own `refs/g4a/client-ledgers/<name>`, and
+only the bound uid may append to that ref.
+
+`g4a agent remove <name>` cleans up completely:
+
+- kills the agent's processes;
+- releases its claim and deletes its ref;
+- unbinds it at the authority;
+- removes its sudoers line, crontab, user, group and home;
+- deletes its files in `/tmp`, `/var/tmp` and `/dev/shm`.
+
+`authority uninstall` removes every agent first. test/system.test.mjs covers all of this: two
+agents can't read each other's credential or home, can't write each other's worktree or anchor,
+and can't impersonate each other; the launcher can't escalate and doesn't evaluate arguments; and
+removal leaves nothing behind.
+
 ## Detected only (not prevented)
 
 - **Detect-only mode** (`g4a authority init DIR`, same uid). An agent running as your uid can
@@ -84,13 +121,24 @@ see PRIVACY.md.
 
 ## Known gaps and risks
 
-- **No isolation between same-uid agents with the default file credential store.** The
-  per-agent credential in `G4A_HOME/credentials/<hash>/<agent>` is a `0600` file, and the CLI
-  reads it automatically. Any process running as your uid can therefore release or promote
-  another agent's claim just by naming it. Release and promote do require the credential, but
-  in the file store every same-uid process has it. For real separation, run agents with
-  `G4A_MCP_SESSION_CREDENTIALS=1` (memory-only credentials held by one MCP server) or, better,
-  as separate uids against a system-mode authority.
+- **Same-uid agents are not isolated from each other.** This is why one OS user per agent is now
+  the default for system mode (see "Agent OS users" below). If you still run several agents as
+  your own uid, the per-agent credential in `G4A_HOME/credentials/<hash>/<agent>` is a `0600`
+  file that every process running as your uid can read. Any of them can then release or promote
+  another agent's claim. `G4A_MCP_SESSION_CREDENTIALS=1` narrows this but does not close it:
+  ptrace and `/proc` are still open to same-uid processes.
+- **Limits of agent OS users:**
+  - The operator account still has sudo. It installs, adds and removes agents, so anything
+    running as the operator can do the same, and agents must never run as the operator.
+  - The launcher's `env_keep` allowlist passes `ANTHROPIC_API_KEY`, `OPENAI_API_KEY` and
+    `GEMINI_API_KEY` to the agent, so each agent sees the key you launch it with.
+  - `no_new_privs` cannot be set, because agents need sudo to reach the authority wrappers.
+  - Agent CLIs (Codex, Claude Code, …) need their own login inside the agent home, and their
+    binaries must be readable by the agent user. A `0700` operator home hides them.
+  - A witness command runs as `g4a-authority`, unsandboxed where bwrap is unavailable. It could
+    therefore write `state/os-agents.json` directly. This is the same exposure as the existing
+    witness and `init-root` risk.
+  - Detect-only (same-user) mode still only detects.
 
 - Redaction is pattern-based (see PRIVACY.md). Tee files hold raw git output, which can include
   diff content and therefore source code.

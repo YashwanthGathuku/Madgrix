@@ -113,3 +113,125 @@ test('system authority: agent user is prevented from bypassing the authority', {
     for (const u of created) sh(`sudo -n userdel -r ${u} 2>/dev/null`);
   }
 });
+
+// One OS user per agent (g4a agent add / g4a run / g4a agent remove). Runs after the test above in
+// the same file (node --test runs a file's tests in order), so the two never race on the install.
+test('agent users: separate uids, scoped launcher, no impersonation, full cleanup', { skip: !canSudo && 'needs passwordless sudo' }, () => {
+  const env = Object.fromEntries(Object.entries(process.env).filter(([k]) => !/^(CODEX_|CLAUDECODE|GEMINI_CLI|G4A_)/.test(k)));
+  const dir = fs.mkdtempSync('/tmp/g4a-au-'); fs.chmodSync(dir, 0o755);
+  Object.assign(env, { G4A_HOME: path.join(dir, 'home'), G4A_KEY_DIR: path.join(dir, 'keys') });
+  const repo = path.join(dir, 'repo');
+  const g4a = (args, o = {}) => spawnSync(process.execPath, ['--no-warnings', CLI, ...args], { encoding: 'utf8', env, cwd: repo, ...o });
+  const J = (r) => { try { return JSON.parse(r.stdout); } catch { return { ok: false, raw: r.stdout + r.stderr }; } };
+  const run = (name, script) => g4a(['run', '--agent', name, '--', 'sh', '-c', script]);
+  const H = (n) => `/var/lib/g4a-agents/${n}`;
+  let repoIdStr = null; const uids = {};
+  try {
+    const g = `git -c user.name=t -c user.email=t@t`;
+    assert.equal(sh(`mkdir ${repo} && cd ${repo} && git init -q -b main && echo a > a.txt && echo b > b.txt && ${g} add -A && ${g} commit -qm base && git checkout -q --detach`).status, 0);
+    repoIdStr = fs.realpathSync(path.join(repo, '.git'));
+    assert.equal(g4a(['authority', 'init', '--system', '--repo', repo]).status, 0);
+    assert.equal(g4a(['daemon', '--detach']).status, 0);
+    // argument injection / bad names are refused before anything runs as root
+    for (const bad of ['x;id', '../x', '-o', 'Alice', 'a b', '', 'x'.repeat(25), 'a$(id)']) {
+      assert.equal(J(g4a(['agent', 'add', bad])).ok, false, `agent add ${JSON.stringify(bad)}`);
+      assert.notEqual(g4a(['run', '--agent', bad, '--', 'id']).status, 0);
+    }
+    for (const n of ['alice', 'bob']) {
+      const r = J(g4a(['agent', 'add', n]));
+      assert.equal(r.ok, true, JSON.stringify(r)); uids[n] = r.uid;
+      // private home, credential owned by the agent user, dir 0700 / file 0600
+      const st = sh(`sudo -n stat -c '%U %a' ${H(n)} ${path.dirname(r.credential_file)} ${r.credential_file}`).stdout.trim().split('\n');
+      assert.deepEqual(st, [`g4a-a-${n} 700`, `g4a-a-${n} 700`, `g4a-a-${n} 600`]);
+      // no sudo beyond the authority wrappers, no privileged groups
+      const l = sh(`sudo -n -l -U g4a-a-${n}`).stdout;
+      assert.doesNotMatch(l, /\((ALL|root)[^)]*\)/); assert.match(l, /\(g4a-authority\)/);
+      assert.doesNotMatch(sh(`id g4a-a-${n}`).stdout, /sudo|wheel|adm|docker/);
+    }
+    assert.equal(J(g4a(['agent', 'add', 'alice'])).ok, false, 'duplicate add');
+    // sudoers: the operator may run only the launcher, only as each agent user; visudo-clean
+    const rules = sh('sudo -n cat /etc/sudoers.d/g4a-agents').stdout;
+    const me = os.userInfo().username;
+    assert.deepEqual(rules.split('\n').filter((x) => x && !x.startsWith('#') && !x.startsWith('Defaults')), [`${me} ALL=(g4a-a-alice) NOPASSWD: ${WRAP}/g4a-agent-exec`, `${me} ALL=(g4a-a-bob) NOPASSWD: ${WRAP}/g4a-agent-exec`]);
+    assert.match(rules, /env_reset/); assert.equal(sh('sudo -n visudo -cf /etc/sudoers.d/g4a-agents').status, 0);
+
+    // the launcher runs the command as the agent user, in its own clone, with the shim first on PATH
+    const who = run('alice', 'id -un; pwd; command -v git; echo "$G4A_HOME"');
+    assert.equal(who.status, 0, who.stderr);
+    assert.deepEqual(who.stdout.trim().split('\n'), ['g4a-a-alice', `${H('alice')}/repo`, `${H('alice')}/.g4a/bin/git`, `${H('alice')}/.g4a`]);
+    // ... and cannot escalate: no sudo to root/the operator/another agent, no launcher for bob
+    for (const s of ['sudo -n true', 'sudo -n -u root id', `sudo -n -u ${me} id`, `sudo -n -u g4a-a-bob ${WRAP}/g4a-agent-exec id`, `sudo -n -u g4a-authority ${WRAP}/g4a-authority 0000000000000000 init-root e30=`]) {
+      const r = run('alice', `${s} >/dev/null 2>&1; echo rc=$?`);
+      assert.match(r.stdout, /rc=(?!0)\d+/, `alice: ${s}`);
+    }
+    // the launcher refuses when invoked directly (not as an agent user) and from root
+    assert.notEqual(sh(`${WRAP}/g4a-agent-exec id`).status, 0);
+    assert.notEqual(sh(`sudo -n ${WRAP}/g4a-agent-exec id`).status, 0);
+    assert.notEqual(spawnSync('sudo', ['-n', process.execPath, '--no-warnings', CLI, 'run', '--agent', 'alice', '--', 'id'], { encoding: 'utf8', env }).status, 0, 'g4a run from root');
+    // shell metacharacters in the command are passed as plain argv (no eval by the launcher)
+    const inj = g4a(['run', '--agent', 'alice', '--', 'echo', '$(id -u);', '`id`', '&&', 'id']);
+    assert.equal(inj.stdout.trim(), '$(id -u); `id` && id');
+    // caller-supplied env (other than the allowlist) does not reach the agent
+    const ev = spawnSync(process.execPath, ['--no-warnings', CLI, 'run', '--agent', 'alice', '--', 'sh', '-c', 'echo "${LD_PRELOAD:-none} ${G4A_RAW:-none} ${ANTHROPIC_API_KEY:-none}"'], { encoding: 'utf8', cwd: repo, env: { ...env, LD_PRELOAD: '/tmp/x.so', G4A_RAW: '1', ANTHROPIC_API_KEY: 'k-test' } });
+    assert.equal(ev.stdout.trim(), 'none none k-test');
+
+    // separation between agents: credential, clone/worktree, impersonation
+    const credA = sh(`sudo -n find ${H('alice')}/.g4a/credentials -type f`).stdout.trim();
+    assert.match(run('bob', `cat ${credA} 2>&1; echo rc=$?`).stdout, /Permission denied[\s\S]*rc=1/);
+    assert.match(run('bob', `ls ${H('alice')} 2>&1; echo rc=$?`).stdout, /Permission denied/);
+    const c = run('alice', 'g4a claim --agent alice --paths a.txt --witness true');
+    assert.equal(J(c).ok, true, c.stdout + c.stderr);
+    assert.match(run('bob', `echo X > ${H('alice')}/repo/.g4a/worktrees/alice/a.txt 2>/dev/null; echo rc=$?`).stdout, /rc=(?!0)\d+/);
+    // bob cannot act as alice (own credential or none), the operator cannot act as anyone
+    for (const cmd of [['claim', '--agent', 'alice', '--paths', 'b.txt', '--witness', 'true'], ['release', '--agent', 'alice'], ['promote', '--agent', 'alice']]) {
+      const r = J(g4a(['run', '--agent', 'bob', '--', 'g4a', ...cmd]));
+      assert.notEqual(r.ok, true, `bob ${cmd[0]} as alice: ${JSON.stringify(r)}`);
+    }
+    const id = JSON.parse(fs.readFileSync('/etc/g4a/authority.json', 'utf8'))[repoIdStr].id;
+    const asBob = spawnSync('sudo', ['-n', '-u', 'g4a-a-bob', 'sudo', '-n', '-u', 'g4a-authority', `${WRAP}/g4a-authority`, id, 'permit', b64({ agent: 'alice' })], { encoding: 'utf8', cwd: '/tmp' });
+    assert.match(asBob.stdout, /agent_identity/);
+    for (const os2 of ['os-bind', 'os-unbind', 'os-policy']) assert.match(spawnSync('sudo', ['-n', '-u', 'g4a-a-bob', 'sudo', '-n', '-u', 'g4a-authority', `${WRAP}/g4a-authority`, id, os2, b64({ agent: 'bob', uid: 0 })], { encoding: 'utf8', cwd: '/tmp' }).stdout, /bad command/);
+    const op = J(g4a(['claim', '--agent', 'op', '--paths', 'b.txt', '--witness', 'true']));
+    assert.equal(op.ok, false); assert.match(JSON.stringify(op), /own OS users/);
+    // an agent CLI started as the operator (agent marker set) is refused on writes in the repo
+    const opw = sh(`cd ${repo} && PATH=${env.G4A_HOME}/bin:$PATH CLAUDECODE=1 git commit --allow-empty -qm x 2>&1; echo rc=$?`, { env });
+    if (fs.existsSync(path.join(env.G4A_HOME, 'bin', 'git'))) assert.match(opw.stdout, /own OS users[\s\S]*rc=1/);
+    // alice's full flow: edit in her own worktree, promote through the authority as her uid
+    const p = run('alice', 'cd .g4a/worktrees/alice && echo A > a.txt && git add -A && git commit -qm a && g4a promote --agent alice');
+    assert.equal(J(p).status, 'promoted', p.stdout + p.stderr);
+    // bob syncs (launcher) and lands his own change on top
+    const pb = run('bob', 'g4a claim --agent bob --paths b.txt --witness true >/dev/null && cd .g4a/worktrees/bob && test "$(cat a.txt)" = A && echo B > b.txt && git add -A && git commit -qm b && g4a promote --agent bob');
+    assert.equal(J(pb).status, 'promoted', pb.stdout + pb.stderr);
+    // each agent anchors its own ledger chain; bob cannot write alice's anchor ref
+    const anc = `/var/lib/g4a-authority/repos/${id}/anchors.git`;
+    const push = (ref) => run('bob', `/usr/bin/git push -q --receive-pack="sudo -n -u g4a-authority ${WRAP}/g4a-receive-pack" ${anc} HEAD:${ref} 2>&1; echo rc=$?`).stdout;
+    for (const ref of ['refs/g4a/client-ledgers/carol', 'refs/g4a/client-ledger', 'refs/g4a/x']) assert.match(push(ref), /may only append[\s\S]*rc=(?!0)\d+/, ref);
+    assert.match(sh(`cd /tmp && sudo -n -u g4a-authority git -C ${anc} for-each-ref --format='%(refname)'`).stdout, /client-ledgers\/alice[\s\S]*client-ledgers\/bob/);
+    // the operator's checkout catches up with authority main
+    const s = J(g4a(['authority', 'sync']));
+    assert.equal(s.ok, true, JSON.stringify(s));
+    assert.equal(sh(`git -C ${repo} show main:b.txt`).stdout.trim(), 'B');
+    for (const n of ['alice', 'bob']) { const v = run(n, 'g4a verify'); assert.equal(J(v).ok, true, n + ': ' + v.stdout + v.stderr); }
+    assert.equal(J(g4a(['authority', 'audit'])).ok, true);
+
+    // cleanup leaves nothing: user, group, home, processes, tmp files, sudoers, maps, binding
+    run('alice', 'sleep 300 >/dev/null 2>&1 & echo x > /tmp/g4a-au-left-alice; true');
+    for (const n of ['alice', 'bob']) assert.equal(J(g4a(['agent', 'remove', n])).ok, true);
+    for (const n of ['alice', 'bob']) {
+      assert.notEqual(sh(`id g4a-a-${n}`).status, 0); assert.notEqual(sh(`getent group g4a-a-${n}`).status, 0);
+      assert.equal(fs.existsSync(H(n)), false); assert.notEqual(sh(`pgrep -u ${uids[n]}`).status, 0);
+      assert.equal(sh(`sudo -n find /tmp /var/tmp /dev/shm /var/lib /etc -xdev -uid ${uids[n]} 2>/dev/null`).stdout.trim(), '');
+    }
+    assert.equal(fs.existsSync('/etc/sudoers.d/g4a-agents'), false);
+    assert.equal(fs.existsSync('/etc/g4a/agents.json'), false);
+    assert.doesNotMatch(fs.readFileSync('/etc/g4a/authority.json', 'utf8'), /"agent"/);
+    const st = sh(`sudo -n cat /var/lib/g4a-authority/repos/${id}/state/agents.json /var/lib/g4a-authority/repos/${id}/state/os-agents.json`).stdout;
+    assert.doesNotMatch(st, /alice|bob/);
+    assert.equal(fs.existsSync('/var/lib/g4a-agents'), false);
+  } finally {
+    g4a(['stop']);
+    for (const n of ['alice', 'bob']) if (sh(`id g4a-a-${n}`).status === 0) g4a(['agent', 'remove', n]);
+    if (repoIdStr) assert.match(g4a(['authority', 'uninstall', '--system', '--repo-id', repoIdStr], { cwd: '/tmp' }).stdout, /"ok":\s*true/);
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});

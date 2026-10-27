@@ -64,6 +64,9 @@ export function fetchMain(loc, repo) {
   return safeGit(repo, ['rev-parse', 'refs/g4a/authority-main']).stdout.trim();
 }
 
-export const clientAnchorRemote = (loc) => ({ url: loc.anchors, ref: CLIENT_ANCHOR_REF, receivePack: receivePack(loc), uploadPack: uploadPack(loc) });
+// an agent OS user (g4a run --agent) anchors its own ledger under its own ref; the anchor hook
+// only lets the bound uid write it, so agents cannot clobber each other's anchor chains
+const clientRef = (loc) => (loc.mode === 'system' && /^[a-z0-9][a-z0-9-]{0,23}$/.test(process.env.G4A_AGENT_NAME || '') ? `${CLIENT_ANCHOR_REF}s/${process.env.G4A_AGENT_NAME}` : CLIENT_ANCHOR_REF);
+export const clientAnchorRemote = (loc) => ({ url: loc.anchors, ref: clientRef(loc), receivePack: receivePack(loc), uploadPack: uploadPack(loc) });
 export const authorityAnchorRemote = (loc) => ({ url: loc.anchors, ref: AUTH_ANCHOR_REF, uploadPack: uploadPack(loc) });
 export const pubFile = (loc, name) => path.join(loc.pub, name);

@@ -13,6 +13,8 @@ import { fileURLToPath } from 'node:url';
 
 const USER = 'g4a-authority', HOME = '/var/lib/g4a-authority', REPOS = `${HOME}/repos`, PUB = '/var/lib/g4a-authority-pub';
 const LIB = '/usr/local/lib/g4a', BIN = `${LIB}/bin`, MAP = '/etc/g4a/authority.json', SUDOERS = '/etc/sudoers.d/g4a-authority';
+export const AGENTS_HOME = '/var/lib/g4a-agents', AGENTS_MAP = '/etc/g4a/agents.json', AGENTS_SUDOERS = '/etc/sudoers.d/g4a-agents';
+export { USER as AUTH_USER, REPOS, PUB, LIB, BIN, MAP };
 const SRC_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
 const sh = (cmd, args, o = {}) => execFileSync(cmd, args, { stdio: ['ignore', 'pipe', 'pipe'], encoding: 'utf8', ...o });
 const which = (n) => { const r = spawnSync('sh', ['-c', `command -v ${n}`], { encoding: 'utf8' }); return r.status === 0 ? r.stdout.trim() : null; };
@@ -93,6 +95,30 @@ case "$p" in ${REPOS}/????????????????/repo|${REPOS}/????????????????/anchors.gi
 case "$p" in *..*) exit 2;; esac
 exec ${ENV} git upload-pack "$p"
 `,
+    // the g4a CLI from the root-owned copy (agent users run this one, never the operator's tree)
+    'g4a': `#!/bin/sh
+exec ${BIN}/node --no-warnings ${LIB}/packages/g4a/bin/g4a.mjs "$@"
+`,
+    // launcher: run ONLY as an agent user (g4a-a-<name>) through /etc/sudoers.d/g4a-agents. The
+    // user is taken from the uid, never from arguments; the command is exec'd as given (no shell).
+    'g4a-agent-exec': `#!/bin/sh
+set -eu
+umask 077
+me=$(id -un); uid=$(id -u)
+[ "$uid" -ne 0 ] || { echo "g4a: refused: agents never run as root" >&2; exit 2; }
+case "$me" in g4a-a-*) ;; *) echo "g4a: refused: g4a-agent-exec runs only as a g4a agent user (g4a run --agent <name>)" >&2; exit 2;; esac
+name=\${me#g4a-a-}
+case "$name" in *[!a-z0-9-]*|''|-*) echo "g4a: bad agent user" >&2; exit 2;; esac
+h=${AGENTS_HOME}/"$name"
+[ -d "$h/repo" ] || { echo "g4a: agent $name has no clone (g4a agent add)" >&2; exit 2; }
+[ "$#" -gt 0 ] || { echo "usage: g4a run --agent <name> -- <command> [args]" >&2; exit 2; }
+export HOME="$h" USER="$me" LOGNAME="$me" G4A_HOME="$h/.g4a" G4A_AGENT=1 G4A_AGENT_NAME="$name"
+export PATH="$h/.g4a/bin:${BIN}:${LIB}/node/bin:/usr/local/bin:/usr/bin:/bin"
+cd "$h/repo"
+${BIN}/g4a daemon --detach >/dev/null 2>&1 || true
+${BIN}/g4a authority sync --repo "$h/repo" >/dev/null 2>&1 || true
+exec "$@"
+`,
   };
   for (const [n, body] of Object.entries(w)) fs.writeFileSync(`${LIB}.new/bin/${n}`, body);
   sh('chown', ['-R', 'root:root', `${LIB}.new`]); sh('chmod', ['-R', 'go-w,a+rX', `${LIB}.new`]); for (const n of [...Object.keys(w), 'node', 'mergiraf']) if (fs.existsSync(`${LIB}.new/bin/${n}`)) fs.chmodSync(`${LIB}.new/bin/${n}`, 0o755);
@@ -123,11 +149,17 @@ exec ${ENV} git upload-pack "$p"
 
 // Remove one repo's authority (root dir, pub dir, map entry). When no mapped repo remains (or
 // purge), also remove the code copy, wrappers, sudoers rule, /etc/g4a and the g4a-authority user.
-export function uninstall({ repoId, purge = false }) {
+export async function uninstall({ repoId, purge = false }) {
   if (process.getuid() !== 0) throw new Error('system uninstall must run as root');
   let map = {}; try { map = JSON.parse(fs.readFileSync(MAP, 'utf8')); } catch {}
   const removed = [];
   const ids = purge ? Object.keys(map) : [repoId];
+  // agent users of the removed authorities go first (users, homes, bindings, sudoers, map entries)
+  const gone = new Set(ids.map((r) => map[r]?.id).filter(Boolean));
+  const { listAgents, removeAgent } = await import('./agent-users.mjs');
+  for (const a of listAgents()) if (gone.has(a.authorityId)) removeAgent({ name: a.name });
+  try { map = JSON.parse(fs.readFileSync(MAP, 'utf8')); } catch {}
+  for (const r of Object.keys(map)) if (map[r].agent && gone.has(map[r].id)) delete map[r];
   for (const r of ids) {
     const e = map[r]; if (!e) continue;
     if (!/^[0-9a-f]{16}$/.test(e.id)) throw new Error('corrupt map entry');
@@ -136,18 +168,17 @@ export function uninstall({ repoId, purge = false }) {
   }
   const left = Object.keys(map).length;
   if (left) { fs.writeFileSync(`${MAP}.tmp`, JSON.stringify(map, null, 2) + '\n', { mode: 0o644 }); fs.renameSync(`${MAP}.tmp`, MAP); return { ok: true, removed, remaining: left }; }
-  for (const f of [SUDOERS, LIB, path.dirname(MAP), HOME, PUB]) fs.rmSync(f, { recursive: true, force: true });
+  for (const f of [SUDOERS, AGENTS_SUDOERS, AGENTS_HOME, LIB, path.dirname(MAP), HOME, PUB]) fs.rmSync(f, { recursive: true, force: true });
   if (spawnSync('id', ['-u', USER]).status === 0) spawnSync('userdel', [USER]);
   return { ok: true, removed, remaining: 0, purged: true };
 }
 
 if (process.argv[1] && fs.realpathSync(process.argv[1]) === fileURLToPath(import.meta.url)) {
   if (process.argv[2] === '--uninstall' || process.argv[2] === '--purge') {
-    try { process.stdout.write(JSON.stringify(uninstall({ repoId: process.argv[3], purge: process.argv[2] === '--purge' })) + '\n'); }
+    uninstall({ repoId: process.argv[3], purge: process.argv[2] === '--purge' }).then((r) => process.stdout.write(JSON.stringify(r) + '\n'), (e) => { process.stdout.write(JSON.stringify({ ok: false, error: e.message }) + '\n'); process.exitCode = 1; });
+  } else {
+    const [repoId, seedRepo, mergiraf] = process.argv.slice(2);
+    try { process.stdout.write(JSON.stringify(install({ repoId, seedRepo, mergiraf: mergiraf || which('mergiraf') })) + '\n'); }
     catch (e) { process.stdout.write(JSON.stringify({ ok: false, error: e.message }) + '\n'); process.exitCode = 1; }
-    process.exit();
   }
-  const [repoId, seedRepo, mergiraf] = process.argv.slice(2);
-  try { process.stdout.write(JSON.stringify(install({ repoId, seedRepo, mergiraf: mergiraf || which('mergiraf') })) + '\n'); }
-  catch (e) { process.stdout.write(JSON.stringify({ ok: false, error: e.message }) + '\n'); process.exitCode = 1; }
 }
