@@ -1,10 +1,15 @@
-// Promotion to main: scope check, merge (rung 0 git merge-tree, rung 1 Mergiraf in a
-// bubblewrap sandbox), required signed witnesses in bubblewrap, then a CAS ref update
-// with a bounded retry when main moved. Replaces the Cloudflare promotion workflow.
+// Promotion to main: scope check, merge ladder, required signed witnesses in bubblewrap,
+// then a CAS ref update with a bounded retry when main moved. Verdicts follow the
+// resolution-hardening shape: ADMIT (promoted), REFUSE, REVIEW (needs a human).
+// Ladder: fast-forward -> git merge-tree (clean) -> [region analysis: both sides changed the
+// same base lines => REVIEW, never auto-merged] -> Mergiraf in bwrap -> union of same-point
+// pure insertions. Mergiraf/union output is never trusted alone: the frozen intent witnesses
+// of every agent already promoted to main, plus the candidate's own, must pass on the result.
 // Reused: scripts/lib/sandbox.mjs (runContained), scripts/resolvers/mergiraf-resolver.mjs,
 // scripts/lib/resolve-ladder.mjs (findMergiraf), scripts/lib/fork-crew.mjs
 // (conflictHunks, strayConflictMarkers), scripts/lib/safe-git.mjs.
 import fs from 'node:fs';
+import { spawnSync } from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -29,6 +34,57 @@ const isAncestor = (top, a, b) => safeGit(top, ['merge-base', '--is-ancestor', a
 const readMain = (top) => safeGit(top, ['rev-parse', '--verify', 'refs/heads/main^{commit}']).stdout.trim();
 
 // Merge candidate onto main. Returns { sha, rung } or { conflict: capsule }.
+// Changed base-line ranges from `git diff -U0`: {a, b} = b lines replaced starting at line a;
+// b == 0 means a pure insertion after line a.
+function hunks(top, from, to, file) {
+  const d = safeGit(top, ['diff', '-U0', '--no-color', '--no-ext-diff', from, to, '--', file], { allowFailure: true }).stdout;
+  const out = [];
+  for (const line of d.split('\n')) {
+    const m = /^@@ -(\d+)(?:,(\d+))? \+\d+(?:,\d+)? @@/.exec(line);
+    if (m) { out.push({ a: Number(m[1]), b: m[2] === undefined ? 1 : Number(m[2]), add: [] }); continue; }
+    if (out.length && line.startsWith('+') && !line.startsWith('+++')) out[out.length - 1].add.push(line.slice(1));
+  }
+  return out;
+}
+export function classifyRegions(ours, theirs) {
+  const out = { sameRegion: [], adjacent: [], samePointInsert: [] };
+  for (const o of ours) for (const t of theirs) {
+    const tag = { ours: o, theirs: t };
+    if (o.b > 0 && t.b > 0) {
+      if (o.a < t.a + t.b && t.a < o.a + o.b) out.sameRegion.push(tag);
+      else if (o.a + o.b === t.a || t.a + t.b === o.a) out.adjacent.push(tag);
+    } else if (o.b === 0 && t.b === 0) {
+      if (o.a === t.a) out.samePointInsert.push(tag);
+    } else {
+      const [m, i] = o.b > 0 ? [o, t] : [t, o];
+      if (m.a <= i.a && i.a < m.a + m.b - 1) out.sameRegion.push(tag);
+      else if (i.a === m.a - 1 || i.a === m.a + m.b - 1) out.adjacent.push(tag);
+    }
+  }
+  return out;
+}
+
+// Apply both sides' (disjoint) hunks to the base; at a shared insertion point keep ours then
+// theirs. Only reached when every overlap is a same-point pure insertion. Line-level
+// `git merge-file --union` is not used: it aligns shared closing lines and interleaves blocks.
+function unionInsertions(files, regionsHunks) {
+  return files.map((f) => {
+    const baseLines = f.base.split('\n');
+    const { ours, theirs } = regionsHunks[f.path];
+    const edits = [...ours.map((h) => ({ ...h, side: 0 })), ...theirs.map((h) => ({ ...h, side: 1 }))]
+      .map((h) => ({ ...h, start: h.b === 0 ? h.a : h.a - 1 }))
+      .sort((x, y) => x.start - y.start || x.side - y.side);
+    const out = []; let i = 0;
+    for (const e of edits) {
+      if (e.start < i) return null;
+      out.push(...baseLines.slice(i, e.start), ...e.add);
+      i = e.start + e.b;
+    }
+    out.push(...baseLines.slice(i));
+    return { path: f.path, text: out.join('\n') };
+  });
+}
+
 function combine(top, main, candidate, agent, log) {
   if (isAncestor(top, main, candidate)) return { sha: candidate, rung: 'fast-forward' };
   const mt = safeGit(top, ['merge-tree', '--write-tree', '--name-only', '--no-messages', '-z', main, candidate], { allowFailure: true });
@@ -38,11 +94,21 @@ function combine(top, main, candidate, agent, log) {
   if (mt.status === 1) {
     const base = safeGit(top, ['merge-base', main, candidate]).stdout.trim();
     const files = [...new Set(conflicted)].map((p) => ({ path: p, base: show(top, base, p), sides: [{ text: show(top, main, p) }, { text: show(top, candidate, p) }] }));
-    const resolved = mergirafRung(files, log);
-    if (!resolved) {
-      const capsule = { version: 'g4a-conflict-capsule/v1', main, candidate, base, agent, files: files.map((f) => ({ path: f.path, hunks: conflictHunks(f.base, f.sides[0].text, f.sides[1].text)?.hunks ?? null })) };
-      return { conflict: capsule };
+    const raw = Object.fromEntries(files.map((f) => [f.path, { ours: hunks(top, base, main, f.path), theirs: hunks(top, base, candidate, f.path) }]));
+    const regions = Object.fromEntries(files.map((f) => [f.path, classifyRegions(raw[f.path].ours, raw[f.path].theirs)]));
+    const capsule = (reason) => ({ version: 'g4a-conflict-capsule/v1', reason, main, candidate, base, agent, regions, files: files.map((f) => ({ path: f.path, hunks: conflictHunks(f.base, f.sides[0].text, f.sides[1].text)?.hunks ?? null })) });
+    // Both sides changed the same base lines: semantic overlap. Never auto-merged.
+    if (Object.values(regions).some((r) => r.sameRegion.length)) return { review: capsule('same_region_overlap') };
+    let resolved = mergirafRung(files, log);
+    if (resolved) rung = 'mergiraf';
+    else if (Object.values(regions).every((r) => r.adjacent.length === 0 && r.samePointInsert.length > 0)) {
+      // only pure insertions at the same base point: keep both (ours then theirs); witnesses decide
+      resolved = unionInsertions(files, raw);
+      if (resolved.some((f) => !f)) resolved = null;
+      if (resolved && resolved.some((f, i) => strayConflictMarkers(f.text, [files[i].base, ...files[i].sides.map((x) => x.text)]).length)) resolved = null;
+      if (resolved) { rung = 'union-insertions'; log.push('union rung: same-point pure insertions kept from both sides'); }
     }
+    if (!resolved) return { conflict: capsule('unresolved_conflict') };
     // rebuild the merged tree with the resolved blobs
     const idx = path.join(os.tmpdir(), `g4a-index-${process.pid}-${Date.now()}`);
     try {
@@ -55,7 +121,6 @@ function combine(top, main, candidate, agent, log) {
       }
       finalTree = safeGit(top, ['write-tree'], { env }).stdout.trim();
     } finally { fs.rmSync(idx, { force: true }); }
-    rung = 'mergiraf';
   }
   const sha = safeGit(top, ['commit-tree', finalTree, '-p', main, '-p', candidate, '-m', `g4a promote ${agent}`], { env: ID_ENV }).stdout.trim();
   return { sha, rung };
@@ -89,14 +154,14 @@ function mergirafRung(files, log) {
 }
 
 // Run each witness command in bubblewrap on a detached checkout of `sha`.
-function runWitnesses(top, sha, commands) {
+function runWitnesses(top, sha, intents) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'g4a-witness-'));
   const wt = path.join(dir, 'tree');
   safeGit(top, ['worktree', 'add', '--quiet', '--detach', wt, sha]);
   try {
-    return commands.map((cmd) => {
+    return intents.map(({ cmd, agents }) => {
       const r = runContained({ command: cmd, cwd: wt, writable: [wt], timeoutMs: 300_000, purpose: 'witness', env: { PATH: process.env.PATH ?? '/usr/bin:/bin', HOME: dir } });
-      return { cmd, exit: r.status, signal: r.signal, timedOut: r.timedOut, sandbox: r.sandbox };
+      return { cmd, agents, exit: r.status, signal: r.signal, timedOut: r.timedOut, sandbox: r.sandbox };
     });
   } finally {
     safeGit(top, ['worktree', 'remove', '--force', wt], { allowFailure: true });
@@ -105,7 +170,18 @@ function runWitnesses(top, sha, commands) {
 }
 
 // One promotion attempt-set for a claim. `auth` is the Authority.
-export async function promote(auth, claim, jobId) {
+// Frozen intents: the witness commands of every claim already promoted in this repo (frozen at
+// its promotion) plus the candidate's own. Deduplicated by command, tagged with owning agents.
+function intentWitnesses(auth, claim) {
+  const rows = auth.db.prepare('SELECT agent, witnesses FROM intents WHERE repo = ? ORDER BY frozen_at').all(claim.repo);
+  const m = new Map();
+  for (const { agent, witnesses } of [...rows.map((r) => ({ agent: r.agent, witnesses: JSON.parse(r.witnesses) })), { agent: claim.agent, witnesses: claim.witnesses }])
+    for (const cmd of witnesses) { const e = m.get(cmd) ?? { cmd, agents: [] }; if (!e.agents.includes(agent)) e.agents.push(agent); m.set(cmd, e); }
+  return [...m.values()];
+}
+
+// hooks: test-only injection points ({ afterIntent, afterCas }); production passes none.
+export async function promote(auth, claim, jobId, hooks = {}) {
   const top = repoTop(claim.worktree);
   const log = [];
   const candidate = safeGit(top, ['rev-parse', '--verify', `refs/heads/${claim.branch}^{commit}`]).stdout.trim();
@@ -128,37 +204,52 @@ export async function promote(auth, claim, jobId) {
       const intent = auth.db.prepare("SELECT payload FROM ledger WHERE repo = ? AND kind = 'promote_intent' AND json_extract(payload, '$.job') = ? ORDER BY seq DESC LIMIT 1").get(claim.repo, jobId);
       const p = intent && JSON.parse(intent.payload);
       if (p && isAncestor(top, p.main_after, main)) {
-        const e = await auth.serial(() => auth.appendLedger(claim.repo, 'promote', { ...p, recovered: true }));
+        const e = await auth.serial(async () => { const r = await auth.appendLedger(claim.repo, 'promote', { ...p, recovered: true }); freezeIntent(auth, claim); return r; });
         return { ok: true, status: 'recovered', main: p.main_after, entry: e.seq };
       }
       const e = await auth.serial(() => auth.appendLedger(claim.repo, 'promote_noop', { job: jobId, claim: claim.id, agent: claim.agent, candidate, main }));
       return { ok: true, status: 'already_in_main', main, entry: e.seq };
     }
+    if (attempt === 0) {
+      const lastMain = auth.db.prepare("SELECT payload FROM ledger WHERE repo = ? AND kind IN ('promote', 'main_external') ORDER BY seq DESC LIMIT 1").get(claim.repo);
+      const expect = lastMain && (JSON.parse(lastMain.payload).main_after ?? JSON.parse(lastMain.payload).actual);
+      if (expect && expect !== main) await auth.serial(() => auth.appendLedger(claim.repo, 'main_external', { job: jobId, expected: expect, actual: main, note: 'main moved outside the g4a daemon' }));
+    }
     const c = combine(top, main, candidate, claim.agent, log);
+    if (c.review) {
+      const capsule_sha256 = await sha256Hex(canonicalJson(c.review));
+      await auth.serial(() => auth.appendLedger(claim.repo, 'promote_review', { job: jobId, claim: claim.id, agent: claim.agent, verdict: 'REVIEW', reason: 'same_region_overlap', capsule_sha256, files: c.review.files.map((f) => f.path) }));
+      return { ok: false, status: 'review', verdict: 'REVIEW', reason: 'same_region_overlap', capsule: c.review, log };
+    }
     if (c.conflict) {
       const capsule_sha256 = await sha256Hex(canonicalJson(c.conflict));
-      await auth.serial(() => auth.appendLedger(claim.repo, 'promote_refused', { job: jobId, claim: claim.id, agent: claim.agent, reason: 'unresolved_conflict', capsule_sha256, files: c.conflict.files.map((f) => f.path) }));
-      return { ok: false, status: 'refused', reason: 'unresolved_conflict', capsule: c.conflict, log };
+      await auth.serial(() => auth.appendLedger(claim.repo, 'promote_refused', { job: jobId, claim: claim.id, agent: claim.agent, verdict: 'REFUSE', reason: 'unresolved_conflict', capsule_sha256, files: c.conflict.files.map((f) => f.path) }));
+      return { ok: false, status: 'refused', verdict: 'REFUSE', reason: 'unresolved_conflict', capsule: c.conflict, log };
     }
-    const results = runWitnesses(top, c.sha, claim.witnesses);
+    const results = runWitnesses(top, c.sha, intentWitnesses(auth, claim));
     const tree = safeGit(top, ['rev-parse', `${c.sha}^{tree}`]).stdout.trim();
     const report = { version: 'g4a-witness-report/v1', merged: c.sha, tree, candidate, main_before: main, rung: c.rung, results };
     const signer = await auth.signer();
     const { signature } = await signer.sign(Buffer.from(canonicalJson(report)));
     if (!results.every((r) => r.exit === 0)) {
-      await auth.serial(() => auth.appendLedger(claim.repo, 'promote_refused', { job: jobId, claim: claim.id, agent: claim.agent, reason: 'witness_failed', witness: { report, signature, keyId: signer.keyId } }));
-      return { ok: false, status: 'refused', reason: 'witness_failed', results };
+      await auth.serial(() => auth.appendLedger(claim.repo, 'promote_refused', { job: jobId, claim: claim.id, agent: claim.agent, verdict: 'REFUSE', reason: 'witness_failed', witness: { report, signature, keyId: signer.keyId } }));
+      return { ok: false, status: 'refused', verdict: 'REFUSE', reason: 'witness_failed', rung: c.rung, results };
     }
-    const payload = { job: jobId, claim: claim.id, agent: claim.agent, candidate, main_before: main, main_after: c.sha, rung: c.rung, witness: { report, signature, keyId: signer.keyId }, attempts: attempt + 1 };
+    const payload = { job: jobId, claim: claim.id, agent: claim.agent, candidate, main_before: main, main_after: c.sha, rung: c.rung, verdict: 'ADMIT', witness: { report, signature, keyId: signer.keyId }, attempts: attempt + 1 };
     await auth.serial(() => auth.appendLedger(claim.repo, 'promote_intent', payload));
-    if (process.env.G4A_TEST_CRASH_AFTER_INTENT === '1') process.kill(process.pid, 'SIGKILL');
+    hooks.afterIntent?.();
     // compare-and-swap: only moves main if it is still where we merged against
     const cas = safeGit(top, ['update-ref', '-m', `g4a promote ${claim.agent}`, 'refs/heads/main', c.sha, main || ZERO], { allowFailure: true });
     if (cas.status !== 0) { log.push(`CAS lost on attempt ${attempt}: main moved`); continue; }
-    if (process.env.G4A_TEST_CRASH_AFTER_CAS === '1') process.kill(process.pid, 'SIGKILL');
-    const e = await auth.serial(() => auth.appendLedger(claim.repo, 'promote', payload));
-    return { ok: true, status: 'promoted', main: c.sha, rung: c.rung, attempts: attempt + 1, entry: e.seq, log };
+    hooks.afterCas?.();
+    const e = await auth.serial(async () => { const r = await auth.appendLedger(claim.repo, 'promote', payload); freezeIntent(auth, claim); return r; });
+    return { ok: true, status: 'promoted', verdict: 'ADMIT', main: c.sha, rung: c.rung, attempts: attempt + 1, entry: e.seq, log };
   }
   await auth.serial(() => auth.appendLedger(claim.repo, 'promote_refused', { job: jobId, claim: claim.id, agent: claim.agent, reason: 'cas_retries_exhausted' }));
   return { ok: false, status: 'refused', reason: 'cas_retries_exhausted', log };
+}
+
+function freezeIntent(auth, claim) {
+  auth.db.prepare('INSERT OR IGNORE INTO intents (repo, claim, agent, witnesses, frozen_at) VALUES (?, ?, ?, ?, ?)')
+    .run(claim.repo, claim.id, claim.agent, JSON.stringify(claim.witnesses), new Date().toISOString());
 }

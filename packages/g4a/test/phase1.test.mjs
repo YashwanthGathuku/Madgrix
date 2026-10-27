@@ -21,13 +21,15 @@ function mkRepo(files) {
   git(d, 'checkout', '-q', '--detach'); // main is moved by update-ref, so keep it unchecked-out
   return d;
 }
+const keysOf = (home) => `${home}-keys`; // signing key + external anchor live outside G4A_HOME
+const H = (home) => ({ G4A_HOME: home, G4A_KEY_DIR: keysOf(home) });
 function cli(home, args, opts = {}) {
-  const r = spawnSync(process.execPath, ['--no-warnings', CLI, ...args], { encoding: 'utf8', env: { ...process.env, G4A_HOME: home, ...opts.env }, cwd: opts.cwd });
+  const r = spawnSync(process.execPath, ['--no-warnings', CLI, ...args], { encoding: 'utf8', env: { ...process.env, ...H(home), ...opts.env }, cwd: opts.cwd });
   let json = null; try { json = JSON.parse(r.stdout); } catch {}
   return { ...r, json };
 }
-function startDaemon(home, env = {}) {
-  const c = spawn(process.execPath, ['--no-warnings', CLI, 'daemon'], { env: { ...process.env, G4A_HOME: home, ...env }, stdio: ['ignore', 'ignore', 'pipe'] });
+function startDaemon(home, env = {}, argv = [CLI, 'daemon']) {
+  const c = spawn(process.execPath, ['--no-warnings', ...argv], { env: { ...process.env, ...H(home), ...env }, stdio: ['ignore', 'ignore', 'pipe'] });
   let err = ''; c.stderr.on('data', (d) => { err += d; });
   return new Promise((res, rej) => {
     const t = setInterval(() => { if (err.includes('g4a daemon pid')) { clearInterval(t); res(c); } }, 20);
@@ -66,10 +68,14 @@ test('socket and key permissions; second daemon refuses; stale socket is cleaned
   const d = await startDaemon(home);
   try {
     assert.equal(fs.statSync(path.join(home, 'g4a.sock')).mode & 0o777, 0o600);
-    assert.equal(fs.statSync(path.join(home, 'witness-ed25519.pem')).mode & 0o777, 0o600);
+    assert.equal(fs.statSync(path.join(keysOf(home), 'witness-ed25519.pem')).mode & 0o777, 0o600);
+    assert.equal(fs.statSync(keysOf(home)).mode & 0o777, 0o700);
+    assert.ok(!fs.existsSync(path.join(home, 'witness-ed25519.pem')), 'key must not live next to the db');
     await assert.rejects(startDaemon(home), /already running/);
   } finally { d.kill('SIGKILL'); await new Promise((r) => d.once('exit', r)); }
   assert.ok(fs.existsSync(path.join(home, 'g4a.sock'))); // stale after kill -9
+  // a key dir inside G4A_HOME is refused
+  await assert.rejects(startDaemon(home, { G4A_KEY_DIR: path.join(home, 'k') }), /must not be inside/);
   const d2 = await startDaemon(home); await stop(d2);
 });
 
@@ -119,9 +125,11 @@ test('e2e local fork-crew: overlapping edits resolved by mergiraf in bwrap, witn
     commitIn(e.worktree, 'src/calc.js', git(repo, 'show', 'main:src/calc.js').replace('VERSION = 1;', 'VERSION = 3;') + '\n', 'parens');
     const pe = await rpc(home, 'promote', { repo, agent: 'erin', secret: secretOf(home, e.id) });
     assert.equal(pe.status, 'promoted', JSON.stringify(pe));
-    // dave's baseline must be the old main for scope diff; use his claim baseline via scope (only calc.js changed)
+    // both sides changed the same base line: REVIEW, never auto-merged, main untouched
+    const mainErin = git(repo, 'rev-parse', 'main');
     const pd = await rpc(home, 'promote', { repo, agent: 'dave', secret: secretOf(home, dv.id) });
-    assert.equal(pd.status, 'refused', JSON.stringify(pd)); assert.equal(pd.reason, 'unresolved_conflict');
+    assert.equal(pd.status, 'review', JSON.stringify(pd)); assert.equal(pd.reason, 'same_region_overlap'); assert.equal(pd.verdict, 'REVIEW');
+    assert.equal(git(repo, 'rev-parse', 'main'), mainErin);
     assert.equal(pd.capsule.files[0].path, 'src/calc.js');
     assert.ok(git(repo, 'rev-parse', 'main') !== mainBefore); // erin moved it; dave did not
     // out-of-scope: erin edits README which is not hers
@@ -135,7 +143,7 @@ test('e2e local fork-crew: overlapping edits resolved by mergiraf in bwrap, witn
     const v = cli(home, ['verify', bundleFile, '--pin', bundle.witness_pub]);
     assert.equal(v.json.ok, true, v.stdout); assert.equal(v.json.promotions, 4);
     const kinds = bundle.entries.map((x) => x.kind);
-    assert.ok(kinds.includes('promote_refused'));
+    assert.ok(kinds.includes('promote_review') && kinds.includes('promote_refused'));
     const rep = bundle.entries.find((x) => x.kind === 'promote' && x.payload.rung === 'mergiraf').payload.witness.report;
     assert.equal(rep.results[0].sandbox, 'bwrap'); assert.equal(rep.results[0].exit, 0);
     // a wrong pin fails
@@ -165,15 +173,50 @@ test('ledger tamper detection: edited payload, edited witness report, deleted ro
   assert.equal(tamper("UPDATE ledger SET payload = json_set(payload, '$.witness.report.results[0].exit', 1) WHERE kind = 'promote'").ok, false);
   assert.equal(tamper("UPDATE ledger SET entry_hash = 'ff' || substr(entry_hash, 3) WHERE seq = 0").ok, false);
   assert.equal(tamper('DELETE FROM ledger WHERE seq = 1').ok, false);
-  // Known limit: dropping the newest entries leaves a valid shorter chain (no external head anchor).
-  assert.equal(tamper('DELETE FROM ledger WHERE seq = (SELECT max(seq) FROM ledger)').ok, true);
+  // tail deletion is caught by the anchors outside G4A_HOME (repo ref + key-dir file)
+  const tail = tamper('DELETE FROM ledger WHERE seq = (SELECT max(seq) FROM ledger)');
+  assert.equal(tail.ok, false); assert.equal(tail.errors.filter((e) => /truncated or rolled back/.test(e)).length, 2, JSON.stringify(tail.errors));
+  const tail3 = tamper('DELETE FROM ledger WHERE seq >= 2');
+  assert.equal(tail3.ok, false);
+  // with only the repo ref removed, the key-dir anchor still catches truncation
+  fs.writeFileSync(dbf, base);
+  git(repo, 'update-ref', '-d', 'refs/g4a/ledger-head');
+  const noRef = tamper('DELETE FROM ledger WHERE seq = (SELECT max(seq) FROM ledger)');
+  assert.equal(noRef.ok, false); assert.ok(noRef.errors.some((e) => /anchor missing/.test(e)) && noRef.errors.some((e) => /key-dir anchor.*truncated/.test(e)), JSON.stringify(noRef.errors));
   void id;
 });
 
-for (const point of ['G4A_TEST_CRASH_AFTER_INTENT', 'G4A_TEST_CRASH_AFTER_CAS']) {
-  test(`crash recovery: daemon kill -9 (${point}); restart resumes and ledger verifies`, async () => {
+test('ledger rollback: restoring an old db copy is detected by verify and the daemon refuses to write', async () => {
+  const home = mkHome(); const repo = mkRepo({ 'f.txt': '1\n' });
+  const dbf = path.join(home, 'g4a.db');
+  let d = await startDaemon(home);
+  try { await rpc(home, 'claim', { repo, agent: 'a', paths: ['f.txt'], witnesses: ['true'] }); } finally { await stop(d); }
+  { const db = new DatabaseSync(dbf); db.exec('PRAGMA wal_checkpoint(TRUNCATE)'); db.close(); }
+  const snapshot = fs.readFileSync(dbf);
+  d = await startDaemon(home);
+  try {
+    await rpc(home, 'release', { repo, agent: 'a' });
+    await rpc(home, 'claim', { repo, agent: 'b', paths: ['g.txt'], witnesses: ['true'] });
+  } finally { await stop(d); }
+  assert.equal(cli(home, ['verify', '--repo', repo]).json.ok, true);
+  fs.writeFileSync(dbf, snapshot); for (const f of ['-wal', '-shm']) fs.rmSync(dbf + f, { force: true });
+  const v = cli(home, ['verify', '--repo', repo]).json;
+  assert.equal(v.ok, false); assert.ok(v.errors.some((e) => /rolled back/.test(e)), JSON.stringify(v.errors));
+  // the anchor is monotonic: the daemon will not start appending on top of a rolled-back db
+  await assert.rejects(startDaemon(home), /rollback detected/);
+  // the anchor chain's counters are strictly monotonic
+  const counters = git(repo, 'log', '--format=%s', 'refs/g4a/ledger-head').split('\n').map((l) => Number(l.split(' ').pop()));
+  assert.deepEqual(counters, [...counters].sort((x, y) => y - x)); assert.equal(new Set(counters).size, counters.length);
+});
+
+test('production code has no test crash switches', () => {
+  for (const f of ['src/promote.mjs', 'src/daemon.mjs', 'src/authority.mjs', 'bin/g4a.mjs']) assert.doesNotMatch(fs.readFileSync(path.join(PKG, f), 'utf8'), /G4A_TEST_|CRASH/);
+});
+
+for (const point of ['afterIntent', 'afterCas']) {
+  test(`crash recovery: daemon kill -9 (${point}, injected hook); restart resumes and ledger verifies`, async () => {
     const home = mkHome(); const repo = mkRepo({ 'f.txt': '1\n', 'g.txt': 'x\n' });
-    const d = await startDaemon(home, { [point]: '1' });
+    const d = await startDaemon(home, {}, [path.join(PKG, 'test', 'fixtures', 'crash-daemon.mjs'), point]);
     const c = await rpc(home, 'claim', { repo, agent: 'a', paths: ['f.txt'], witnesses: ['sleep 0.3'] });
     git(repo, 'commit', '--allow-empty', '-qm', 'noop'); // keep HEAD detached; move nothing
     commitIn(c.worktree, 'f.txt', '2\n', 'two');
@@ -194,12 +237,21 @@ for (const point of ['G4A_TEST_CRASH_AFTER_INTENT', 'G4A_TEST_CRASH_AFTER_CAS'])
   });
 }
 
-test('shim wiring: write commands in a claimed worktree are checked; warn by default, block with G4A_ENFORCE=1, fail open when daemon down', async () => {
+function agentEnv(home, extra = {}) {
+  const env = { ...process.env, ...ID, ...H(home), PATH: `${path.join(home, 'bin')}:${process.env.PATH}`, G4A_AGENT: '1', ...extra };
+  delete env.G4A_RAW; delete env.G4A_ACTIVE; delete env.G4A_ENFORCE;
+  return env;
+}
+function humanEnv(home) {
+  const env = agentEnv(home);
+  for (const k of Object.keys(env)) if (k === 'G4A_AGENT' || k === 'CLAUDECODE' || k === 'GEMINI_CLI' || k === 'G4A_NONTTY_IS_AGENT' || k.startsWith('CODEX_')) delete env[k];
+  return env;
+}
+
+test('shim enforcement: agents blocked by default out of scope, G4A_ENFORCE=0 opts out, daemon down fails closed, humans unaffected', async () => {
   const home = mkHome(); const repo = mkRepo({ 'f.txt': '1\n', 'other.txt': 'o\n' });
   assert.equal(cli(home, ['install']).status, 0);
-  const shimDir = path.join(home, 'bin');
-  const env = { ...process.env, ...ID, G4A_HOME: home, PATH: `${shimDir}:${process.env.PATH}`, G4A_AGENT: 'test' };
-  delete env.G4A_RAW; delete env.G4A_ACTIVE;
+  const env = agentEnv(home);
   const d = await startDaemon(home);
   let wt;
   try {
@@ -207,15 +259,117 @@ test('shim wiring: write commands in a claimed worktree are checked; warn by def
     wt = c.worktree;
     fs.writeFileSync(path.join(wt, 'other.txt'), 'changed\n');
     spawnSync('git', ['add', 'other.txt'], { cwd: wt, env });
-    const warn = spawnSync('git', ['commit', '-qm', 'x'], { cwd: wt, env, encoding: 'utf8' });
-    assert.match(warn.stderr, /\[g4a\] warning: .*other\.txt/); assert.equal(warn.status, 0);
-    fs.writeFileSync(path.join(wt, 'other.txt'), 'again\n');
-    spawnSync('git', ['add', 'other.txt'], { cwd: wt, env });
-    const blocked = spawnSync('git', ['commit', '-qm', 'y'], { cwd: wt, env: { ...env, G4A_ENFORCE: '1' }, encoding: 'utf8' });
-    assert.equal(blocked.status, 1); assert.match(blocked.stderr, /blocked/);
+    const blocked = spawnSync('git', ['commit', '-qm', 'x'], { cwd: wt, env, encoding: 'utf8' });
+    assert.equal(blocked.status, 1, blocked.stderr); assert.match(blocked.stderr, /\[g4a\] blocked: .*other\.txt/);
+    assert.equal(git(wt, 'rev-list', '--count', 'HEAD'), '1');
+    const opt = spawnSync('git', ['commit', '-qm', 'y'], { cwd: wt, env: { ...env, G4A_ENFORCE: '0' }, encoding: 'utf8' });
+    assert.equal(opt.status, 0, opt.stderr); assert.match(opt.stderr, /\[g4a\] warning: .*other\.txt/);
+    // in-scope commit passes
+    fs.writeFileSync(path.join(wt, 'f.txt'), '2\n');
+    spawnSync('git', ['add', 'f.txt'], { cwd: wt, env });
+    const ok = spawnSync('git', ['commit', '-qm', 'z'], { cwd: wt, env, encoding: 'utf8' });
+    assert.equal(ok.status, 0, ok.stderr);
+    // reserved refs: update-ref main / branch -f main are blocked in the worktree
+    const ur = spawnSync('git', ['update-ref', 'refs/heads/main', 'HEAD'], { cwd: wt, env, encoding: 'utf8' });
+    assert.equal(ur.status, 1); assert.match(ur.stderr, /reserved to the g4a daemon/);
+    // the main checkout of a managed repo: agent writes outside any claimed worktree are blocked
+    fs.writeFileSync(path.join(repo, 'f.txt'), 'direct\n');
+    const main = spawnSync('git', ['commit', '-qam', 'direct'], { cwd: repo, env, encoding: 'utf8' });
+    assert.equal(main.status, 1); assert.match(main.stderr, /outside a claimed worktree/);
+    assert.equal(spawnSync('git', ['branch'], { cwd: repo, env, encoding: 'utf8' }).status, 0); // listing is a read
+    // humans pass through untouched (no marker, or G4A_AGENT=0)
+    const h = spawnSync('git', ['commit', '-qm', 'human', '--allow-empty'], { cwd: wt, env: humanEnv(home), encoding: 'utf8' });
+    assert.equal(h.status, 0, h.stderr); assert.doesNotMatch(h.stderr, /g4a/);
     const st = await rpc(home, 'export', { repo });
     assert.ok(st.entries.some((e) => e.kind === 'scope_warning'));
   } finally { await stop(d); }
-  const down = spawnSync('git', ['commit', '-qm', 'z'], { cwd: wt, env, encoding: 'utf8' });
-  assert.match(down.stderr, /daemon unavailable/); assert.equal(down.status, 0);
+  const down = spawnSync('git', ['commit', '-qm', 'z', '--allow-empty'], { cwd: wt, env, encoding: 'utf8' });
+  assert.equal(down.status, 1); assert.match(down.stderr, /daemon unavailable.*fail closed/);
+  const downOpt = spawnSync('git', ['commit', '-qm', 'z', '--allow-empty'], { cwd: wt, env: { ...env, G4A_ENFORCE: '0' }, encoding: 'utf8' });
+  assert.equal(downOpt.status, 0); assert.match(downOpt.stderr, /daemon unavailable/);
+  const downHuman = spawnSync('git', ['commit', '-qm', 'h2', '--allow-empty'], { cwd: wt, env: { ...humanEnv(home), G4A_AGENT: '0' }, encoding: 'utf8' });
+  assert.equal(downHuman.status, 0, downHuman.stderr);
+});
+
+// ---- Mergiraf is never trusted alone ----
+async function twoAgents(home, repo, files, witnesses, edits) {
+  const a = await rpc(home, 'claim', { repo, agent: 'a', paths: files, witnesses: witnesses.a, allowOverlap: true });
+  const b = await rpc(home, 'claim', { repo, agent: 'b', paths: files, witnesses: witnesses.b, allowOverlap: true });
+  for (const [f, t] of Object.entries(edits.a)) commitIn(a.worktree, f, t, 'a');
+  for (const [f, t] of Object.entries(edits.b)) commitIn(b.worktree, f, t, 'b');
+  const pa = await rpc(home, 'promote', { repo, agent: 'a', secret: secretOf(home, a.id) });
+  assert.equal(pa.status, 'promoted', JSON.stringify(pa));
+  const mainA = git(repo, 'rev-parse', 'main');
+  const pb = await rpc(home, 'promote', { repo, agent: 'b', secret: secretOf(home, b.id) });
+  return { pa, pb, mainA };
+}
+
+test('regression: a+b+0 vs Number(a)+Number(b) (Mergiraf merges it) goes to REVIEW, not promoted', async () => {
+  const home = mkHome();
+  const src = 'export function add(a, b) {\n  return a + b;\n}\n';
+  const repo = mkRepo({ 'add.js': src, 'package.json': '{"type":"module"}\n' });
+  const d = await startDaemon(home);
+  try {
+    const { pb, mainA } = await twoAgents(home, repo, ['add.js'], { a: ['true'], b: ['true'] }, {
+      a: { 'add.js': src.replace('a + b', 'a + b + 0') }, b: { 'add.js': src.replace('a + b', 'Number(a) + Number(b)') } });
+    assert.equal(pb.status, 'review', JSON.stringify(pb)); assert.equal(pb.reason, 'same_region_overlap');
+    assert.equal(git(repo, 'rev-parse', 'main'), mainA);
+    assert.equal(git(repo, 'show', 'main:add.js'), src.replace('a + b', 'a + b + 0').trim());
+    const e = (await rpc(home, 'export', { repo })).entries.find((x) => x.kind === 'promote_review');
+    assert.equal(e.payload.verdict, 'REVIEW'); assert.match(e.payload.capsule_sha256, /^[0-9a-f]{64}$/);
+  } finally { await stop(d); }
+});
+
+test('frozen intents: a later agent that breaks an earlier agent\'s witness is REFUSED, even on a clean merge', async () => {
+  const home = mkHome();
+  const repo = mkRepo({ 'lib.js': 'export const rate = 2;\n', 'use.js': 'export const x = 1;\n', 'package.json': '{"type":"module"}\n' });
+  const d = await startDaemon(home);
+  try {
+    // a's intent: rate * 3 === 6 ; b's own witness is trivially true but b edits lib.js in a disjoint file region? no: b edits lib.js wholesale on top of main later
+    const a = await rpc(home, 'claim', { repo, agent: 'a', paths: ['use.js'], witnesses: ["node -e \"import('./lib.js').then(m=>process.exit(m.rate*3===6?0:1))\""] });
+    commitIn(a.worktree, 'use.js', "import { rate } from './lib.js';\nexport const x = rate * 3;\n", 'a');
+    assert.equal((await rpc(home, 'promote', { repo, agent: 'a', secret: secretOf(home, a.id) })).status, 'promoted');
+    const b = await rpc(home, 'claim', { repo, agent: 'b', paths: ['lib.js'], witnesses: ['true'] });
+    commitIn(b.worktree, 'lib.js', 'export const rate = 5;\n', 'b');
+    const mainA = git(repo, 'rev-parse', 'main');
+    const pb = await rpc(home, 'promote', { repo, agent: 'b', secret: secretOf(home, b.id) });
+    assert.equal(pb.status, 'refused', JSON.stringify(pb)); assert.equal(pb.reason, 'witness_failed'); assert.equal(pb.verdict, 'REFUSE');
+    const failed = pb.results.find((r) => r.exit !== 0);
+    assert.deepEqual(failed.agents, ['a']);
+    assert.equal(git(repo, 'rev-parse', 'main'), mainA);
+  } finally { await stop(d); }
+});
+
+test('concurrent top-level insertions at the same point: union rung keeps both, both intents must pass', async () => {
+  const home = mkHome();
+  const src = 'export function one() {\n  return 1;\n}\n';
+  const repo = mkRepo({ 'm.js': src, 'package.json': '{"type":"module"}\n' });
+  const d = await startDaemon(home);
+  try {
+    const wa = ["node -e \"import('./m.js').then(m=>process.exit(m.two()===2?0:1))\""];
+    const wb = ["node -e \"import('./m.js').then(m=>process.exit(m.three()===3?0:1))\""];
+    const { pb } = await twoAgents(home, repo, ['m.js'], { a: wa, b: wb }, {
+      a: { 'm.js': src + '\nexport function two() {\n  return 2;\n}\n' }, b: { 'm.js': src + '\nexport function three() {\n  return 3;\n}\n' } });
+    assert.equal(pb.status, 'promoted', JSON.stringify(pb)); assert.ok(['mergiraf', 'union-insertions'].includes(pb.rung), pb.rung);
+    const m = git(repo, 'show', 'main:m.js'); assert.match(m, /function two/); assert.match(m, /function three/);
+    const last = (await rpc(home, 'export', { repo })).entries.filter((x) => x.kind === 'promote').pop();
+    assert.equal(last.payload.verdict, 'ADMIT');
+    const agents = last.payload.witness.report.results.flatMap((r) => r.agents).sort();
+    assert.deepEqual(agents, ['a', 'b']);
+  } finally { await stop(d); }
+});
+
+test('concurrent duplicate top-level declarations: union rung output fails the witnesses and is refused cleanly', async () => {
+  const home = mkHome();
+  const src = 'export const base = 0;\n';
+  const repo = mkRepo({ 'v.js': src, 'package.json': '{"type":"module"}\n' });
+  const d = await startDaemon(home);
+  try {
+    const w = ["node -e \"import('./v.js').then(()=>0,()=>process.exit(1))\""];
+    const { pb, mainA } = await twoAgents(home, repo, ['v.js'], { a: w, b: w }, {
+      a: { 'v.js': src + 'export const v = 1;\n' }, b: { 'v.js': src + 'export const v = 2;\n' } });
+    assert.equal(pb.status, 'refused', JSON.stringify(pb));
+    assert.ok(['witness_failed', 'unresolved_conflict'].includes(pb.reason), pb.reason);
+    assert.equal(git(repo, 'rev-parse', 'main'), mainA);
+  } finally { await stop(d); }
 });

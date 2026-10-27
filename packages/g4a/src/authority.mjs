@@ -6,7 +6,8 @@
 import { DatabaseSync } from 'node:sqlite';
 import fs from 'node:fs';
 import path from 'node:path';
-import { generateKeyPairSync, createPrivateKey, createPublicKey, verify as cryptoVerify } from 'node:crypto';
+import os from 'node:os';
+import { generateKeyPairSync, createPrivateKey, createPublicKey, createHash, sign as cryptoSign, verify as cryptoVerify } from 'node:crypto';
 import { globsOverlap, globMatchesPath } from '../../../src/lib/claims.ts';
 import { ledgerEntryHash, verifyLedgerChain, LEDGER_GENESIS_PREV_HASH } from '../../../src/lib/ledger.ts';
 import { canonicalJson, sha256Hex, randomHex } from '../../../src/lib/canonical.ts';
@@ -25,6 +26,9 @@ CREATE UNIQUE INDEX IF NOT EXISTS claims_active ON claims(repo, agent) WHERE sta
 CREATE TABLE IF NOT EXISTS ledger (
   repo TEXT NOT NULL, seq INTEGER NOT NULL, ts TEXT NOT NULL, kind TEXT NOT NULL, payload TEXT NOT NULL,
   payload_hash TEXT NOT NULL, prev_hash TEXT NOT NULL, entry_hash TEXT NOT NULL, PRIMARY KEY (repo, seq));
+CREATE TABLE IF NOT EXISTS intents (
+  repo TEXT NOT NULL, claim TEXT NOT NULL, agent TEXT NOT NULL, witnesses TEXT NOT NULL, frozen_at TEXT NOT NULL,
+  PRIMARY KEY (repo, claim));
 CREATE TABLE IF NOT EXISTS jobs (
   id TEXT PRIMARY KEY, kind TEXT NOT NULL, payload TEXT NOT NULL, status TEXT NOT NULL,
   attempts INTEGER NOT NULL DEFAULT 0, result TEXT, created_at TEXT NOT NULL);
@@ -47,18 +51,35 @@ export function repoTop(repo) {
   return path.basename(common) === '.git' ? path.dirname(common) : common;
 }
 
+// The signing key and the external anchor live outside $G4A_HOME (default
+// $XDG_CONFIG_HOME/g4a-keys), so copying or rolling back the db does not carry the key or anchor.
+export function keyDir(env = process.env) {
+  return env.G4A_KEY_DIR || path.join(env.XDG_CONFIG_HOME || path.join(os.homedir(), '.config'), 'g4a-keys');
+}
+const within = (child, parent) => { const r = path.relative(parent, child); return r === '' || (!r.startsWith('..') && !path.isAbsolute(r)); };
+export const ANCHOR_REF = 'refs/g4a/ledger-head';
+const ZERO = '0'.repeat(40);
+const ANCHOR_ENV = { GIT_AUTHOR_NAME: 'g4a', GIT_AUTHOR_EMAIL: 'g4a@localhost', GIT_COMMITTER_NAME: 'g4a', GIT_COMMITTER_EMAIL: 'g4a@localhost', GIT_AUTHOR_DATE: '1970-01-01T00:00:00Z', GIT_COMMITTER_DATE: '1970-01-01T00:00:00Z' };
+
 export class Authority {
-  constructor(home) {
-    this.home = home;
+  constructor(home, { keyDir: kd = keyDir() } = {}) {
+    this.home = path.resolve(home);
+    this.keyDir = path.resolve(kd);
+    if (within(this.keyDir, this.home) || within(this.home, this.keyDir)) throw new Error(`key dir ${this.keyDir} must not be inside or contain G4A_HOME ${this.home}`);
     this.db = openDb(home);
     this.lock = Promise.resolve();
-    this.keyFile = path.join(home, 'witness-ed25519.pem');
+    this.keyFile = path.join(this.keyDir, 'witness-ed25519.pem');
     this.ensureKey();
+    this.reanchorAll();
   }
   serial(fn) { const p = this.lock.then(fn, fn); this.lock = p.catch(() => {}); return p; }
 
   // Required witness key: generated locally on first start, 0600, never leaves the box.
   ensureKey() {
+    fs.mkdirSync(this.keyDir, { recursive: true, mode: 0o700 });
+    fs.chmodSync(this.keyDir, 0o700);
+    const legacy = path.join(this.home, 'witness-ed25519.pem');
+    if (!fs.existsSync(this.keyFile) && fs.existsSync(legacy)) fs.renameSync(legacy, this.keyFile); // phase-1 layout
     if (!fs.existsSync(this.keyFile)) {
       const { privateKey } = generateKeyPairSync('ed25519');
       fs.writeFileSync(this.keyFile, privateKey.export({ type: 'pkcs8', format: 'pem' }), { mode: 0o600 });
@@ -70,16 +91,63 @@ export class Authority {
     else if (pinned.v !== spki) throw new Error('witness key does not match the pinned public key; refusing to start');
     this.privateKey = pk;
     this.publicKeySpkiHex = spki;
+    fs.writeFileSync(path.join(this.keyDir, 'witness-ed25519.pub.hex'), spki + '\n', { mode: 0o644 });
+  }
+  sign(obj) { return cryptoSign(null, Buffer.from(canonicalJson(obj)), this.privateKey).toString('base64'); }
+
+  // ---- ledger head anchors (outside $G4A_HOME) ----
+  // 1) a signed commit chain at refs/g4a/ledger-head in the repo itself;
+  // 2) a signed, monotonic file in the key dir. Both only move forward.
+  anchorFile(repo) { return path.join(this.keyDir, 'anchors', `${createHash('sha256').update(repo).digest('hex').slice(0, 32)}.json`); }
+  assertNotRolledBack(repo) {
+    const head = this.db.prepare('SELECT seq, entry_hash FROM ledger WHERE repo = ? ORDER BY seq DESC LIMIT 1').get(repo);
+    const at = (seq) => this.db.prepare('SELECT entry_hash FROM ledger WHERE repo = ? AND seq = ?').get(repo, seq)?.entry_hash;
+    for (const a of [readRefAnchor(repo)?.anchor, readFileAnchor(this.anchorFile(repo))?.anchor]) {
+      if (!a) continue;
+      if (!head || a.seq > head.seq) throw new Error(`ledger rollback detected for ${repo}: anchor at seq ${a.seq}, db head ${head ? head.seq : 'empty'}; refusing to write`);
+      if (at(a.seq) !== a.entry_hash) throw new Error(`ledger rewrite detected for ${repo} at seq ${a.seq}; refusing to write`);
+    }
+  }
+  writeAnchor(repo, seq, entry_hash) {
+    const anchor = { version: 'g4a-anchor/v1', repo, seq, entry_hash, counter: seq + 1, witness_pub: this.publicKeySpkiHex };
+    const signature = this.sign(anchor);
+    const body = JSON.stringify({ anchor, signature }, null, 2) + '\n';
+    // file anchor: write-then-rename; never move backwards
+    const f = this.anchorFile(repo);
+    const cur = readFileAnchor(f)?.anchor;
+    if (!cur || cur.counter < anchor.counter) {
+      fs.mkdirSync(path.dirname(f), { recursive: true, mode: 0o700 });
+      fs.writeFileSync(f + '.tmp', body, { mode: 0o600 });
+      fs.renameSync(f + '.tmp', f);
+    }
+    // ref anchor: commit chain, CAS on the previous anchor commit
+    const prev = safeGit(repo, ['rev-parse', '--verify', '--quiet', ANCHOR_REF], { allowFailure: true }).stdout.trim();
+    const prevA = prev ? readRefAnchor(repo)?.anchor : null;
+    if (prevA && prevA.counter >= anchor.counter) return;
+    const blob = safeGit(repo, ['hash-object', '-w', '--stdin'], { input: body }).stdout.trim();
+    const tree = safeGit(repo, ['mktree'], { input: `100644 blob ${blob}\thead.json\n` }).stdout.trim();
+    const commit = safeGit(repo, ['commit-tree', tree, ...(prev ? ['-p', prev] : []), '-m', `g4a ledger head ${seq}`], { env: ANCHOR_ENV }).stdout.trim();
+    safeGit(repo, ['update-ref', ANCHOR_REF, commit, prev || ZERO]);
+  }
+  reanchorAll() {
+    for (const { repo } of this.db.prepare('SELECT DISTINCT repo FROM ledger').all()) {
+      if (!fs.existsSync(repo)) continue;
+      this.assertNotRolledBack(repo);
+      const h = this.db.prepare('SELECT seq, entry_hash FROM ledger WHERE repo = ? ORDER BY seq DESC LIMIT 1').get(repo);
+      this.writeAnchor(repo, h.seq, h.entry_hash); // catches up after a crash between append and anchor
+    }
   }
   async signer() { return witnessSignerFromKey(this.privateKey); }
 
   // ---- ledger (hash chain from src/lib/ledger.ts) ----
   async appendLedger(repo, kind, payload) {
+    this.assertNotRolledBack(repo);
     const head = this.db.prepare('SELECT seq, entry_hash FROM ledger WHERE repo = ? ORDER BY seq DESC LIMIT 1').get(repo);
     const fields = { seq: head ? head.seq + 1 : 0, ts: new Date().toISOString(), kind, payload_hash: await sha256Hex(canonicalJson(payload)), prev_hash: head ? head.entry_hash : LEDGER_GENESIS_PREV_HASH };
     const entry_hash = await ledgerEntryHash(fields, sha256Hex);
     this.db.prepare('INSERT INTO ledger (repo, seq, ts, kind, payload, payload_hash, prev_hash, entry_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
       .run(repo, fields.seq, fields.ts, kind, canonicalJson(payload), fields.payload_hash, fields.prev_hash, entry_hash);
+    this.writeAnchor(repo, fields.seq, entry_hash);
     return { ...fields, entry_hash };
   }
 
@@ -149,7 +217,17 @@ export class Authority {
       let wtTop;
       try { wtTop = fs.realpathSync(safeGit(cwd, ['rev-parse', '--show-toplevel']).stdout.trim()); } catch { return { ok: true, managed: false }; }
       const row = this.db.prepare("SELECT * FROM claims WHERE worktree = ? AND status = 'active'").get(wtTop);
-      if (!row) return { ok: true, managed: false };
+      if (!row) {
+        let repo;
+        try { repo = repoId(cwd); } catch { return { ok: true, managed: false }; }
+        const managed = this.db.prepare('SELECT 1 FROM claims WHERE repo = ? LIMIT 1').get(repo);
+        if (!managed) return { ok: true, managed: false };
+        const sub0 = argv.find((x) => !x.startsWith('-'));
+        if (sub0 === 'branch' && !argv.some((x) => /^-[a-zA-Z]*[fdDmMcC]|^--(force|delete|move|copy)/.test(x))) return { ok: true, managed: true, claim: null, warnings: [] };
+        const warnings = [`agent write outside a claimed worktree in a g4a-managed repo (${wtTop}); claim paths with \`g4a claim\` and work in .g4a/worktrees/<agent>`];
+        await this.appendLedger(repo, 'scope_warning', { claim: null, cwd: wtTop, argv, warnings });
+        return { ok: false, managed: true, claim: null, warnings };
+      }
       const c = rowClaim(row);
       const sub = argv.find((a) => !a.startsWith('-'));
       const warnings = [];
@@ -161,6 +239,8 @@ export class Authority {
         if (out.length) warnings.push(`commit touches paths outside claim ${c.id} (${c.paths.join(', ')}): ${out.join(', ')}`);
       }
       if (sub === 'push' && argv.some((a) => /(^|:)(refs\/heads\/)?main$/.test(a))) warnings.push('pushing to main bypasses g4a promotion; use `g4a promote`');
+      if (sub === 'update-ref' && argv.some((a) => a === 'main' || a === 'refs/heads/main' || a.startsWith('refs/g4a/'))) warnings.push('update-ref on main or refs/g4a/* is reserved to the g4a daemon');
+      if (sub === 'branch' && argv.some((a) => /^-(f|M|D|C|-force|-delete)$/.test(a) || /^-[a-zA-Z]*[fMDC]/.test(a)) && argv.includes('main')) warnings.push('moving or deleting main is reserved to the g4a daemon');
       if (['reset', 'rebase', 'checkout', 'switch'].includes(sub) && argv.some((a) => a === 'main' || a.endsWith('/main'))) warnings.push(`${sub} onto main inside a claimed worktree`);
       if (warnings.length) await this.appendLedger(c.repo, 'scope_warning', { claim: c.id, agent: c.agent, argv, warnings });
       return { ok: warnings.length === 0, managed: true, claim: c.id, agent: c.agent, warnings };
@@ -191,8 +271,8 @@ function excludeG4a(top) {
 
 // Offline verify: recompute the chain (src/lib/ledger.ts), every payload hash, and every
 // witness signature against the bundle's (or a pinned) Ed25519 public key.
-export async function verifyBundle(bundle, { pinnedPub } = {}) {
-  const errors = [];
+export async function verifyBundle(bundle, { pinnedPub, anchors = [], main } = {}) {
+  const errors = [], warnings = [];
   const chain = await verifyLedgerChain(bundle.entries, sha256Hex);
   if (!chain.ok) errors.push(chain.detail);
   for (const e of bundle.entries ?? []) {
@@ -203,11 +283,64 @@ export async function verifyBundle(bundle, { pinnedPub } = {}) {
   let promotions = 0;
   for (const e of bundle.entries ?? []) {
     if (e.kind !== 'promote' && e.kind !== 'promote_intent') continue;
+    if (e.payload.recovered && !e.payload.witness) { errors.push(`entry ${e.seq} promote without witness`); continue; }
     if (e.kind === 'promote') promotions++;
     const w = e.payload.witness;
     const ok = w && cryptoVerify(null, Buffer.from(canonicalJson(w.report)), pub, Buffer.from(w.signature, 'base64'));
     if (!ok) errors.push(`entry ${e.seq} witness signature invalid`);
     else if (!w.report.results.every((r) => r.exit === 0)) errors.push(`entry ${e.seq} promoted with a failing witness`);
   }
-  return { ok: errors.length === 0, head: chain.ok ? chain.head : null, entries: bundle.entries?.length ?? 0, promotions, errors };
+  // anchors: every anchor must be correctly signed and must match the ledger at its seq;
+  // an anchor beyond the bundle's last entry means truncation or rollback.
+  const bySeq = new Map((bundle.entries ?? []).map((e) => [e.seq, e]));
+  const last = bundle.entries?.length ? bundle.entries[bundle.entries.length - 1].seq : -1;
+  const checkedAnchors = [];
+  for (const { source, anchor, signature, missing } of anchors) {
+    if (missing) { if (last >= 0) errors.push(`${source}: anchor missing while the ledger has ${last + 1} entries`); continue; }
+    const sigOk = (() => { try { return cryptoVerify(null, Buffer.from(canonicalJson(anchor)), pub, Buffer.from(signature, 'base64')); } catch { return false; } })();
+    if (!sigOk) { errors.push(`${source}: anchor signature invalid`); continue; }
+    if (anchor.repo !== bundle.repo) { errors.push(`${source}: anchor is for another repo`); continue; }
+    if (anchor.seq > last) errors.push(`${source}: ledger truncated or rolled back (anchored head seq ${anchor.seq}, ledger ends at ${last})`);
+    else if (bySeq.get(anchor.seq)?.entry_hash !== anchor.entry_hash) errors.push(`${source}: ledger rewritten (entry ${anchor.seq} differs from the anchored hash)`);
+    checkedAnchors.push({ source, seq: anchor.seq });
+  }
+  if (main) {
+    const lastMain = [...(bundle.entries ?? [])].reverse().find((e) => e.kind === 'promote' || e.kind === 'main_external');
+    const expect = lastMain && (lastMain.payload.main_after ?? lastMain.payload.actual);
+    if (expect && expect !== main) warnings.push(`main is ${main} but the last recorded main is ${expect}: main moved outside the g4a daemon since then`);
+  }
+  return { ok: errors.length === 0, head: chain.ok ? chain.head : null, entries: bundle.entries?.length ?? 0, promotions, anchors: checkedAnchors, errors, warnings };
+}
+
+export function readRefAnchor(repo) {
+  const r = safeGit(repo, ['cat-file', 'blob', `${ANCHOR_REF}:head.json`], { allowFailure: true });
+  if (r.status !== 0) return null;
+  try { return JSON.parse(r.stdout); } catch { return null; }
+}
+// every anchor commit on the chain (newest first); counters must strictly decrease
+export function readRefAnchorChain(repo) {
+  const r = safeGit(repo, ['rev-list', '--first-parent', ANCHOR_REF], { allowFailure: true });
+  if (r.status !== 0) return [];
+  return r.stdout.trim().split('\n').filter(Boolean).map((c) => {
+    const b = safeGit(repo, ['cat-file', 'blob', `${c}:head.json`], { allowFailure: true });
+    try { return { commit: c, ...JSON.parse(b.stdout) }; } catch { return { commit: c, anchor: null }; }
+  });
+}
+export function readFileAnchor(f) { try { return JSON.parse(fs.readFileSync(f, 'utf8')); } catch { return null; } }
+
+// Collect anchors for offline verification of the ledger of `repo` (a git common dir).
+export function collectAnchors(repo, kd = keyDir()) {
+  const out = [];
+  const chain = fs.existsSync(repo) ? readRefAnchorChain(repo) : [];
+  if (!chain.length) out.push({ source: `repo ${ANCHOR_REF}`, missing: true });
+  let prev = Infinity;
+  for (const c of chain) {
+    if (!c.anchor || !(c.anchor.counter < prev)) { out.push({ source: `repo ${ANCHOR_REF}@${c.commit.slice(0, 12)}`, anchor: c.anchor ?? {}, signature: '' }); break; }
+    prev = c.anchor.counter;
+    out.push({ source: `repo ${ANCHOR_REF}@${c.commit.slice(0, 12)}`, anchor: c.anchor, signature: c.signature });
+  }
+  const f = path.join(kd, 'anchors', `${createHash('sha256').update(repo).digest('hex').slice(0, 32)}.json`);
+  const fa = readFileAnchor(f);
+  out.push(fa ? { source: `key-dir anchor ${f}`, ...fa } : { source: `key-dir anchor ${f}`, missing: true });
+  return out;
 }

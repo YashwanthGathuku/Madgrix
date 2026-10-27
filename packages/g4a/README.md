@@ -136,17 +136,52 @@ The check flags staged files outside the claim, pushes to main, and moving onto 
 (`[g4a] warning:` on stderr plus a ledger entry). `G4A_ENFORCE=1` blocks instead. If the daemon is down, the shim warns
 and lets the command run (fail open).
 
-### Phase 1 limits (what it does not do)
-- The ledger has no external anchor. Deleting the newest entries leaves a valid shorter chain, and a
-  test asserts this. Anyone who can write `$G4A_HOME` (the key plus the db) can forge history. This is
-  tamper evidence against edits, not a defense against the local user.
-- Enforcement is advisory by default. Agents can bypass the shim with `G4A_RAW=1`, by calling the real
-  git path, or by editing files without git. Claims gate promotion to main, not edits.
-- `update-ref` moves `refs/heads/main` but does not update a checkout of main. Use a bare repo or keep
-  the main worktree detached. The tests do the latter.
-- Mergiraf resolves concurrent class-member and JSON-key additions. It does not resolve concurrent top-level
-  insertions. It can also merge two edits of one expression structurally, for example `a + b + 0` with
-  `Number(a) + Number(b)`. Witnesses are the guard against such merges, so choose them accordingly.
-- There is one daemon per user, and jobs run one at a time across all repos. There is no multi-host coordination.
-- `node:sqlite` is experimental in Node 22. The CLI runs it with `--no-warnings`.
-- The crash-test hooks `G4A_TEST_CRASH_AFTER_INTENT` and `G4A_TEST_CRASH_AFTER_CAS` are env vars read by the daemon, and they exist for tests only.
+### Phase 1 hardening
+- **Merges are never trusted to Mergiraf alone.** When `git merge-tree` reports a conflict, g4a reads the
+  `git diff -U0` hunks base→main and base→candidate. If both sides changed the same base lines, or one side
+  inserts inside a range the other side changed, the verdict is **REVIEW**. A `promote_review` entry
+  records the capsule hash and main is left alone. `a + b + 0` vs `Number(a) + Number(b)`, which Mergiraf
+  would merge, is a regression test for this. Mergiraf is tried only after that. If Mergiraf fails and
+  every overlap is a pure insertion at the same base point, a union rung keeps both blocks, ours first.
+  Adjacent edits are refused.
+- **Frozen intents.** When a claim is promoted, its witness commands are frozen in the `intents` table.
+  Every later promotion, fast-forwards included, runs the candidate's witnesses plus every frozen intent
+  in bwrap on the merged tree. Results are tagged with the owning agents. Verdicts are ADMIT (promote),
+  REFUSE (`promote_refused`) and REVIEW (`promote_review`).
+- **Ledger anchors outside `$G4A_HOME`.** After every append, the daemon writes two anchors, both
+  signed `{repo, seq, entry_hash, counter}`:
+  - a commit chain at `refs/g4a/ledger-head` in the repo, advanced by a CAS update-ref;
+  - a file at `$G4A_KEY_DIR/anchors/<repo-hash>.json`, which is only ever raised.
+
+  `g4a verify` checks the signature of every anchor and the hash at its seq. It reports truncation,
+  rollback, or a missing anchor when entries exist. It also warns when main moved outside the daemon
+  (the daemon logs `main_external`). If an anchor is ahead of the db, the daemon refuses to append or
+  start (fail closed).
+- **Key placement.** The Ed25519 key lives in `$G4A_KEY_DIR`, which defaults to
+  `${XDG_CONFIG_HOME:-~/.config}/g4a-keys`. The dir is 0700 and the key 0600. The dir must not be inside
+  `$G4A_HOME` or contain it. A Phase 1 key found in `$G4A_HOME` is moved there. The OS keyring is not used.
+- **Enforcement by default for agents.** Agents are identified by an agent marker; `G4A_AGENT=0` marks a
+  human. In a g4a-managed repo, the daemon checks these git commands: commit, push, merge, rebase, reset,
+  checkout, switch, cherry-pick, am, apply, revert, pull, update-ref and branch. The command is blocked
+  when it is out of scope, runs outside a claimed worktree, or touches main or `refs/g4a/*`. If the
+  daemon is down, agents are blocked with a message that says how to start it. `G4A_ENFORCE=0` is the
+  explicit opt-out, and with it these cases only warn. Humans are never checked. Main moves only through
+  `g4a promote` (the daemon).
+- **No test switches in production.** Crash points are injected through `promote(..., hooks)` and
+  `startDaemon(home, { hooks })` by `test/fixtures/crash-daemon.mjs` only.
+
+### Phase 1 limits (what it still does not do)
+- Bypasses remain. An agent can run the real git binary by absolute path, set `G4A_RAW=1` or
+  `G4A_ENFORCE=0`, or edit files without git. Claims gate promotion to main, not edits. Closing these
+  bypasses is Phase 2's job (the authority repo).
+- Anyone who can write both `$G4A_KEY_DIR` and the repo's refs, which is the same local user, can still
+  re-sign history. The anchors detect rollback or truncation of the db alone, or the ref alone. They are
+  not a defense against a fully compromised local account.
+- Agents can edit test files inside their own claim, so a frozen intent is only as strong as the paths
+  its witness depends on. Keep witness files out of other agents' claims.
+- The union rung is line-based. Witnesses are what reject semantically bad unions, such as a duplicated
+  `export const v`, which is tested.
+- `update-ref` moves `refs/heads/main` but does not update a checkout of main. Use a bare repo or keep the
+  main worktree detached.
+- There is one daemon per user, and jobs run serially. `node:sqlite` is experimental in Node 22, so the
+  CLI runs it with `--no-warnings`.

@@ -201,7 +201,11 @@ async function verifyCmd(args) {
   else { const db = A.openDb(home, { readOnly: true }); bundle = A.bundleFromDb(db, A.repoId(o.repo)); db.close(); }
   let pinnedPub;
   if (o.pin) pinnedPub = o.pin;
-  const r = await A.verifyBundle(bundle, { pinnedPub });
+  // anchors outside $G4A_HOME: refs/g4a/ledger-head in the repo + the key-dir anchor file
+  const anchors = A.collectAnchors(bundle.repo, A.keyDir());
+  const { safeGit } = await import('../../../scripts/lib/safe-git.mjs');
+  const main = fs.existsSync(bundle.repo) ? safeGit(bundle.repo, ['rev-parse', '--verify', '--quiet', 'refs/heads/main'], { allowFailure: true }).stdout.trim() || undefined : undefined;
+  const r = await A.verifyBundle(bundle, { pinnedPub, anchors, main });
   out(r);
 }
 async function stopCmd() { try { out(await (await client())('shutdown')); } catch (e) { out({ ok: false, error: e.message }); } }

@@ -12,7 +12,8 @@ import { g4aHome } from './lib.mjs';
 
 export const socketPath = (home = g4aHome()) => path.join(home, 'g4a.sock');
 
-export async function startDaemon(home = g4aHome()) {
+// opts.hooks: test-only promotion hooks (see test/fixtures/crash-daemon.mjs); never set by the CLI.
+export async function startDaemon(home = g4aHome(), { hooks = {}, keyDir } = {}) {
   fs.mkdirSync(home, { recursive: true, mode: 0o700 });
   fs.chmodSync(home, 0o700);
   // control-plane git must reach the real git, never the shim
@@ -23,7 +24,7 @@ export async function startDaemon(home = g4aHome()) {
     if (alive) throw new Error(`g4a daemon already running on ${sock}`);
     fs.rmSync(sock, { force: true }); // stale socket from a crashed daemon
   }
-  const auth = new Authority(home);
+  const auth = new Authority(home, keyDir ? { keyDir } : {});
   const requeued = auth.db.prepare("UPDATE jobs SET status = 'queued' WHERE status = 'running'").run().changes;
   const bus = new EventEmitter();
   let busy = false;
@@ -40,7 +41,7 @@ export async function startDaemon(home = g4aHome()) {
         try {
           const { claimId } = JSON.parse(job.payload);
           const row = auth.db.prepare('SELECT * FROM claims WHERE id = ?').get(claimId);
-          result = row ? await promote(auth, rowClaim(row), job.id) : { ok: false, status: 'refused', reason: 'claim not found' };
+          result = row ? await promote(auth, rowClaim(row), job.id, hooks) : { ok: false, status: 'refused', reason: 'claim not found' };
         } catch (e) { result = { ok: false, status: 'error', error: String(e.message || e) }; }
         auth.db.prepare("UPDATE jobs SET status = 'done', result = ? WHERE id = ?").run(JSON.stringify(result), job.id);
         bus.emit(job.id, result);
