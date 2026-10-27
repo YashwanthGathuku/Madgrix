@@ -97,7 +97,7 @@ export async function startDaemon(home = g4aHome(), { hooks = {}, keyDir } = {})
         if (p.credentialStore === 'session') issued = { agent_credential: a.agent_credential, credential_store: 'session' };
         else { const f = credPath(p.repo, p.agent); ensurePrivateDir(path.dirname(path.dirname(f))); ensurePrivateDir(path.dirname(f)); writePrivate(f, a.agent_credential); issued = { credential_store: 'file' }; }
       }
-      try { const r = await auth.claim(p); if (!r.ok) call(loc, 'release', { agent: p.agent, credential: cred }); return { ...r, ...issued, authority: { mode: loc.mode, claim: a.id } }; }
+      try { const r = await auth.claim({ ...p, expectBaseline: a.baseline }); if (!r.ok) call(loc, 'release', { agent: p.agent, credential: cred }); return { ...r, ...issued, authority: { mode: loc.mode, claim: a.id } }; }
       catch (e) { call(loc, 'release', { agent: p.agent, credential: cred }); throw e; }
     },
     release: async (p) => {

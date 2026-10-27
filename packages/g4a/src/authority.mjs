@@ -298,7 +298,7 @@ export class Authority {
     for (const c of this.activeClaims(repo)) if (c.agent !== agent) for (const p of c.witness_paths) out.push({ owner: c.agent, path: p, frozen: false });
     return out;
   }
-  claim({ repo: repoPath, agent, paths, witnesses = [], witnessPaths = [], allowOverlap = false }) {
+  claim({ repo: repoPath, agent, paths, witnesses = [], witnessPaths = [], allowOverlap = false, expectBaseline = null }) {
     return this.serial(async () => {
       if (!/^[A-Za-z0-9._-]{1,64}$/.test(agent || '')) throw new Error('agent must match [A-Za-z0-9._-]{1,64}');
       if (!Array.isArray(paths) || paths.length === 0) throw new Error('claim needs at least one path');
@@ -325,6 +325,9 @@ export class Authority {
         return { ok: false, refused: 'witness_paths', guarded };
       }
       const baseline = safeGit(top, ['rev-parse', '--verify', 'refs/heads/main^{commit}']).stdout.trim();
+      // mirrored claims: the authority already fixed the baseline its permit will check; a local
+      // worktree on any other main would carry foreign paths into the push (refused out-of-claim)
+      if (expectBaseline && expectBaseline !== baseline) return { ok: false, refused: 'main_out_of_sync', local: baseline, authority: expectBaseline };
       const branch = `g4a/${agent}`;
       const worktree = path.join(top, '.g4a', 'worktrees', agent);
       excludeG4a(top);
