@@ -1,0 +1,5 @@
+{
+	"name": "escape-string-regexp",
+	"private": true,
+	"type": "module"
+}

@@ -1,0 +1,36 @@
+# Parent fork plus two role-scoped sub-agents. Git4agents does not vendor
+# Agentfleet. `fleet validate --config` this file; the path split lives in
+# configs/git4agents-fork-crew.json. Sub-agents commit on the parent fork.
+version: "1.0"
+name: git4agents-fork-crew
+endpoints:
+  local:
+    provider: mock
+    base_url: http://127.0.0.1:9/v1
+    model_name: mock
+agents:
+  - id: parent
+    role: parent
+    model_ref: local
+    system_prompt: Fork the baseline once. Do not edit src/api or src/ui. Sub-agents work on this fork.
+  - id: sub-api
+    role: api
+    model_ref: local
+    system_prompt: Own src/api only. Do not edit src/ui.
+  - id: sub-ui
+    role: ui
+    model_ref: local
+    system_prompt: Own src/ui only. Do not edit src/api.
+tasks:
+  - id: work-parent
+    assigned_agent: parent
+    instruction: Fork the baseline and host the sub-agents. Do not edit their files.
+    expected_output: out/parent.md
+  - id: work-sub-api
+    assigned_agent: sub-api
+    instruction: Add the API handler under src/api only.
+    expected_output: src/api/handler.js
+  - id: work-sub-ui
+    assigned_agent: sub-ui
+    instruction: Add the UI view under src/ui only.
+    expected_output: src/ui/view.js

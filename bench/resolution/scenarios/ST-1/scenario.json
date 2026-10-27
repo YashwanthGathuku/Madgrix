@@ -1,0 +1,27 @@
+{
+  "id": "ST-1",
+  "kind": "list",
+  "package": "indent-string",
+  "title": "Two new options meet only in the option list",
+  "agents": [
+    {
+      "id": "a-trim",
+      "intent": "Add a trimTrailing option that removes trailing whitespace from every line of the result.",
+      "files": [
+        "index.d.ts",
+        "index.js"
+      ]
+    },
+    {
+      "id": "b-strict",
+      "intent": "Add a strict option: a count of 0 throws a RangeError when strict is true.",
+      "files": [
+        "CHANGELOG.md",
+        "index.js"
+      ]
+    }
+  ],
+  "reference": [
+    "index.js"
+  ]
+}

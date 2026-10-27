@@ -1,0 +1,136 @@
+[
+  {
+    "n": 10,
+    "mode": "local",
+    "granted": 10,
+    "errors": 0,
+    "error_rate": 0,
+    "rate_limited": 0,
+    "p50_ms": 0.3052009999999967,
+    "p95_ms": 0.8956969999999984,
+    "error_samples": [],
+    "wall_ms": 6,
+    "seeded_overlaps": 0,
+    "overlaps_flagged": 0,
+    "state_bytes_max": 11040,
+    "first_claim_over_2MiB": null,
+    "conflict_reports_stored": 0,
+    "ledger": {
+      "ok": true,
+      "entries": 12
+    },
+    "forks_created": 0
+  },
+  {
+    "n": 100,
+    "mode": "local",
+    "granted": 100,
+    "errors": 0,
+    "error_rate": 0,
+    "rate_limited": 0,
+    "p50_ms": 0.4576900000000137,
+    "p95_ms": 1.0327369999999974,
+    "error_samples": [],
+    "wall_ms": 53,
+    "seeded_overlaps": 4,
+    "overlaps_flagged": 4,
+    "state_bytes_max": 101755,
+    "first_claim_over_2MiB": null,
+    "conflict_reports_stored": 4,
+    "ledger": {
+      "ok": true,
+      "entries": 102
+    },
+    "forks_created": 0
+  },
+  {
+    "n": 500,
+    "mode": "local",
+    "granted": 500,
+    "errors": 0,
+    "error_rate": 0,
+    "rate_limited": 0,
+    "p50_ms": 1.351651000000004,
+    "p95_ms": 3.5059029999999893,
+    "error_samples": [],
+    "wall_ms": 782,
+    "seeded_overlaps": 24,
+    "overlaps_flagged": 24,
+    "state_bytes_max": 506970,
+    "first_claim_over_2MiB": null,
+    "conflict_reports_stored": 24,
+    "ledger": {
+      "ok": true,
+      "entries": 502
+    },
+    "forks_created": 0
+  },
+  {
+    "n": 1000,
+    "mode": "local",
+    "granted": 1000,
+    "errors": 0,
+    "error_rate": 0,
+    "rate_limited": 0,
+    "p50_ms": 2.937044999999898,
+    "p95_ms": 7.3179879999997866,
+    "error_samples": [],
+    "wall_ms": 3179,
+    "seeded_overlaps": 49,
+    "overlaps_flagged": 49,
+    "state_bytes_max": 1016595,
+    "first_claim_over_2MiB": null,
+    "conflict_reports_stored": 49,
+    "ledger": {
+      "ok": true,
+      "entries": 1002
+    },
+    "forks_created": 0
+  },
+  {
+    "n": 2000,
+    "mode": "local",
+    "granted": 2000,
+    "errors": 0,
+    "error_rate": 0,
+    "rate_limited": 0,
+    "p50_ms": 7.655805000000328,
+    "p95_ms": 18.359369000001607,
+    "error_samples": [],
+    "wall_ms": 16654,
+    "seeded_overlaps": 99,
+    "overlaps_flagged": 99,
+    "state_bytes_max": 2035990,
+    "first_claim_over_2MiB": null,
+    "conflict_reports_stored": 99,
+    "ledger": {
+      "ok": true,
+      "entries": 2002
+    },
+    "forks_created": 0
+  },
+  {
+    "n": 3000,
+    "mode": "local",
+    "granted": 2020,
+    "errors": 980,
+    "error_rate": 0.32666666666666666,
+    "rate_limited": 0,
+    "p50_ms": 10.741256000001158,
+    "p95_ms": 21.328859000001103,
+    "error_samples": [
+      "500:state_value_over_2MiB"
+    ],
+    "wall_ms": 33580,
+    "seeded_overlaps": 149,
+    "overlaps_flagged": 0,
+    "state_bytes_max": 2097644,
+    "first_claim_over_2MiB": 2021,
+    "conflict_reports_stored": 0,
+    "ledger": {
+      "ok": true,
+      "entries": 2022
+    },
+    "forks_created": 0
+  }
+]

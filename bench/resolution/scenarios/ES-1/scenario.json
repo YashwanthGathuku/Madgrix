@@ -1,0 +1,27 @@
+{
+  "id": "ES-1",
+  "kind": "textual",
+  "package": "escape-string-regexp",
+  "title": "Two agents each add an escape to the same replace chain",
+  "agents": [
+    {
+      "id": "a-slash",
+      "intent": "Also escape / so the result is safe inside a regular expression literal.",
+      "files": [
+        "index.d.ts",
+        "index.js"
+      ]
+    },
+    {
+      "id": "b-nul",
+      "intent": "Escape NUL characters as \\x00.",
+      "files": [
+        "CHANGELOG.md",
+        "index.js"
+      ]
+    }
+  ],
+  "reference": [
+    "index.js"
+  ]
+}

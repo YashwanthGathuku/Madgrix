@@ -1,0 +1,115 @@
+# Parent fork plus 12 path-scoped sub-agents on ext-ky (sindresorhus/ky, MIT).
+# Path split lives in configs/git4agents-fork-crew-big.json.
+version: "1.0"
+name: git4agents-fork-crew-big
+endpoints:
+  local:
+    provider: mock
+    base_url: http://127.0.0.1:9/v1
+    model_name: mock
+agents:
+  - id: parent
+    role: parent
+    model_ref: local
+    system_prompt: Fork the baseline once and host the sub-agents.
+  - id: sub-01-core
+    role: core
+    model_ref: local
+    system_prompt: Own source/core/MADGRIX_CREW_01.md only.
+  - id: sub-02-errors
+    role: errors
+    model_ref: local
+    system_prompt: Own source/errors/MADGRIX_CREW_02.md only.
+  - id: sub-03-types
+    role: types
+    model_ref: local
+    system_prompt: Own source/types/MADGRIX_CREW_03.md only.
+  - id: sub-04-utils
+    role: utils
+    model_ref: local
+    system_prompt: Own source/utils/MADGRIX_CREW_04.md only.
+  - id: sub-05-src
+    role: src
+    model_ref: local
+    system_prompt: Own source/MADGRIX_CREW_05.md only.
+  - id: sub-06-test
+    role: test
+    model_ref: local
+    system_prompt: Own source/core/MADGRIX_CREW_06.md only.
+  - id: sub-07-helpers
+    role: helpers
+    model_ref: local
+    system_prompt: Own source/utils/MADGRIX_CREW_07.md only.
+  - id: sub-08-typed
+    role: typed
+    model_ref: local
+    system_prompt: Own test-d/MADGRIX_CREW_08.md only.
+  - id: sub-09-media
+    role: media
+    model_ref: local
+    system_prompt: Own media/MADGRIX_CREW_09.md only.
+  - id: sub-10-wf
+    role: wf
+    model_ref: local
+    system_prompt: Own .github/workflows/MADGRIX_CREW_10.md only.
+  - id: sub-11-gh
+    role: gh
+    model_ref: local
+    system_prompt: Own .github/MADGRIX_CREW_11.md only.
+  - id: sub-12-root
+    role: root
+    model_ref: local
+    system_prompt: Own MADGRIX_CREW_12.md only.
+tasks:
+  - id: work-parent
+    assigned_agent: parent
+    instruction: Fork the baseline and host the sub-agents.
+    expected_output: out/parent.md
+  - id: work-sub-01-core
+    assigned_agent: sub-01-core
+    instruction: Write source/core/MADGRIX_CREW_01.md only.
+    expected_output: source/core/MADGRIX_CREW_01.md
+  - id: work-sub-02-errors
+    assigned_agent: sub-02-errors
+    instruction: Write source/errors/MADGRIX_CREW_02.md only.
+    expected_output: source/errors/MADGRIX_CREW_02.md
+  - id: work-sub-03-types
+    assigned_agent: sub-03-types
+    instruction: Write source/types/MADGRIX_CREW_03.md only.
+    expected_output: source/types/MADGRIX_CREW_03.md
+  - id: work-sub-04-utils
+    assigned_agent: sub-04-utils
+    instruction: Write source/utils/MADGRIX_CREW_04.md only.
+    expected_output: source/utils/MADGRIX_CREW_04.md
+  - id: work-sub-05-src
+    assigned_agent: sub-05-src
+    instruction: Write source/MADGRIX_CREW_05.md only.
+    expected_output: source/MADGRIX_CREW_05.md
+  - id: work-sub-06-test
+    assigned_agent: sub-06-test
+    instruction: Write source/core/MADGRIX_CREW_06.md only.
+    expected_output: source/core/MADGRIX_CREW_06.md
+  - id: work-sub-07-helpers
+    assigned_agent: sub-07-helpers
+    instruction: Write source/utils/MADGRIX_CREW_07.md only.
+    expected_output: source/utils/MADGRIX_CREW_07.md
+  - id: work-sub-08-typed
+    assigned_agent: sub-08-typed
+    instruction: Write test-d/MADGRIX_CREW_08.md only.
+    expected_output: test-d/MADGRIX_CREW_08.md
+  - id: work-sub-09-media
+    assigned_agent: sub-09-media
+    instruction: Write media/MADGRIX_CREW_09.md only.
+    expected_output: media/MADGRIX_CREW_09.md
+  - id: work-sub-10-wf
+    assigned_agent: sub-10-wf
+    instruction: Write .github/workflows/MADGRIX_CREW_10.md only.
+    expected_output: .github/workflows/MADGRIX_CREW_10.md
+  - id: work-sub-11-gh
+    assigned_agent: sub-11-gh
+    instruction: Write .github/MADGRIX_CREW_11.md only.
+    expected_output: .github/MADGRIX_CREW_11.md
+  - id: work-sub-12-root
+    assigned_agent: sub-12-root
+    instruction: Write MADGRIX_CREW_12.md only.
+    expected_output: MADGRIX_CREW_12.md

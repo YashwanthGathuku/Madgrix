@@ -1,0 +1,27 @@
+{
+  "id": "ES-2",
+  "kind": "textual",
+  "package": "escape-string-regexp",
+  "title": "One agent widens the accepted input; another rewrites the error it raises",
+  "agents": [
+    {
+      "id": "a-message",
+      "intent": "Name the received type in the TypeError message.",
+      "files": [
+        "index.d.ts",
+        "index.js"
+      ]
+    },
+    {
+      "id": "b-number",
+      "intent": "Accept numbers by converting them to strings.",
+      "files": [
+        "CHANGELOG.md",
+        "index.js"
+      ]
+    }
+  ],
+  "reference": [
+    "index.js"
+  ]
+}

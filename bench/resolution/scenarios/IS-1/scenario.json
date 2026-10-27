@@ -1,0 +1,27 @@
+{
+  "id": "IS-1",
+  "kind": "textual",
+  "package": "indent-string",
+  "title": "Two new options change the same option list and the same return line",
+  "agents": [
+    {
+      "id": "a-trim",
+      "intent": "Add a trimTrailing option that removes trailing whitespace from every line of the result.",
+      "files": [
+        "index.d.ts",
+        "index.js"
+      ]
+    },
+    {
+      "id": "b-prefix",
+      "intent": "Add a prefix option that is written before the indentation of every indented line.",
+      "files": [
+        "CHANGELOG.md",
+        "index.js"
+      ]
+    }
+  ],
+  "reference": [
+    "index.js"
+  ]
+}

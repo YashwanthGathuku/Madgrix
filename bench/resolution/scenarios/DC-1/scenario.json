@@ -1,0 +1,27 @@
+{
+  "id": "DC-1",
+  "kind": "textual",
+  "package": "decamelize",
+  "title": "Two agents insert different input checks at the same place",
+  "agents": [
+    {
+      "id": "a-trim",
+      "intent": "Trim surrounding whitespace from the input.",
+      "files": [
+        "index.d.ts",
+        "index.js"
+      ]
+    },
+    {
+      "id": "b-empty-separator",
+      "intent": "Reject an empty separator with a TypeError.",
+      "files": [
+        "CHANGELOG.md",
+        "index.js"
+      ]
+    }
+  ],
+  "reference": [
+    "index.js"
+  ]
+}

@@ -1,0 +1,23 @@
+{
+  "id": "CTRL-2",
+  "kind": "control",
+  "package": "decamelize",
+  "title": "One agent rewords an error; another adds a snake_case helper that names its separator",
+  "agents": [
+    {
+      "id": "a-message",
+      "intent": "Say which argument has the wrong type in the TypeError.",
+      "files": [
+        "index.js"
+      ]
+    },
+    {
+      "id": "b-snake",
+      "intent": "Add toSnakeCase(text) in snake.js, which returns snake_case.",
+      "files": [
+        "snake.js"
+      ]
+    }
+  ],
+  "reference": []
+}

@@ -41,11 +41,13 @@ interface ContainerExecOutput {
 }
 interface ContainerExecProcess {
 	output(): Promise<ContainerExecOutput>;
+	kill(signal?: number): void;
 }
 interface ContainerHandle {
 	running: boolean;
 	start(options?: { env?: Record<string, string>; entrypoint?: string[]; enableInternet?: boolean }): void;
 	exec(cmd: string[], options?: { env?: Record<string, string> }): Promise<ContainerExecProcess>;
+	destroy(error?: unknown): Promise<void>;
 }
 
 interface DurableObjectState {
@@ -82,6 +84,20 @@ interface DoNamespace {
 	get(id: DoObjectId): DoStub;
 }
 
+/** Structural stand-in for a Workflow instance handle. */
+interface WorkflowInstanceHandle {
+	id: string;
+	status(): Promise<{ status: string; error?: { name: string; message: string }; output?: unknown }>;
+	terminate(): Promise<void>;
+	restart(): Promise<void>;
+}
+
+/** Structural stand-in for a Workflow binding (`Workflow` in the runtime types). */
+interface WorkflowBindingLike {
+	create(options?: { id?: string; params?: unknown }): Promise<WorkflowInstanceHandle>;
+	get(id: string): Promise<WorkflowInstanceHandle>;
+}
+
 /** Worker environment (structural). In production, `ARTIFACTS` is the real
  *  Artifacts binding adapted via `BindingArtifactsPort`; locally it is a
  *  `FakeArtifacts` (which already implements `ArtifactsPort`). */
@@ -92,7 +108,22 @@ interface Env {
 	EVALUATION_SERVICE_TOKEN: string;
 	CONTROL_SERVICE_TOKEN: string;
 	AGENT_SERVICE_TOKEN: string;
+	/** Ed25519 PKCS8 (PEM or base64) the TaskAuthority signs promotion bundles with. */
+	AUTHORITY_SIGNING_KEY?: string;
+	/** SPKI DER hex of the witness runner key; when set, COMPOSED/RESOLVED need an admission proof. */
+	/** Comma-separated SPKI DER (hex) Ed25519 witness runner keys. */
+	MADGRIX_WITNESS_RUNNER_PUBLIC_KEY?: string;
+	/** Comma-separated revoked witness runner key ids (wr-…). */
+	MADGRIX_WITNESS_RUNNER_REVOKED_KEY_IDS?: string;
+	/** "1": INSECURE dev opt-in to record COMPOSED/RESOLVED with no key pinned. */
+	MADGRIX_INSECURE_UNPINNED_WITNESS_RUNNER?: string;
 	PROMOTION_CONTAINER: DoNamespace;
+	/** The PromotionWorkflow binding: one instance per permit, id = permit_id. */
+	PROMOTION_WORKFLOW: WorkflowBindingLike;
+	/** Optional: one task id whose work-graph page is readable without a token (demo). */
+	MADGRIX_PUBLIC_DEMO_TASK_ID?: string;
+	/** ModuleAgent Durable Objects (docs/MODULE_MEMORY.md). Deployed with the madgrix Worker. */
+	MODULE_AGENT?: DoNamespace;
 }
 
 /** Queue consumer batch shape (structural; mirrors MessageBatch). */

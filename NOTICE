@@ -1,0 +1,20 @@
+Git4agents
+Copyright 2026 Yashwanth Gathuku
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This product includes third-party software:
+
+- TheUstad (third_party/theustad), MIT License. Its license and notice are
+  kept in third_party/theustad/LICENSE and third_party/theustad/NOTICE.
+- indent-string, escape-string-regexp and decamelize by Sindre Sorhus
+  (bench/resolution/upstream), MIT License, used as benchmark baselines and
+  modified by the scenarios in bench/resolution/scenarios. Each license is
+  kept next to its source; bench/resolution/README.md names the commits.
+
+Mergiraf (GPL-3.0) is optionally run as an external program by the
+resolution ladder; it is not redistributed or linked.
+
+External repositories used as demo baselines (sindresorhus/ky,
+sindresorhus/is-plain-obj, both MIT) are imported at run time into
+Cloudflare Artifacts and are not redistributed in this repository.

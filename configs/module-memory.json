@@ -1,0 +1,14 @@
+{
+  "modules": [
+    { "id": "lib", "paths": ["src/lib/**"] },
+    { "id": "worker", "paths": ["src/worker/**"] },
+    { "id": "durable-objects", "paths": ["src/do/**"] },
+    { "id": "harness", "paths": ["src/harness/**", "src/cli/**"] },
+    { "id": "scripts", "paths": ["scripts/**"] },
+    { "id": "container", "paths": ["container/**"] },
+    { "id": "tests", "paths": ["test/**"] },
+    { "id": "theustad", "paths": ["third_party/**"] },
+    { "id": "docs", "paths": ["docs/**", "specs/**", "research/**", "*.md"] },
+    { "id": "config", "paths": ["configs/**", "keys/**", ".github/**", "*.json", "*.ts"] }
+  ]
+}

@@ -1,0 +1,24 @@
+{
+  "id": "SEM-2",
+  "kind": "semantic",
+  "package": "decamelize",
+  "title": "One agent changes the default separator; another adds a snake_case helper that relies on it",
+  "agents": [
+    {
+      "id": "a-dash",
+      "intent": "Use - as the default separator.",
+      "files": [
+        "index.d.ts",
+        "index.js"
+      ]
+    },
+    {
+      "id": "b-snake",
+      "intent": "Add toSnakeCase(text) in snake.js, which returns snake_case.",
+      "files": [
+        "snake.js"
+      ]
+    }
+  ],
+  "reference": []
+}

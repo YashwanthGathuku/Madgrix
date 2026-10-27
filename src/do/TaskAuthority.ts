@@ -14,25 +14,48 @@
  * - All state transitions go through the pure functions in
  *   `src/lib/task-state.ts` inside a storage transaction: `/event` →
  *   `ingestQueueEvent`; `/claim` → `registerClaim` (validates the claim,
- *   assigns work_id, classifies conflicts against live claims);
+ *   assigns work_id, binds the agent's secret hash, classifies conflicts
+ *   against live claims); `/contender` → `registerContender` (create-only:
+ *   an existing record is returned unchanged, never overwritten);
  *   `/evidence` → `submitEvaluation` (rejects bundles for a different
- *   task). `/contender` remains a provisional record-ingestion endpoint
- *   (the control plane inserts contender records after forking); verdict,
- *   permit, and quarantine logic lives in task-state.ts.
+ *   task or for a SHA that is not the contender's latest observed commit;
+ *   answers 409 and ledgers `evidence_replacement_rejected` when a labeled
+ *   candidate's evidence would be replaced); `/permit` → `issuePermit`
+ *   (409 REBASE_REQUIRED, ledgered, when the destination head is not one the
+ *   candidate is known to descend from); `/rebase` → `recordRebase` (the
+ *   rebase container's report: REBASED/UP_TO_DATE record ancestry, CONFLICT
+ *   escalates with the paths as data; specs/amendments/rebase-ancestry-v1.md);
+ *   `/promotion/begin` → `beginPromotion` (the reservation is the
+ *   linearization point); `/promotion/abort` → `abortReservedPromotion`
+ *   (a proven no-write terminal outcome); `/promotion/finalize` → `finalizeReservedPromotion`
+ *   + `recordPromotionBundle` (signs the ship record with
+ *   AUTHORITY_SIGNING_KEY in the same transaction; it does not re-decide
+ *   authority for that reservation). Verdict, permit, and quarantine logic
+ *   lives in task-state.ts.
  *
  * Structural typing note: this class does NOT extend a real DurableObject
  * (no base class importable here; see workers.d.ts). The runtime only needs
  * the `(state, env)` constructor and `fetch(request)`.
  */
 
+import { parseWitnessRunnerKeys } from "../lib/admission-proof.ts";
+import type { AncestryProof } from "../lib/ancestry-proof.ts";
 import {
+	AgentSecretError,
 	assignCandidateLabels,
-	attemptPromotion,
+	abortReservedPromotion,
+	beginPromotion,
 	commitVerifier,
 	createAuthority,
+	enrollAgents,
+	finalizeReservedPromotion,
 	ingestQueueEvent,
 	issuePermit,
+	recordComposition,
+	recordPromotionBundle,
+	recordRebase,
 	registerClaim,
+	registerContender,
 	registerOperatorKeys,
 	registerVerifierKeys,
 	revealVerifier,
@@ -42,10 +65,12 @@ import {
 	type Ctx,
 	type Effect,
 	type NewClaimInput,
+	type RebaseReport,
 } from "../lib/task-state.ts";
 import type {
 	AuthorityState,
 	CallerIdentity,
+	CompositionRecord,
 	ContenderRecord,
 	EvaluationBundle,
 	QueuePushEvent,
@@ -56,6 +81,7 @@ import type {
 } from "../lib/types.ts";
 import { joinHashParts, randomHex, sha256Hex } from "../lib/canonical.ts";
 import { SELECTOR_POLICY_VERSION } from "../lib/types.ts";
+import { loadAuthoritySigner, type AuthoritySigner } from "../lib/authority-key.ts";
 
 /** Frozen spec 1 §10: permit = SHA256(task_hash || baseline || winning_tree
  *  || eval_bundle || policy || expected_destination_head), with "||"
@@ -100,8 +126,17 @@ async function selectorPolicyHash(): Promise<string> {
 
 /** Production Ctx for ingestQueueEvent: real wall-clock time, real
  *  randomness, WebCrypto SHA-256, frozen policy identity. */
-async function productionCtx(): Promise<Ctx> {
+async function productionCtx(env?: {
+	MADGRIX_WITNESS_RUNNER_PUBLIC_KEY?: string;
+	MADGRIX_WITNESS_RUNNER_REVOKED_KEY_IDS?: string;
+	MADGRIX_INSECURE_UNPINNED_WITNESS_RUNNER?: string;
+}): Promise<Ctx> {
+	// Comma-separated SPKI hex keys (rotation: pin old and new together), and
+	// revoked key ids. With none pinned, COMPOSED/RESOLVED are refused unless
+	// the insecure dev opt-in is set.
 	return {
+		witnessRunnerKeys: await parseWitnessRunnerKeys(env?.MADGRIX_WITNESS_RUNNER_PUBLIC_KEY, env?.MADGRIX_WITNESS_RUNNER_REVOKED_KEY_IDS),
+		insecureUnpinnedWitnessRunner: env?.MADGRIX_INSECURE_UNPINNED_WITNESS_RUNNER === "1",
 		now: () => new Date().toISOString(),
 		randomHex,
 		sha256Hex,
@@ -141,7 +176,21 @@ export class TaskAuthority {
 		return st ?? null;
 	}
 
+	/**
+	 * Every answer is JSON: a transition that throws where a route does not
+	 * expect it (storage, a bug) is a 500 `authority_internal_error`, never
+	 * the runtime's error page (specs/amendments/promotion-runtime-v1.md).
+	 */
 	async fetch(request: Request): Promise<Response> {
+		try {
+			return await this.route(request);
+		} catch (err) {
+			console.error(`TaskAuthority: ${request.method} ${new URL(request.url).pathname} failed: ${(err as Error)?.message ?? err}`);
+			return json({ error: "authority_internal_error" }, 500);
+		}
+	}
+
+	private async route(request: Request): Promise<Response> {
 		const url = new URL(request.url);
 		const path = url.pathname;
 
@@ -158,8 +207,11 @@ export class TaskAuthority {
 			const body = parsed.body as {
 				verifier_keys?: { verifier_id: string; public_key_der_hex: string }[];
 				operator_keys?: { public_key_der_hex: string }[];
+				// Agent id → SHA-256 of its secret (agent-enrollment-v1). The
+				// plaintext secrets never reach the authority.
+				agent_enrollment?: Record<string, string>;
 			};
-			const ctx = await productionCtx();
+			const ctx = await productionCtx(this.doEnv as Parameters<typeof productionCtx>[0]);
 			return this.doState.storage.transaction(async () => {
 				const existing = await this.loadState();
 				if (existing !== null) {
@@ -172,6 +224,13 @@ export class TaskAuthority {
 				} catch (err) {
 					return json({ error: "key_registration_failed", detail: (err as Error).message }, 400);
 				}
+				if (body.agent_enrollment !== undefined) {
+					try {
+						state = await enrollAgents(state, body.agent_enrollment, ctx);
+					} catch (err) {
+						return json({ error: "agent_enrollment_failed", detail: (err as Error).message }, 400);
+					}
+				}
 				await this.doState.storage.put(STATE_KEY, state);
 				return json({ task_id: task.task_id, task_hash: task.task_hash, initialized: true });
 			});
@@ -181,17 +240,19 @@ export class TaskAuthority {
 		if (request.method === "POST" && path === "/event") {
 			const parsed = await readJsonBody(request);
 			if (!parsed.ok) return parsed.response;
-			const event = (parsed.body as { event?: QueuePushEvent }).event;
+			const body = parsed.body as { event?: QueuePushEvent; reconciliation?: AncestryProof };
+			const event = body.event;
 			if (!event || typeof event.repo !== "string" || typeof event.after !== "string") {
 				return json({ error: "invalid_event", detail: "body.event must be a QueuePushEvent" }, 400);
 			}
-			const ctx = await productionCtx();
+			const reconciliation = body.reconciliation ?? null;
+			const ctx = await productionCtx(this.doEnv as Parameters<typeof productionCtx>[0]);
 			return this.doState.storage.transaction(async () => {
 				const state = await this.loadState();
 				if (state === null) {
 					return json({ error: "not_initialized" }, 404);
 				}
-				const result = await ingestQueueEvent(state, event, ctx);
+				const result = await ingestQueueEvent(state, event, ctx, { reconciliation });
 				await this.doState.storage.put(STATE_KEY, result.state);
 				// NOTE: effects are RETURNED, not executed. The caller
 				// (queue consumer / Workflow) executes them. The DO never
@@ -209,22 +270,25 @@ export class TaskAuthority {
 			// work_id/status/version via registerClaim (task-state.ts).
 			// A body that already carries work_id is rejected — the
 			// authority is the sole assigner of claim identity.
-			const input = (parsed.body as { claim?: Record<string, unknown> }).claim;
-			if (!input || typeof input !== "object" || "work_id" in input) {
+			const { claim: input, agent_secret } = parsed.body as { claim?: Record<string, unknown>; agent_secret?: unknown };
+			if (!input || typeof input !== "object" || "work_id" in input || "agent_secret_sha256" in input) {
 				return json(
 					{
 						error: "invalid_claim",
-						detail: "body.claim must be a claim input (no work_id; the authority assigns it)",
+						detail: "body.claim must be a claim input (no work_id or agent_secret_sha256; the authority assigns them)",
 					},
 					400,
 				);
 			}
-			const ctx = await productionCtx();
+			if (agent_secret !== undefined && typeof agent_secret !== "string") {
+				return json({ error: "invalid_agent_secret" }, 400);
+			}
+			const ctx = await productionCtx(this.doEnv as Parameters<typeof productionCtx>[0]);
 			return this.doState.storage.transaction(async () => {
 				const state = await this.loadState();
 				if (state === null) return json({ error: "not_initialized" }, 404);
 				try {
-					const r = await registerClaim(state, input as NewClaimInput, ctx);
+					const r = await registerClaim(state, input as NewClaimInput, ctx, agent_secret);
 					await this.doState.storage.put(STATE_KEY, r.state);
 					return json({
 						recorded: true,
@@ -234,14 +298,20 @@ export class TaskAuthority {
 							risk: rep.risk,
 							explanation: rep.explanation,
 						})),
+						// Unenrolled tasks only: the plaintext leaves the authority
+						// once, on the agent's first claim; only its SHA-256 was
+						// stored. Enrolled agents got theirs from POST /tasks.
+						// (specs/amendments/agent-enrollment-v1.md)
+						...(r.agent_secret === null ? {} : { agent_secret: r.agent_secret }),
 					});
 				} catch (err) {
+					if (err instanceof AgentSecretError) return json({ error: err.code }, 403);
 					return json({ error: "claim_rejected", detail: (err as Error).message }, 422);
 				}
 			});
 		}
 
-		/* -- POST /contender — PROVISIONAL contender record ingestion ----- */
+		/* -- POST /contender — create-only contender record --------------- */
 		if (request.method === "POST" && path === "/contender") {
 			const parsed = await readJsonBody(request);
 			if (!parsed.ok) return parsed.response;
@@ -249,12 +319,15 @@ export class TaskAuthority {
 			if (!contender || typeof contender.contender_id !== "string") {
 				return json({ error: "invalid_contender" }, 400);
 			}
+			const ctx = await productionCtx(this.doEnv as Parameters<typeof productionCtx>[0]);
 			return this.doState.storage.transaction(async () => {
 				const state = await this.loadState();
 				if (state === null) return json({ error: "not_initialized" }, 404);
-				state.contenders[contender.contender_id] = contender;
-				await this.doState.storage.put(STATE_KEY, state);
-				return json({ recorded: true, contender_id: contender.contender_id });
+				// An existing record comes back unchanged (recorded: false);
+				// it is never overwritten.
+				const r = await registerContender(state, contender, ctx);
+				if (r.created) await this.doState.storage.put(STATE_KEY, r.state);
+				return json({ recorded: r.created, contender: r.record });
 			});
 		}
 
@@ -266,23 +339,40 @@ export class TaskAuthority {
 			if (!body.bundle || typeof body.bundle.candidate_sha !== "string") {
 				return json({ error: "invalid_bundle" }, 400);
 			}
-			// Caller identity is enforced INSIDE the authority (the zone
-			// check in submitEvaluation is what actually decides). Transport-
-			// level authentication of this claim is NOT yet verified here —
-			// TODO: bind to mTLS / service-token auth at the edge before
-			// production. Until then, an unauthenticated local caller defaults
-			// to "unknown", which submitEvaluation rejects (fail closed).
+			// The Worker's handleEvidence authenticates the evaluation domain
+			// (Bearer EVALUATION_SERVICE_TOKEN; a shared secret, not mTLS) and
+			// sets `caller` itself; only the Worker holds this object's binding.
+			// The zone check in submitEvaluation still decides, so a caller
+			// that names no zone is "unknown" and is refused (fail closed).
 			const caller: CallerIdentity = body.caller ?? { zone: "unknown" };
-			const ctx = await productionCtx();
+			const ctx = await productionCtx(this.doEnv as Parameters<typeof productionCtx>[0]);
 			return this.doState.storage.transaction(async () => {
 				const state = await this.loadState();
 				if (state === null) return json({ error: "not_initialized" }, 404);
 				try {
-					const { state: next, outcome } = await submitEvaluation(state, body.bundle!, caller, ctx);
+					const { state: next, outcome, effects } = await submitEvaluation(state, body.bundle!, caller, ctx);
 					if (outcome === "ACK_DUP")
 						return json({ recorded: true, candidate_sha: body.bundle!.candidate_sha, outcome: "ACK_DUP" });
 					await this.doState.storage.put(STATE_KEY, next);
-					return json({ recorded: true, candidate_sha: body.bundle!.candidate_sha });
+					if (outcome === "REPLACEMENT_REJECTED") {
+						// Persisted: the ledger records the attempt; the labeled evidence stands.
+						return json(
+							{
+								error: "evidence_replacement_rejected",
+								candidate_sha: body.bundle!.candidate_sha,
+								recorded_bundle_hash: next.evaluations[body.bundle!.candidate_sha].bundle_hash,
+							},
+							409,
+						);
+					}
+					// A tamper quarantine's effects (token revocation, ...) are
+					// RETURNED for the Worker to execute, as /event's are.
+					return json({
+						recorded: true,
+						candidate_sha: body.bundle!.candidate_sha,
+						quarantined: effects.length > 0,
+						effects,
+					});
 				} catch (err) {
 					return json({ error: "evidence_rejected", detail: (err as Error).message }, 422);
 				}
@@ -298,7 +388,7 @@ export class TaskAuthority {
 			if (!Array.isArray(candidate_shas) || !candidate_shas.every((x) => typeof x === "string")) {
 				return json({ error: "invalid_candidate_shas" }, 400);
 			}
-			const ctx = await productionCtx();
+			const ctx = await productionCtx(this.doEnv as Parameters<typeof productionCtx>[0]);
 			return this.doState.storage.transaction(async () => {
 				const state = await this.loadState();
 				if (state === null) return json({ error: "not_initialized" }, 404);
@@ -320,7 +410,7 @@ export class TaskAuthority {
 			if (!parsed.ok) return parsed.response;
 			const commitment = (parsed.body as { commitment?: VerifierCommitment }).commitment;
 			if (!commitment || typeof commitment.verifier_id !== "string") return json({ error: "invalid_commitment" }, 400);
-			const ctx = await productionCtx();
+			const ctx = await productionCtx(this.doEnv as Parameters<typeof productionCtx>[0]);
 			return this.doState.storage.transaction(async () => {
 				const state = await this.loadState();
 				if (state === null) return json({ error: "not_initialized" }, 404);
@@ -340,7 +430,7 @@ export class TaskAuthority {
 			if (!parsed.ok) return parsed.response;
 			const body = parsed.body as { verifier_id?: string; report?: ReferenceReport; nonce?: string };
 			if (!body.verifier_id || !body.report || typeof body.nonce !== "string") return json({ error: "invalid_reveal" }, 400);
-			const ctx = await productionCtx();
+			const ctx = await productionCtx(this.doEnv as Parameters<typeof productionCtx>[0]);
 			return this.doState.storage.transaction(async () => {
 				const state = await this.loadState();
 				if (state === null) return json({ error: "not_initialized" }, 404);
@@ -356,7 +446,7 @@ export class TaskAuthority {
 			if (!parsed.ok) return parsed.response;
 			const report = (parsed.body as { report?: VerdictReport }).report;
 			if (!report || typeof report.verifier_id !== "string") return json({ error: "invalid_verifier_report" }, 400);
-			const ctx = await productionCtx();
+			const ctx = await productionCtx(this.doEnv as Parameters<typeof productionCtx>[0]);
 			return this.doState.storage.transaction(async () => {
 				const state = await this.loadState();
 				if (state === null) return json({ error: "not_initialized" }, 404);
@@ -376,7 +466,7 @@ export class TaskAuthority {
 			if (!parsed.ok) return parsed.response;
 			const candidates = (parsed.body as { candidates?: unknown }).candidates;
 			if (!Array.isArray(candidates)) return json({ error: "invalid_candidates" }, 400);
-			const ctx = await productionCtx();
+			const ctx = await productionCtx(this.doEnv as Parameters<typeof productionCtx>[0]);
 			return this.doState.storage.transaction(async () => {
 				const state = await this.loadState();
 				if (state === null) return json({ error: "not_initialized" }, 404);
@@ -396,35 +486,236 @@ export class TaskAuthority {
 			if (!parsed.ok) return parsed.response;
 			const body = parsed.body as { winner_sha?: string; destination_repo?: string; destination_head?: string };
 			if (!body.winner_sha || !body.destination_repo || !body.destination_head) return json({ error: "invalid_permit_request" }, 400);
-			const ctx = await productionCtx();
+			const ctx = await productionCtx(this.doEnv as Parameters<typeof productionCtx>[0]);
 			return this.doState.storage.transaction(async () => {
 				const state = await this.loadState();
 				if (state === null) return json({ error: "not_initialized" }, 404);
 				try {
 					const r = await issuePermit(state, body.winner_sha!, body.destination_repo!, body.destination_head!, ctx);
-					await this.doState.storage.put(STATE_KEY, r.state);
-					return json({ permit: r.permit });
+					if (r.state !== state) await this.doState.storage.put(STATE_KEY, r.state);
+					if (r.outcome === "REBASE_REQUIRED") {
+						// The refusal is ledgered (persisted above); no permit exists.
+						return json(
+							{
+								outcome: "REBASE_REQUIRED",
+								winner_sha: body.winner_sha,
+								contender_id: r.contender_id,
+								destination_head: body.destination_head,
+								bases: r.bases,
+							},
+							409,
+						);
+					}
+					if (r.outcome !== "ISSUED") {
+						return json(
+							{
+								outcome: r.outcome,
+								winner_sha: body.winner_sha,
+								contender_id: r.contender_id,
+							},
+							409,
+						);
+					}
+					return json({ outcome: "ISSUED", permit: r.permit });
 				} catch (err) {
 					return json({ error: "permit_rejected", detail: (err as Error).message }, 422);
 				}
 			});
 		}
 
-		/* -- POST /promotion/finalize — consume only after canonical write --- */
-		if (request.method === "POST" && path === "/promotion/finalize") {
+		/* -- POST /composition — fork-crew COMPOSED / CONFLICTED / RESOLVED -- */
+		if (request.method === "POST" && path === "/composition") {
 			const parsed = await readJsonBody(request);
 			if (!parsed.ok) return parsed.response;
-			const body = parsed.body as { permit_id?: string; verified_parent?: string; tree_sha256?: string };
-			if (!body.permit_id || !body.verified_parent || !body.tree_sha256) return json({ error: "invalid_promotion_finalize" }, 400);
-			const ctx = await productionCtx();
+			const composition = (parsed.body as { composition?: CompositionRecord }).composition;
+			if (!composition || typeof composition !== "object") return json({ error: "invalid_composition" }, 400);
+			const ctx = await productionCtx(this.doEnv as Parameters<typeof productionCtx>[0]);
 			return this.doState.storage.transaction(async () => {
 				const state = await this.loadState();
 				if (state === null) return json({ error: "not_initialized" }, 404);
-				const r = await attemptPromotion(state, body.permit_id!, body.verified_parent!, body.tree_sha256!, ctx);
-				if (r.state !== state) await this.doState.storage.put(STATE_KEY, r.state);
-				const status = r.outcome === "PROMOTED" || r.outcome === "ALREADY_CONSUMED" ? 200 : 409;
-				return json({ outcome: r.outcome, effects: r.effects }, status);
+				try {
+					const next = await recordComposition(state, composition, ctx);
+					if (next !== state) await this.doState.storage.put(STATE_KEY, next);
+					return json({ recorded: true, status: next.composition?.status ?? composition.status });
+				} catch (err) {
+					return json({ error: "composition_rejected", detail: (err as Error).message }, 422);
+				}
 			});
+		}
+
+		/* -- POST /rebase — the rebase container's report -------------------- */
+		// specs/amendments/rebase-ancestry-v1.md: REBASED / UP_TO_DATE record
+		// that `onto` is an ancestor of the (new) candidate; CONFLICT escalates
+		// the task with the conflicting paths as data.
+		if (request.method === "POST" && path === "/rebase") {
+			const parsed = await readJsonBody(request);
+			if (!parsed.ok) return parsed.response;
+			const report = (parsed.body as { report?: RebaseReport }).report;
+			if (!report || typeof report !== "object") return json({ error: "invalid_rebase_report" }, 400);
+			const ctx = await productionCtx(this.doEnv as Parameters<typeof productionCtx>[0]);
+			return this.doState.storage.transaction(async () => {
+				const state = await this.loadState();
+				if (state === null) return json({ error: "not_initialized" }, 404);
+				try {
+					const r = await recordRebase(state, report, ctx);
+					if (r.state !== state) await this.doState.storage.put(STATE_KEY, r.state);
+					return json({
+						outcome: r.outcome,
+						contender: r.state.contenders[report.contender_id],
+						task_status: r.state.task_status,
+						effects: r.effects,
+					});
+				} catch (err) {
+					return json({ error: "rebase_report_rejected", detail: (err as Error).message }, 422);
+				}
+			});
+		}
+
+		/* -- POST /promotion/begin — reserve the canonical write ----------- */
+		// The reservation is the linearization point. Tokens and the container
+		// run only after this returns RESERVED.
+		if (request.method === "POST" && path === "/promotion/begin") {
+			const parsed = await readJsonBody(request);
+			if (!parsed.ok) return parsed.response;
+			const permit_id = (parsed.body as { permit_id?: unknown }).permit_id;
+			if (typeof permit_id !== "string" || permit_id === "") return json({ error: "invalid_promotion_begin" }, 400);
+			const ctx = await productionCtx(this.doEnv as Parameters<typeof productionCtx>[0]);
+			return this.doState.storage.transaction(async () => {
+				const state = await this.loadState();
+				if (state === null) return json({ error: "not_initialized" }, 404);
+				const permit = Object.hasOwn(state.permits, permit_id) ? state.permits[permit_id] : undefined;
+				const r = await beginPromotion(
+					state,
+					permit_id,
+					permit?.expected_destination_head ?? "",
+					permit?.winning_tree_sha256 ?? "",
+					ctx,
+				);
+				if (r.state !== state) await this.doState.storage.put(STATE_KEY, r.state);
+				if (r.outcome === "RESERVED") return json({ outcome: "RESERVED", reservation: r.reservation });
+				if (r.outcome === "ALREADY_CONSUMED") return json({ outcome: "ALREADY_CONSUMED", permit_id });
+				if (r.outcome === "UNKNOWN_PERMIT") return json({ outcome: "UNKNOWN_PERMIT", permit_id }, 404);
+				if (r.outcome === "PERMIT_ID_INVALID") return json({ error: "permit_id_invalid", permit_id }, 409);
+				if (r.outcome === "WINNER_CONTENDER_NOT_FOUND") {
+					return json({ error: "winner_contender_not_found", permit_id }, 409);
+				}
+				return json({ outcome: r.outcome, permit_id }, 409);
+			});
+		}
+
+		/* -- POST /promotion/abort — proven no-write terminal outcome ------ */
+		// Marks the IN_FLIGHT reservation ABORTED. Does not consume the permit
+		// and does not authorize a canonical write.
+		if (request.method === "POST" && path === "/promotion/abort") {
+			const parsed = await readJsonBody(request);
+			if (!parsed.ok) return parsed.response;
+			const body = parsed.body as {
+				permit_id?: unknown;
+				promotion_nonce?: unknown;
+				terminal_outcome?: unknown;
+			};
+			if (typeof body.permit_id !== "string" || body.permit_id === "" || typeof body.promotion_nonce !== "string" || body.promotion_nonce === "") {
+				return json({ error: "invalid_promotion_abort" }, 400);
+			}
+			const ctx = await productionCtx(this.doEnv as Parameters<typeof productionCtx>[0]);
+			return this.doState.storage.transaction(async () => {
+				const state = await this.loadState();
+				if (state === null) return json({ error: "not_initialized" }, 404);
+				const r = await abortReservedPromotion(state, body.permit_id as string, body.promotion_nonce as string, body.terminal_outcome, ctx);
+				if (r.state !== state) await this.doState.storage.put(STATE_KEY, r.state);
+				if (r.outcome === "ABORTED" || r.outcome === "ALREADY_ABORTED") {
+					return json({ outcome: r.outcome, permit_id: body.permit_id });
+				}
+				if (r.outcome === "UNKNOWN_PERMIT") return json({ outcome: r.outcome, permit_id: body.permit_id }, 404);
+				return json({ outcome: r.outcome, permit_id: body.permit_id }, 409);
+			});
+		}
+
+		/* -- POST /promotion/finalize — consume + sign the ship record ------ */
+		// Finalizes the reservation beginPromotion already took. A later
+		// quarantine is not applied to that reserved write.
+		if (request.method === "POST" && path === "/promotion/finalize") {
+			const parsed = await readJsonBody(request);
+			if (!parsed.ok) return parsed.response;
+			const body = parsed.body as {
+				permit_id?: string;
+				verified_base?: string;
+				tree_sha256?: string;
+				promoted_sha?: string;
+				promoted_parent?: string;
+				promotion_nonce?: string;
+			};
+			// verified_base: the permit-bound head promote.sh fast-forwarded from;
+			// promoted_parent: the promoted commit's own parent as git reported it
+			// ("" for a root commit). promotion_nonce: the reservation fence.
+			if (
+				!body.permit_id ||
+				!body.verified_base ||
+				!body.tree_sha256 ||
+				!body.promoted_sha ||
+				typeof body.promoted_parent !== "string" ||
+				typeof body.promotion_nonce !== "string" ||
+				body.promotion_nonce === ""
+			) {
+				return json({ error: "invalid_promotion_finalize" }, 400);
+			}
+			// Without the signing key no ship record can be recorded, so nothing
+			// is consumed; the caller retries once the secret is configured.
+			let signer: AuthoritySigner;
+			try {
+				signer = await loadAuthoritySigner(this.doEnv["AUTHORITY_SIGNING_KEY"]);
+			} catch (err) {
+				return json({ error: "authority_signing_key_unavailable", detail: (err as Error).message }, 503);
+			}
+			const ctx = await productionCtx(this.doEnv as Parameters<typeof productionCtx>[0]);
+			return this.doState.storage.transaction(async () => {
+				const state = await this.loadState();
+				if (state === null) return json({ error: "not_initialized" }, 404);
+				const r = await finalizeReservedPromotion(
+					state,
+					body.permit_id!,
+					{
+						promoted_sha: body.promoted_sha!,
+						tree_sha256: body.tree_sha256!,
+						verified_base: body.verified_base!,
+						promotion_nonce: body.promotion_nonce!,
+					},
+					ctx,
+				);
+				if (r.outcome !== "PROMOTED" && r.outcome !== "ALREADY_CONSUMED") {
+					if (r.state !== state) await this.doState.storage.put(STATE_KEY, r.state);
+					return json({ outcome: r.outcome, effects: r.effects }, 409);
+				}
+				// A finalize retry returns the bundle signed the first time.
+				const stored = r.state.promotion_bundles?.[body.permit_id!];
+				if (stored) return json({ outcome: r.outcome, effects: r.effects, bundle: stored });
+				try {
+					const recorded = await recordPromotionBundle(
+						r.state,
+						body.permit_id!,
+						{ commit: body.promoted_sha!, parent: body.promoted_parent! },
+						signer,
+						ctx,
+					);
+					await this.doState.storage.put(STATE_KEY, recorded.state);
+					return json({ outcome: r.outcome, effects: r.effects, bundle: recorded.bundle });
+				} catch (err) {
+					// Nothing was stored: the permit stays unconsumed.
+					return json({ error: "promotion_bundle_failed", detail: (err as Error).message }, 500);
+				}
+			});
+		}
+
+		/* ---------------- GET /bundle — authority-signed ship record ------- */
+		if (request.method === "GET" && path === "/bundle") {
+			const state = await this.loadState();
+			if (state === null) return json({ error: "not_initialized" }, 404);
+			const bundles = state.promotion_bundles ?? {};
+			const permitId = url.searchParams.get("permit_id");
+			// Default: the task's most recent promotion.
+			const bundle = permitId === null ? Object.values(bundles).at(-1) : bundles[permitId];
+			if (!bundle) return json({ error: "bundle_not_found", permit_id: permitId }, 404);
+			return json(bundle);
 		}
 
 		/* ---------------- GET /state — debug/introspection ---------------- */

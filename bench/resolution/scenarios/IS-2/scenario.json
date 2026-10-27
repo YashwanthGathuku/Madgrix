@@ -1,0 +1,27 @@
+{
+  "id": "IS-2",
+  "kind": "textual",
+  "package": "indent-string",
+  "title": "Two agents rewrite the same count validation with different policies",
+  "agents": [
+    {
+      "id": "a-integer",
+      "intent": "Reject a count that is not an integer with a RangeError.",
+      "files": [
+        "index.d.ts",
+        "index.js"
+      ]
+    },
+    {
+      "id": "b-clamp",
+      "intent": "Treat a negative count as 0 instead of throwing.",
+      "files": [
+        "CHANGELOG.md",
+        "index.js"
+      ]
+    }
+  ],
+  "reference": [
+    "index.js"
+  ]
+}

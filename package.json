@@ -7,21 +7,30 @@
     "typescript": "^7.0.2",
     "vite": "^8.3.0"
   },
-  "license": "MIT",
+  "license": "Apache-2.0",
   "name": "madgrix",
   "private": true,
   "scripts": {
     "build": "cf build",
     "dev": "cf dev",
-    "typecheck": "tsc --noEmit",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.node.json",
     "slice": "node src/harness/slice.ts",
     "headmove": "node src/harness/head-move.ts",
     "verify": "node src/cli/verify.ts",
     "bench": "node src/lib/benchmark.ts",
+    "attack:lab": "node scripts/attack-lab.ts",
+    "fleet:10k": "node scripts/scale-10k.ts",
+    "fleet:waves": "node scripts/run-fleet-waves.mjs",
     "test": "node --test \"test/**/*.test.ts\"",
     "contenders": "node scripts/run-contenders.mjs",
+    "fork-crew": "node scripts/run-fork-crew.mjs",
     "evaluate": "node scripts/evaluate-candidate.ts",
-    "live:e2e": "node scripts/live-e2e.ts"
+    "live:e2e": "node scripts/live-e2e.ts",
+    "demo:memory": "node scripts/demo-memory.ts",
+    "bench:memory": "node scripts/bench-memory.ts",
+    "demo:resolution": "node scripts/demo-resolution.ts",
+    "prune:runs": "node scripts/prune-madgrix-runs.mjs",
+    "bench:resolution": "node scripts/bench-resolution.mjs"
   },
   "type": "module",
   "version": "0.1.0"

@@ -3,3 +3,6 @@ node_modules/
 .DS_Store
 
 .slice-output/
+keys/*.pem
+keys/*private*
+.madgrix-demo/

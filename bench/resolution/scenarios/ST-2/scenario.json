@@ -1,0 +1,27 @@
+{
+  "id": "ST-2",
+  "kind": "list",
+  "package": "decamelize",
+  "title": "Two new options meet only in the option list",
+  "agents": [
+    {
+      "id": "a-limit",
+      "intent": "Add a maxLength option that truncates the result.",
+      "files": [
+        "index.d.ts",
+        "index.js"
+      ]
+    },
+    {
+      "id": "b-trim",
+      "intent": "Add a trim option that removes surrounding whitespace from the input first.",
+      "files": [
+        "CHANGELOG.md",
+        "index.js"
+      ]
+    }
+  ],
+  "reference": [
+    "index.js"
+  ]
+}

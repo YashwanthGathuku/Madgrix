@@ -20,7 +20,7 @@ import type {
 
 /** Claim fields the contender supplies; work_id/status/version are
  *  assigned by the task authority (see task-state.ts registerClaim). */
-export type ClaimInput = Omit<WorkClaim, "work_id" | "status" | "version">;
+export type ClaimInput = Omit<WorkClaim, "work_id" | "status" | "version" | "agent_secret_sha256">;
 
 export type ClaimValidation =
 	| { ok: true }
@@ -48,6 +48,12 @@ export function validateClaim(input: ClaimInput): ClaimValidation {
 	if (!input.scope.paths.every((p) => typeof p === "string" && p.length > 0)) {
 		return { ok: false, error: "scope.paths must be non-empty strings" };
 	}
+	if (input.scope.paths.some(isUnboundedGlob)) {
+		return {
+			ok: false,
+			error: 'unbounded scope.paths ("**" matches every path) — unbounded claims are inadmissible (spec 2 §2, §7)',
+		};
+	}
 	if (!input.contracts || !Array.isArray(input.contracts.reads) || !Array.isArray(input.contracts.modifies)) {
 		return { ok: false, error: "contracts.reads and contracts.modifies must be arrays" };
 	}
@@ -57,6 +63,14 @@ export function validateClaim(input: ClaimInput): ClaimValidation {
 /* ------------------------------------------------------------------ */
 /* Glob matching (L0). Supports `**` suffix and exact match.           */
 /* ------------------------------------------------------------------ */
+
+/**
+ * Does `glob` match every path under globMatchesPath? Such a scope bounds
+ * nothing (spec 2 §2: unbounded claims are not admissible).
+ */
+export function isUnboundedGlob(glob: string): boolean {
+	return glob === "**";
+}
 
 /** Does a repo-relative path fall inside a claim's scope glob? */
 export function globMatchesPath(glob: string, path: string): boolean {

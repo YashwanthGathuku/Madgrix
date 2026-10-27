@@ -1,0 +1,27 @@
+{
+  "id": "DC-2",
+  "kind": "textual",
+  "package": "decamelize",
+  "title": "Two new options change the option list and every return",
+  "agents": [
+    {
+      "id": "a-prefix",
+      "intent": "Add a prefix option that is prepended to the result.",
+      "files": [
+        "index.d.ts",
+        "index.js"
+      ]
+    },
+    {
+      "id": "b-suffix",
+      "intent": "Add a suffix option that is appended to the result.",
+      "files": [
+        "CHANGELOG.md",
+        "index.js"
+      ]
+    }
+  ],
+  "reference": [
+    "index.js"
+  ]
+}

@@ -1,0 +1,79 @@
+[
+  {
+    "n": 10,
+    "mode": "live",
+    "granted": 10,
+    "errors": 0,
+    "error_rate": 0,
+    "rate_limited": 0,
+    "p50_ms": 163.05206599999997,
+    "p95_ms": 180.12192299999992,
+    "error_samples": [],
+    "task_id": "task_251258982a2e50daf4f22200",
+    "create_task_ms": 1569,
+    "wall_ms": 184,
+    "claims_per_s": 54.3,
+    "seeded_overlaps": 0,
+    "overlaps_flagged": 0,
+    "false_overlap_flags": 0,
+    "ledger": {
+      "ok": true,
+      "chain_ok": true,
+      "entries": 14,
+      "claim_entries": 10
+    },
+    "forks_created": 0
+  },
+  {
+    "n": 100,
+    "mode": "live",
+    "granted": 100,
+    "errors": 0,
+    "error_rate": 0,
+    "rate_limited": 0,
+    "p50_ms": 388.126718,
+    "p95_ms": 1128.677757,
+    "error_samples": [],
+    "task_id": "task_a9f860eb7b774d80b752c8ee",
+    "create_task_ms": 490,
+    "wall_ms": 3395,
+    "claims_per_s": 29.5,
+    "seeded_overlaps": 4,
+    "overlaps_flagged": 4,
+    "false_overlap_flags": 0,
+    "ledger": {
+      "ok": true,
+      "chain_ok": true,
+      "entries": 104,
+      "claim_entries": 100
+    },
+    "forks_created": 0
+  },
+  {
+    "n": 200,
+    "mode": "live",
+    "granted": 192,
+    "errors": 8,
+    "error_rate": 0.04,
+    "rate_limited": 0,
+    "p50_ms": 1024.726756,
+    "p95_ms": 4287.417456000001,
+    "error_samples": [
+      "422:claim_rejected"
+    ],
+    "task_id": "task_d7da85a3245cffb5be94d7d9",
+    "create_task_ms": 435,
+    "wall_ms": 12432,
+    "claims_per_s": 16.1,
+    "seeded_overlaps": 9,
+    "overlaps_flagged": 1,
+    "false_overlap_flags": 0,
+    "ledger": {
+      "ok": true,
+      "chain_ok": true,
+      "entries": 196,
+      "claim_entries": 192
+    },
+    "forks_created": 0
+  }
+]

@@ -1,0 +1,24 @@
+{
+  "id": "SEM-1",
+  "kind": "semantic",
+  "package": "indent-string",
+  "title": "One agent changes the default count; another adds a helper that relies on the old default",
+  "agents": [
+    {
+      "id": "a-default",
+      "intent": "Indent by two by default.",
+      "files": [
+        "index.d.ts",
+        "index.js"
+      ]
+    },
+    {
+      "id": "b-once",
+      "intent": "Add indentOnce(string, options) in once.js, which indents every line exactly once.",
+      "files": [
+        "once.js"
+      ]
+    }
+  ],
+  "reference": []
+}

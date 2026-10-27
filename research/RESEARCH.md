@@ -1,7 +1,7 @@
 # RESEARCH.md — Cloudflare "Build the Next Git Platform" competition
 
 **Researched:** 2026-10-01 (competition announced 2026-10-01; deadline Oct 14, 2026)
-**Status:** research only — NO build work has started (user directive 2026-10-01)
+**Status:** research written 2026-10-01, before any implementation, and not updated since. The implementation has since diverged from parts of it: README.md says what is built and validated, and `specs/amendments/` records each change to the frozen specs.
 **Method:** 5 parallel research subagents + my own primary-source verification of the four Sept 2026 preprints cited in the blueprint. All URLs below were returned verbatim by the browser tools; where a claim rests on secondary synthesis rather than primary text, it is flagged.
 
 ---

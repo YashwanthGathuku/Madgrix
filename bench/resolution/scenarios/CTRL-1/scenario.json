@@ -1,0 +1,23 @@
+{
+  "id": "CTRL-1",
+  "kind": "control",
+  "package": "indent-string",
+  "title": "One agent documents the count; another adds a helper that passes its count explicitly",
+  "agents": [
+    {
+      "id": "a-docs",
+      "intent": "Name the received value in the negative-count RangeError.",
+      "files": [
+        "index.js"
+      ]
+    },
+    {
+      "id": "b-once",
+      "intent": "Add indentOnce(string, options) in once.js, which indents every line exactly once.",
+      "files": [
+        "once.js"
+      ]
+    }
+  ],
+  "reference": []
+}

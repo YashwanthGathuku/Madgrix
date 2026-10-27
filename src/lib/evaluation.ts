@@ -15,6 +15,7 @@
 
 import { canonicalJson } from "./canonical.ts";
 import { globMatchesPath } from "./claims.ts";
+import { completeMergeArtifactScan, unresolvedMergeArtifacts } from "./merge-artifacts.ts";
 import type {
 	AdmissionGates,
 	EvaluationBundle,
@@ -172,6 +173,12 @@ export async function evaluateCandidate(input: EvaluateCandidateInput): Promise<
 		findings: [...securityFindings, ...policy.findings],
 	};
 
+	const unresolved_merge_artifacts = unresolvedMergeArtifacts({
+		blobs: Object.entries(tree).map(([path, text]) => ({
+			path,
+			bytes: new TextEncoder().encode(text),
+		})),
+	});
 	const bundleWithoutHash = {
 		candidate_sha: input.candidateSha,
 		tree_sha256: input.treeSha256,
@@ -185,6 +192,12 @@ export async function evaluateCandidate(input: EvaluateCandidateInput): Promise<
 		security_policy,
 		evaluated_at: input.evaluatedAt ?? new Date().toISOString(),
 		tainted: false,
+		merge_artifact_scan: completeMergeArtifactScan({
+			candidate_sha: input.candidateSha,
+			tree_sha256: input.treeSha256,
+			paths: unresolved_merge_artifacts,
+		}),
+		unresolved_merge_artifacts,
 	};
 	const bundle_hash = await input.sha256Hex(canonicalJson(bundleWithoutHash));
 	return { ...bundleWithoutHash, bundle_hash };
