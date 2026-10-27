@@ -47,6 +47,8 @@ function validate(t, a) {
   const bad = (m) => { throw Object.assign(new Error(m), { code: -32602 }); };
   if (typeof a !== 'object' || a === null || Array.isArray(a)) bad('arguments must be an object');
   for (const k of Object.keys(a)) if (!(k in t.inputSchema.properties)) bad(`unknown argument ${k}`);
+  const strs = Object.values(a).flatMap((v) => (Array.isArray(v) ? v : [v])).filter((v) => typeof v === 'string');
+  if (strs.some((v) => /[\x00-\x08\x0a-\x1f\x7f]/.test(v))) bad('arguments must not contain NUL, newlines or other control characters');
   for (const k of t.inputSchema.required || []) if (a[k] === undefined) bad(`missing ${k}`);
   if (a.agent !== undefined && !/^[A-Za-z0-9._-]{1,64}$/.test(a.agent)) bad('agent must match [A-Za-z0-9._-]{1,64}');
   if (a.repo !== undefined && (typeof a.repo !== 'string' || !a.repo || a.repo.startsWith('-'))) bad('repo must be a path');
@@ -98,6 +100,10 @@ export async function callTool(name, args = {}, { cwd = process.env.G4A_MCP_REPO
   return { content: [{ type: 'text', text }], ...(json ? { structuredContent: json } : {}), isError: r.code !== 0 || json?.ok === false };
 }
 
+// Only our own validation errors (code -32602) reach the client verbatim; Node internals
+// (ERR_INVALID_ARG_VALUE, spawn errors, stack-ish text) become a generic message.
+export function publicError(e) { return e && e.code === -32602 && typeof e.message === 'string' ? e.message : 'internal error (see the g4a MCP server log)'; }
+
 export function serve(input = process.stdin, output = process.stdout) {
   const send = (m) => output.write(JSON.stringify(m) + '\n');
   const rl = readline.createInterface({ input });
@@ -120,7 +126,7 @@ export function serve(input = process.stdin, output = process.stdout) {
         const onProgress = tok === undefined ? undefined : (ms, message) => send({ jsonrpc: '2.0', method: 'notifications/progress', params: { progressToken: tok, progress: Math.round(ms / 1000), message } });
         inflight.set(m.id, ac);
         const p = callTool(m.params?.name, m.params?.arguments ?? {}, { signal: ac.signal, onProgress })
-          .then(reply, (e) => { if (!e.cancelled) fail(e.code ?? -32603, e.message); }); // cancelled requests get no response (MCP spec)
+          .then(reply, (e) => { if (e.cancelled) return; if (e?.code !== -32602) process.stderr.write(`[g4a mcp] ${redact(String(e?.message ?? e))}\n`); fail(e.code === -32602 ? e.code : -32603, publicError(e)); }); // cancelled requests get no response (MCP spec)
         pending.add(p); p.finally(() => { pending.delete(p); inflight.delete(m.id); }); return;
       }
       case 'notifications/cancelled': inflight.get(m.params?.requestId)?.abort(); return;

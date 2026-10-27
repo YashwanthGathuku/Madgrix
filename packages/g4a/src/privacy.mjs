@@ -8,7 +8,7 @@ const R = '[REDACTED]';
 const PATTERNS = [
   [/-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?(-----END [A-Z0-9 ]*PRIVATE KEY-----|$)/g, `-----${R} PRIVATE KEY-----`],
   [/\b([a-z][a-z0-9+.-]*:\/\/)([^\s/@:]+):([^\s/@]+)@/gi, `$1$2:${R}@`],          // scheme://user:pass@
-  [/\b([a-z][a-z0-9+.-]*:\/\/)([^\s/@:]{20,})@/gi, `$1${R}@`],                      // scheme://token@
+  [/\b([a-z][a-z0-9+.-]*:\/\/)(?!git@)([^\s/@:]+)@/gi, `$1${R}@`],                 // scheme://token@ (any length; plain ssh://git@ kept)
   [/\b(authorization|proxy-authorization|x-api-key|api-key|private-token|x-auth-token|cookie)(\s*[:=]\s*)(?:(bearer|basic|token)\s+)?([^\s'",;]+)/gi, (m, h, s, k) => `${h}${s}${k ? `${k} ` : ''}${R}`],
   [/\b(bearer|basic)\s+[A-Za-z0-9._~+/=-]{12,}/gi, `$1 ${R}`],
   [/\b(gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|glpat-[A-Za-z0-9_-]{20,}|xox[abprs]-[A-Za-z0-9-]{10,}|sk-(?:proj-|ant-)?[A-Za-z0-9_-]{20,}|AKIA[0-9A-Z]{16}|ASIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{35}|npm_[A-Za-z0-9]{30,}|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,})\b/g, R],
@@ -30,21 +30,38 @@ export function redactDeep(v, env = process.env) {
   return v;
 }
 
-// Minimise git argv for the usage log: drop commit/tag message bodies (keep their length), then
-// redact. G4A_LOG_ARGV=0 stores only the subcommand.
-const MSG_FLAGS = new Set(['-m', '--message', '-F', '--file', '--template', '-c', '--config-env']);
+// Minimise git argv for the usage log: drop commit/tag message bodies and search content (keep
+// their length), then redact. Handles separate (-m X), attached (-mX, --message=X) and combined
+// short-flag (-qm X, -am X, -qmX) forms; -S/-G/--grep values are treated as content too.
+// G4A_LOG_ARGV=0 stores only the subcommand.
+const MSG_LONG = new Set(['--message', '--file', '--template', '--grep']);
+const CFG_FLAGS = new Set(['-c', '--config-env']);
+const hide = (v) => `[${String(v).length} chars]`;
+const cfg = (v, env) => redact(String(v).replace(/^([^=]*(?:extraheader|token|password|cred)[^=]*=).*/is, `$1${R}`), env);
 export function minimiseArgv(argv, env = process.env) {
   if (!Array.isArray(argv)) return argv;
   if (env.G4A_LOG_ARGV === '0') return argv.length ? ['[argv omitted]'] : [];
   const out = [];
   for (let i = 0; i < argv.length; i++) {
     const a = String(argv[i]);
-    const eq = a.match(/^(--message|--file)=(.*)$/s) || a.match(/^(-m)(.+)$/s);
-    if (eq) { out.push(`${eq[1]}${eq[1].startsWith('--') ? '=' : ''}[${eq[2].length} chars]`); continue; }
-    if (MSG_FLAGS.has(a) && i + 1 < argv.length) {
-      const v = String(argv[++i]);
-      out.push(a, a === '-c' || a === '--config-env' ? redact(v.replace(/^([^=]*(?:extraheader|token|password|cred)[^=]*=).*/i, `$1${R}`), env) : `[${v.length} chars]`);
-      continue;
+    const long = a.match(/^(--[a-z-]+)=(.*)$/s);
+    if (long && MSG_LONG.has(long[1])) { out.push(`${long[1]}=${hide(long[2])}`); continue; }
+    if (long && long[1] === '--config-env') { out.push(`--config-env=${cfg(long[2], env)}`); continue; }
+    if (MSG_LONG.has(a)) { if (i + 1 < argv.length) out.push(a, hide(argv[++i])); else out.push(a); continue; }
+    if (CFG_FLAGS.has(a)) { if (i + 1 < argv.length) out.push(a, cfg(argv[++i], env)); else out.push(a); continue; }
+    // short-flag cluster: the first m/F/S/G takes the rest of the token, or the next argument
+    const sc = /^-([a-zA-Z]+)(.*)$/s.exec(a);
+    if (sc && !a.startsWith('--')) {
+      const letters = sc[1] + sc[2];
+      let k = -1;
+      for (let j = 0; j < letters.length && /[a-zA-Z]/.test(letters[j]); j++) if ('mFSG'.includes(letters[j])) { k = j; break; }
+      if (k >= 0) {
+        const flag = letters[k], val = letters.slice(k + 1), head = `-${letters.slice(0, k + 1)}`;
+        if (val) { out.push(`${head}${hide(val)}`); continue; }
+        // -S/-G may be bare (commit -S signs): only consume a following non-option value
+        if (i + 1 < argv.length && ('mF'.includes(flag) || !String(argv[i + 1]).startsWith('-'))) { out.push(head, hide(argv[++i])); continue; }
+        out.push(head); continue;
+      }
     }
     out.push(redact(a, env));
   }
@@ -65,9 +82,13 @@ export function appendPrivate(f, data) {
   const fd = fs.openSync(f, fs.constants.O_WRONLY | fs.constants.O_APPEND | fs.constants.O_CREAT | NOFOLLOW, 0o600);
   try { const st = fs.fstatSync(fd); if (st.mode & 0o077) fs.fchmodSync(fd, 0o600); fs.writeSync(fd, data); } finally { fs.closeSync(fd); }
 }
-export function writePrivate(f, data) {
-  const fd = fs.openSync(f, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_TRUNC | NOFOLLOW, 0o600);
-  try { fs.fchmodSync(fd, 0o600); fs.writeSync(fd, data); } finally { fs.closeSync(fd); }
+export function writePrivate(f, data, mode = 0o600) {
+  const fd = fs.openSync(f, fs.constants.O_WRONLY | fs.constants.O_CREAT | NOFOLLOW, mode);
+  try {
+    const st = fs.fstatSync(fd);
+    if (!st.isFile()) throw new Error(`g4a: ${f} is not a regular file`);
+    if (typeof process.getuid === 'function' && st.uid !== process.getuid()) throw new Error(`g4a: ${f} is owned by uid ${st.uid}, not ${process.getuid()}`);
+    fs.ftruncateSync(fd, 0); fs.fchmodSync(fd, mode); fs.writeSync(fd, data); } finally { fs.closeSync(fd); }
 }
 
 // Retention. log.jsonl rotates at G4A_LOG_MAX_BYTES (default 5 MiB) keeping G4A_LOG_KEEP (default 2)

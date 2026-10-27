@@ -15,6 +15,7 @@ is a symlink or is owned by another uid.
 | Usage log | `G4A_HOME/log.jsonl` (+ `.1`, `.2`) | One line per intercepted git call: event, timestamp, cwd, subcommand, git argv, agent marker, token estimates. Each hook event also adds the session id, tool name and command string. | 0600 | Rotates at `G4A_LOG_MAX_BYTES` (default 5 MiB) and keeps `G4A_LOG_KEEP` old files (default 2). Total cap is about 15 MiB. |
 | Tee files | `G4A_HOME/tee/*.txt` | The full git output behind a compacted summary, kept so the agent can read what was cut. | dir 0700, files 0600 | Pruned on every write to the newest `G4A_TEE_MAX_FILES` (default 200), dropping files older than `G4A_TEE_MAX_AGE_DAYS` (default 7). `G4A_TEE=0` turns tee off. |
 | Agent credentials | `G4A_HOME/credentials/<repo-hash>/<agent>` | Random per-agent authority credential. Not stored when the MCP client or CLI uses session credentials. | dir 0700, file 0600 | Until `g4a purge --credentials`. It is kept across claims, because the agent binding persists. |
+| Promote secrets (detect-only mode) | `G4A_HOME/secrets/<claim-id>` | Random per-claim secret the daemon checks on promote. | dir 0700, file 0600 (`O_NOFOLLOW`) | Kept with the daemon db; removed with `G4A_HOME`. Not touched by `g4a purge`. |
 | Daemon state (detect-only mode) | `G4A_HOME/g4a.db` (+ WAL/SHM), `g4a.sock`, `g4a.pid`, witness key | Claims: agent name, claimed path globs, witness commands, worktree paths, branch names, commit SHAs. Also intents, jobs (result JSON, redacted) and the signed ledger. | 0600 (socket 0600) | Indefinite. This is the audit trail. |
 | Authority root (system or detect-only) | `/var/lib/g4a` or `DIR`: `state/`, `keys/`, `nonces/`, `accepted.jsonl` | Signed ledger, agent-to-uid bindings and credential hashes, accepted-push log (agent, uid, ref, old/new SHA, time), signing keys. | dirs 0700, owned by the authority user | Indefinite. Remove it with `g4a authority uninstall`. |
 
@@ -29,10 +30,12 @@ error messages shown by the CLI, the daemon and the authority, and all MCP tool 
 
 - **Redacted:** GitHub, GitLab, Slack, OpenAI/Anthropic, AWS, Google and npm token shapes; JWTs;
   `Authorization:`, `Bearer` and `Basic` headers; `scheme://user:pass@` and `scheme://token@`
-  URLs; `*_TOKEN=`, `*password=`, `*secret=` and `*api_key=` style assignments; and PEM
+  URLs of any length (also inside `url.<base>.insteadOf` config; a bare `ssh://git@` is kept); `*_TOKEN=`, `*password=`, `*secret=` and `*api_key=` style assignments; and PEM
   private-key blocks.
-- **Minimised git argv:** values given with `-m`, `--message`, `-F` and `--template` are replaced
-  by `[N chars]`. A `-c` value whose key looks like a header, token or credential is redacted.
+- **Minimised git argv:** values given with `-m`, `--message`, `-F`, `--file` and `--template`
+  are replaced by `[N chars]`, in every form: separate (`-m X`), attached (`-mX`,
+  `--message=X`) and combined short flags (`-qm X`, `-am X`, `-qmX`). Search content
+  (`--grep`, `-S`, `-G`) is minimised the same way. A `-c` value whose key looks like a header, token or credential is redacted.
 - **`G4A_LOG_ARGV=0`:** stores no argv and no hook command string at all.
 - **`G4A_REDACT_EMAILS=1`:** also replaces email addresses. This is off by default because git
   identities are often useful in a local log.
@@ -50,7 +53,14 @@ keep secrets out of it, `claim` refuses:
 
 - any witness command that contains something that looks like a secret (pass secrets to
   witnesses through the environment instead);
-- claim or witness paths that are absolute, start with `~`, or contain `..`.
+- witness commands that pass credentials (`-u`/`--user user:pass`, auth-like `-H` headers,
+  `--oauth2-bearer`, `--cookie`);
+- claim or witness paths that are absolute, start with `~`, contain `..`, control characters,
+  newlines or non-ASCII characters, use pathspec magic (a leading `:`), or point into `.git/` or
+  `.g4a/`.
+
+With the default file credential store, `G4A_HOME/credentials/` gives no isolation between agents
+running as the same uid; see SECURITY.md.
 
 ## Deleting data
 

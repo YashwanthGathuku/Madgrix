@@ -322,6 +322,7 @@ const INVENTORY = [
   ['logs', ['log.jsonl', 'log.jsonl.1', 'log.jsonl.2', 'log.jsonl.3'], 'shim/hook usage log: event, ts, cwd, redacted+minimised git argv, agent'],
   ['tee', ['tee'], 'raw git output of compacted commands (redacted), pruned by age/count'],
   ['credentials', ['credentials'], 'per-agent authority credentials (0600)'],
+  ['secrets', ['secrets'], 'detect-only daemon: per-claim promote secrets (dir 0700, files 0600); kept with the db'],
   ['daemon', ['g4a.db', 'g4a.db-wal', 'g4a.db-shm', 'g4a.sock', 'g4a.pid', 'witness-ed25519.pem', 'witness-ed25519.pub.hex'], 'detect-only daemon state: claims, intents, jobs, ledger, witness key'],
 ];
 function duOf(p) { let st; try { st = fs.lstatSync(p); } catch { return null; } if (!st.isDirectory()) return { bytes: st.size, files: 1, mode: (st.mode & 0o777).toString(8) }; let bytes = 0, files = 0; for (const n of fs.readdirSync(p)) { const d = duOf(path.join(p, n)); if (d) { bytes += d.bytes; files += d.files; } } return { bytes, files, mode: (st.mode & 0o777).toString(8) }; }

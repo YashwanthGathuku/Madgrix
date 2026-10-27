@@ -14,19 +14,48 @@ see PRIVACY.md.
   - The daemon socket is created under umask `0177` and then chmodded to `0600`.
   - Existing files with loose modes are tightened on the next write.
 - **Symlink and TOCTOU attacks on g4a-owned paths.**
-  - Log, tee, credential and pid writes use `O_NOFOLLOW`, so a planted symlink at the target
-    fails the write instead of redirecting it.
+  - Log, tee, credential, pid, promote-secret and key-dir writes (witness and operator keys and
+    their `.pub.hex`, anchors, overrides) use `O_NOFOLLOW` plus an owner check, so a planted
+    symlink at the target fails the write instead of redirecting it.
+  - `G4A_KEY_DIR` and its `anchors/` and `overrides/` subdirectories must be real directories
+    owned by the current uid; a symlinked key dir is refused.
   - `G4A_HOME` and its subdirectories must be real directories owned by the current uid.
   - Temp dirs come from `mkdtemp` (`0700`). The system installer's seed bundle is `0600` in a
     `0700` dir, owned only by the authority user, and removed on success, failure, exit or signal.
   - Nonce files are created with `wx`.
 - **Shell injection in generated hooks.** Authority hook wrappers single-quote every path. The
   old double quotes allowed `$()` and backticks to run.
-- **Claim input traversal.** Absolute paths, `~` paths and `..` segments are refused in claim
-  paths and witness paths. Agent names must match `[A-Za-z0-9._-]{1,64}`, which is also what
+- **Claim input traversal and hygiene.** Absolute paths, `~` paths and `..` segments are refused
+  in claim paths and witness paths, as are control characters and newlines, non-ASCII
+  characters (fullwidth dots and other lookalikes), pathspec magic (a leading `:`), a leading
+  `-`, `.` segments, and anything under `.git/` or `.g4a/`. Claim overlap is checked
+  case-insensitively as well, so `A.TXT` collides with `a.txt`. Agent names must match `[A-Za-z0-9._-]{1,64}`, which is also what
   makes `credentials/<hash>/<agent>` safe.
 - **Secrets in the signed ledger.** Witness commands that look like they contain a secret are
-  refused at claim time.
+  refused at claim time, including credentials passed to curl-style tools (`-u`/`--user
+  user:pass`, `-H`/`--header` with an auth-, token-, key-, secret- or cookie-like name,
+  `--oauth2-bearer`, `--cookie`) and `scheme://token@` URLs of any length.
+- **Shim scope enforcement in an agent context** (git reached through `PATH`).
+  - Every git global option is parsed (`-C`, `-c`, `--config-env`, `--git-dir`,
+    `--work-tree`, `--exec-path`, `-p`/`--paginate`, `--no-advice`, the pathspec flags and the
+    rest). An option git itself would reject is blocked: the shim fails closed.
+  - The repo checked is the one git will act on: cumulative `-C`, `--git-dir`/`--work-tree` and
+    `GIT_DIR`/`GIT_WORK_TREE`, so running from outside the worktree with `-C` is still checked.
+  - In a g4a-managed repo, agents may not override `core.hooksPath`, `core.logAllRefUpdates`,
+    `core.fsmonitor`, `core.worktree`, `core.sshCommand`, `alias.*`, `include.*` or
+    `includeIf.*`, whether through `-c`, `--config-env`, `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_n`,
+    `GIT_CONFIG_PARAMETERS`, `GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM`, or `git config` writes.
+    `--exec-path`/`GIT_EXEC_PATH` are refused; so are `--git-dir`/`--work-tree` (and the `GIT_DIR`
+    family) on writes, and `GIT_INDEX_FILE` on commits.
+  - Aliases from git config are resolved and the expanded command is checked. Shell (`!`)
+    aliases run their own `git` calls, which re-enter the shim and are checked there.
+  - Write subcommands include tag, stash, notes, symbolic-ref, replace, commit-tree, worktree,
+    rm, mv, restore, clean, reflog expire/delete, update-index, read-tree and filter-branch, as
+    well as commit, push, merge, rebase, reset, checkout, switch, cherry-pick, am, apply, revert,
+    pull, update-ref and branch. Read forms (`tag -l`, `stash list`, `worktree list`) are not.
+  - The daemon gets the parsed subcommand and arguments; commit pathspecs (`git commit -m x
+    b.txt`), `update-ref --stdin`, `symbolic-ref` onto main and `git replace` are checked too.
+  - An operator-signed `G4A_ENFORCE` override turns these blocks into warnings.
 - **Environment leakage to children.**
   - Witness and resolver (mergiraf) children get a minimal environment (`PATH`, `HOME`) inside a
     sandbox where one is available.
@@ -44,10 +73,24 @@ see PRIVACY.md.
   chain against the pinned key or an external anchor remote. It is not stopped.
 - **Bypassing the git shim.** Agents can call the real git by absolute path. The shim only
   intercepts git through `PATH`. Only system-mode push enforcement stops a bad land.
+- **Disabling the local ref guard.** The reference-transaction hook (`src/refguard.mjs`) only
+  stops git CLI calls that run hooks. The shim refuses `core.hooksPath` overrides for agents, but
+  the real git by absolute path with `-c core.hooksPath=/dev/null`, libgit2/JGit/isomorphic-git,
+  or writing `.git/refs` directly can still move local `main`. `g4a verify` reports it (local main
+  differs from the authority, reflog entries not written by g4a), and system mode refuses the
+  land.
 - **Purging telemetry.** Any process running as your uid can delete or edit `G4A_HOME` logs.
   They are a convenience record, not evidence. The ledger and anchors are the evidence.
 
 ## Known gaps and risks
+
+- **No isolation between same-uid agents with the default file credential store.** The
+  per-agent credential in `G4A_HOME/credentials/<hash>/<agent>` is a `0600` file, and the CLI
+  reads it automatically. Any process running as your uid can therefore release or promote
+  another agent's claim just by naming it. Release and promote do require the credential, but
+  in the file store every same-uid process has it. For real separation, run agents with
+  `G4A_MCP_SESSION_CREDENTIALS=1` (memory-only credentials held by one MCP server) or, better,
+  as separate uids against a system-mode authority.
 
 - Redaction is pattern-based (see PRIVACY.md). Tee files hold raw git output, which can include
   diff content and therefore source code.

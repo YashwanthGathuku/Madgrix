@@ -6,7 +6,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import { ensurePrivateDir, pruneTee, writePrivate, redact } from './privacy.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
-import { classify, parseArgs, altArgs, compactors, appendLog, estTokens, g4aHome, agentMarker, keyDir } from './lib.mjs';
+import { classify, parseArgs, parseGit, configKeys, DANGEROUS_CONFIG, isWrite, WRITE_SUBS, altArgs, compactors, appendLog, estTokens, g4aHome, agentMarker, keyDir } from './lib.mjs';
 import { validOverride } from './override.mjs';
 
 const REAL = process.env.G4A_REAL_GIT;
@@ -26,10 +26,11 @@ if (!REAL || !fs.existsSync(REAL)) { process.stderr.write('g4a: real git not con
 // Not covered here: calling the real git by absolute path, or editing files directly; the
 // Phase 2 authority repo is what closes those for anything that reaches main.
 const marker = agentMarker({ ...process.env, G4A_AGENT: process.env.G4A_AGENT === '0' ? '' : process.env.G4A_AGENT });
-const WRITE_SUBS = new Set(['commit', 'push', 'merge', 'rebase', 'reset', 'checkout', 'switch', 'cherry-pick', 'am', 'apply', 'revert', 'pull', 'update-ref', 'branch']);
 function managedRepo(dir) {
-  if (`${dir}/`.includes('/.g4a/worktrees/')) return true;
-  for (let d = path.resolve(dir); ; d = path.dirname(d)) {
+  let start = path.resolve(dir);
+  try { start = fs.realpathSync(start); } catch {}
+  if (`${start}/`.includes('/.g4a/worktrees/') || `${path.resolve(dir)}/`.includes('/.g4a/worktrees/')) return true;
+  for (let d = start; ; d = path.dirname(d)) {
     if (fs.existsSync(path.join(d, '.g4a', 'worktrees'))) return true;
     if (fs.existsSync(path.join(d, '.git')) || d === path.dirname(d)) return false;
   }
@@ -75,10 +76,60 @@ if (!isAgent) {
   if (r.signal) process.kill(process.pid, r.signal);
   process.exit(r.status ?? 1);
 }
-if (p?.sub && WRITE_SUBS.has(p.sub) && managedRepo(process.cwd())) {
+// ---- agent-context enforcement (F1/F2 of the red-team review) ----
+// Parse every git global option; anything git itself would not accept is blocked (fail closed).
+const block = (why) => {
+  const enforce = !honored.G4A_ENFORCE;
+  appendLog({ ...base, event: 'scope_check', blocked: why, enforce });
+  process.stderr.write(`[g4a] ${enforce ? 'blocked' : 'warning (operator override)'}: ${why}\n`);
+  if (enforce) process.exit(1);
+};
+const pg = parseGit(argv);
+if (!pg) { block('unrecognised git global option in an agent context; g4a fails closed (run the command without it)'); }
+const pgx = pg ?? { C: [], config: [], configEnv: [], gitDir: null, workTree: null, execPath: null, sub: null, rest: [] };
+// The repo git will actually act on: -C (cumulative), --git-dir/--work-tree and GIT_DIR/GIT_WORK_TREE.
+let eff = process.cwd();
+for (const c of pgx.C) if (c !== '') eff = path.resolve(eff, c);
+const gitDir = pgx.gitDir ?? env.GIT_DIR ?? null, workTree = pgx.workTree ?? env.GIT_WORK_TREE ?? null;
+const managed = [eff, gitDir && path.resolve(eff, gitDir), workTree && path.resolve(eff, workTree)].some((d) => d && managedRepo(d));
+let sub = pgx.sub, rest = pgx.rest;
+if (managed) {
+  const keys = configKeys(pgx, env);
+  for (const f of [env.GIT_CONFIG_GLOBAL, env.GIT_CONFIG_SYSTEM, env.GIT_CONFIG].filter((x) => x && x !== '/dev/null')) {
+    const r = spawnSync(REAL, ['config', '--file', f, '--name-only', '--list'], { encoding: 'utf8', env: { PATH: env.PATH, HOME: env.HOME } });
+    if (r.status === 0) keys.push(...r.stdout.split('\n').filter(Boolean).map((k) => k.toLowerCase()));
+  }
+  const bad = keys.filter((k) => DANGEROUS_CONFIG.test(k));
+  if (bad.length) block(`config override ${[...new Set(bad)].join(', ')} is not allowed for agents in a g4a-managed repo (it would disable the ref guard, define an alias or redirect git)`);
+  if ((pgx.execPath !== null && sub) || env.GIT_EXEC_PATH) block('--exec-path / GIT_EXEC_PATH is not allowed for agents in a g4a-managed repo');
+  // aliases: resolve (non-builtin names only; git ignores aliases that shadow builtins)
+  const READS = new Set(['status', 'log', 'diff', 'show', 'fetch', 'ls-files', 'ls-tree', 'ls-remote', 'rev-parse', 'rev-list', 'cat-file', 'blame', 'grep', 'describe', 'shortlog', 'help', 'version', 'config', 'remote', 'for-each-ref', 'show-ref', 'name-rev', 'merge-base', 'hash-object', 'var', 'check-ignore', 'check-attr', 'diff-tree', 'diff-index', 'diff-files', 'count-objects', 'fsck', 'verify-commit', 'verify-tag', 'whatchanged', 'archive', 'bundle', 'format-patch', 'range-diff', 'clone', 'init', 'gc', 'prune', 'repack', 'maintenance', 'pack-refs']);
+  const seen = new Set();
+  while (sub && !WRITE_SUBS.has(sub) && !READS.has(sub)) {
+    if (seen.has(sub) || seen.size > 10) block(`alias loop at ${sub}`);
+    seen.add(sub);
+    const a = spawnSync(REAL, ['config', '--get', `alias.${sub}`], { cwd: fs.existsSync(eff) ? eff : process.cwd(), encoding: 'utf8', env });
+    const val = a.status === 0 ? a.stdout.trim() : '';
+    if (!val) break; // not an alias: a git-<name> extension or an error; nothing to check
+    if (val.startsWith('!')) break; // shell alias: any nested `git` it runs re-enters this shim and is checked there
+    if (/['"\\]/.test(val)) block(`alias ${sub} uses quoting g4a cannot resolve safely; run the underlying git command`);
+    const toks = val.split(/\s+/).filter(Boolean);
+    if (!toks.length || toks[0].startsWith('-')) block(`alias ${sub} starts with a global option; run the underlying git command`);
+    sub = toks[0]; rest = [...toks.slice(1), ...rest];
+  }
+  const write = sub && isWrite(sub, rest);
+  if (write && (gitDir || workTree || env.GIT_COMMON_DIR || env.GIT_OBJECT_DIRECTORY || env.GIT_ALTERNATE_OBJECT_DIRECTORIES)) block('--git-dir/--work-tree (or GIT_DIR/GIT_WORK_TREE/GIT_COMMON_DIR/GIT_OBJECT_DIRECTORY) is not allowed on agent writes in a g4a-managed repo; cd into .g4a/worktrees/<agent> instead');
+  if (sub === 'commit' && env.GIT_INDEX_FILE) block('GIT_INDEX_FILE is not allowed on agent commits in a g4a-managed repo (the scope check reads the real index)');
+  if (sub === 'config') {
+    const pos = rest.filter((x) => !x.startsWith('-'));
+    const writes = rest.some((x) => /^(--add|--replace-all|--unset|--unset-all|--rename-section|--remove-section|-e|--edit)$/.test(x)) || ['set', 'unset', 'rename-section', 'remove-section', 'edit'].includes(pos[0]) || pos.length >= 2;
+    if (writes && (pos.some((k) => DANGEROUS_CONFIG.test(k)) || rest.some((x) => /^(-e|--edit)$/.test(x)) || pos[0] === 'edit')) block('setting core.hooksPath, core.logAllRefUpdates, alias.*, include.* (or editing config) is not allowed for agents in a g4a-managed repo');
+  }
+}
+if (sub && isWrite(sub, rest) && managed) {
   const enforce = !honored.G4A_ENFORCE;
   const { checkWithDaemon } = await import('./check-client.mjs');
-  const r = await checkWithDaemon({ cwd: process.cwd(), argv }, { home: g4aHome(), timeoutMs: Number(process.env.G4A_CHECK_TIMEOUT_MS || 2000) });
+  const r = await checkWithDaemon({ cwd: fs.existsSync(eff) ? eff : process.cwd(), argv, sub, rest }, { home: g4aHome(), timeoutMs: Number(process.env.G4A_CHECK_TIMEOUT_MS || 2000) });
   appendLog({ ...base, event: 'scope_check', warnings: r.warnings ?? [], unavailable: r.unavailable ?? null, enforce });
   if (r.unavailable) {
     if (enforce) { process.stderr.write(`[g4a] blocked: g4a daemon unavailable (${r.unavailable}); agent writes in a g4a-managed repo fail closed. Start it with \`g4a daemon --detach\`.\n`); process.exit(1); }
