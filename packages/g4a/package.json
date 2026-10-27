@@ -1,0 +1,13 @@
+{
+  "name": "g4a",
+  "version": "0.0.1",
+  "private": true,
+  "description": "Phase 0 of the Git4agents local git interception layer: PATH shim, output compaction, measured savings.",
+  "type": "module",
+  "bin": { "g4a": "bin/g4a.mjs" },
+  "scripts": {
+    "test": "node --test test/*.test.mjs",
+    "bench": "node bench/run.mjs"
+  },
+  "license": "MIT"
+}
