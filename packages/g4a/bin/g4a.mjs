@@ -206,7 +206,7 @@ async function verifyCmd(args) {
   const C = await import('../src/authority-client.mjs');
   let bundle;
   if (o._[0]) bundle = JSON.parse(fs.readFileSync(o._[0], 'utf8'));
-  else { const db = A.openDb(home, { readOnly: true }); bundle = A.bundleFromDb(db, A.repoId(o.repo)); db.close(); }
+  else { const db = A.openDb(home, fs.existsSync(path.join(home, 'g4a.db')) ? { readOnly: true } : {}); bundle = A.bundleFromDb(db, A.repoId(o.repo)); db.close(); }
   const loc = o._[0] ? null : C.locate(o.repo);
   const anchors = A.collectAnchors(bundle.repo, A.keyDir(), { remote: o['anchor-remote'] || (loc ? C.clientAnchorRemote(loc) : process.env.G4A_ANCHOR_REMOTE) });
   const { safeGit } = await import('../../../scripts/lib/safe-git.mjs');
@@ -222,6 +222,7 @@ async function verifyCmd(args) {
       const av = await A.verifyBundle(L.bundle, { pinnedPub: apub, anchors: aAnchor ? [{ source: 'authority anchors.git', ...aAnchor }] : [{ source: 'authority anchors.git', missing: true }] });
       if (!av.ok) errors.push(...av.errors.map((e) => `authority: ${e}`));
       if (main !== L.main) errors.push(`local main ${main} differs from authority main ${L.main}`);
+      errors.push(...(await import('../src/refguard.mjs')).refGuardFindings(A.repoTop(o.repo)).map((e) => `out-of-band: ${e}`));
       const amap = new Map(L.bundle.entries.map((e) => [e.seq, e]));
       const aMains = new Set(L.bundle.entries.filter((e) => e.kind === 'promote').map((e) => e.payload.main_after));
       for (const e of bundle.entries.filter((x) => x.kind === 'promote')) {
@@ -284,14 +285,14 @@ async function authorityCmd(args) {
     const top = A.repoTop(o.repo), id = A.repoId(o.repo);
     if (args.includes('--system')) {
       const r = execFileSync('sudo', ['-n', process.execPath, '--no-warnings', path.join(PKG, 'src', 'system-install.mjs'), id, top], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'inherit'] });
-      return out(JSON.parse(r.trim().split('\n').pop()));
+      return out({ ...JSON.parse(r.trim().split('\n').pop()), ref_guard: (await import('../src/refguard.mjs')).installRefGuard(top) });
     }
     const dir = o._[1];
     if (!dir) { console.error('usage: g4a authority init --system [--repo R] | init DIR [--repo R]'); process.exitCode = 2; return; }
     const { initRoot } = await import('../src/authority-service.mjs');
     const r = initRoot({ root: path.resolve(dir), seed: top, clientRepo: id, mode: 'user' });
     safeGit(top, ['config', 'g4a.authority', path.resolve(dir)]);
-    return out({ ...r, note: 'same-user authority: the agent uid can still edit it; violations are DETECTED (audit/verify), not prevented. Use --system to prevent.' });
+    return out({ ...r, ref_guard: (await import('../src/refguard.mjs')).installRefGuard(top), note: 'same-user authority: the agent uid can still edit it; violations are DETECTED (audit/verify), not prevented. Use --system to prevent.' });
   }
   if (sub === 'uninstall' && args.includes('--system')) {
     const flag = args.includes('--purge') ? ['--purge'] : ['--uninstall', o['repo-id'] || A.repoId(o.repo)];

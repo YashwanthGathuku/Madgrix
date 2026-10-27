@@ -104,3 +104,49 @@ test('limit 1: per-agent credential: a same-uid process that only knows the name
     assert.ok(!log.includes(cred) && !log.includes(nc));
   } finally { await stop(d); cleanup(); }
 });
+
+test('limit 3: reference-transaction guard refuses git-CLI main moves (any binary path); hook-skipping writes are detected by verify', async () => {
+  const home = mkHome(); const repo = mkRepo({ 'a.txt': 'a\n' });
+  // pre-existing user hook is chained, not clobbered
+  const hd = path.join(repo, '.git', 'hooks'); fs.mkdirSync(hd, { recursive: true });
+  fs.writeFileSync(path.join(hd, 'reference-transaction'), '#!/bin/sh\ncat >/dev/null\necho "$1" >> "$(dirname "$0")/../user-hook-ran"\n', { mode: 0o755 });
+  const root = withAuthority(home, repo); tmp.push(home, `${home}-keys`, repo, path.dirname(root));
+  assert.ok(fs.existsSync(path.join(hd, 'reference-transaction.g4a-prev')));
+  const d = await startDaemon(home);
+  const verify = () => cli(home, ['verify', '--repo', repo]).json;
+  try {
+    const c = await rpc(home, 'claim', { repo, agent: 'a1', paths: ['a.txt'], witnesses: ['true'] });
+    commitIn(wt(repo, 'a1'), 'a.txt', 'b\n');
+    assert.equal(cli(home, ['promote', '--repo', repo, '--agent', 'a1']).json.status, 'promoted', 'g4a control plane is not blocked by the guard');
+    assert.equal(verify().ok, true, JSON.stringify(verify()));
+    const main = git(repo, 'rev-parse', 'main'); const base = git(repo, 'rev-parse', 'main~1');
+    // git CLI by absolute path, plain env (no shim): prevented
+    const gitBin = execFileSync('sh', ['-c', 'command -v git'], { encoding: 'utf8' }).trim();
+    for (const args of [['update-ref', 'refs/heads/main', base], ['branch', '-f', 'main', base], ['update-ref', 'refs/g4a/ledger-head', base]]) {
+      const r = spawnSync(gitBin, args, { cwd: repo, encoding: 'utf8', env: { ...process.env, ...ID, G4A_RAW: '1' } });
+      assert.notEqual(r.status, 0, args.join(' ')); assert.match(r.stderr, /g4a: refused/);
+    }
+    assert.equal(git(repo, 'rev-parse', 'main'), main);
+    assert.ok(fs.existsSync(path.join(repo, '.git', 'user-hook-ran')), 'chained user hook still runs');
+    // ordinary work on other refs is unaffected
+    git(repo, 'branch', 'feature', base); git(repo, 'branch', '-D', 'feature');
+    // the refusals themselves are reported
+    assert.match(verify().errors.join('\n'), /hook refused an out-of-band ref change/);
+    fs.rmSync(path.join(repo, '.git', 'g4a-ref-events.log'));
+    assert.equal(verify().ok, true);
+    // a hook-skipping write (what libgit2 / isomorphic-git / -c core.hooksPath do): NOT prevented, detected
+    git(repo, '-c', 'core.hooksPath=/dev/null', 'update-ref', '-m', 'sneaky', 'refs/heads/main', base);
+    let v = verify(); assert.equal(v.ok, false);
+    assert.match(v.errors.join('\n'), /local main .* differs from authority main/); assert.match(v.errors.join('\n'), /"sneaky" was not written by g4a/);
+    // restoring main does not hide it: the reflog entry stays
+    git(repo, '-c', 'core.hooksPath=/dev/null', 'update-ref', '-m', 'restore', 'refs/heads/main', main);
+    v = verify(); assert.equal(v.ok, false); assert.match(v.errors.join('\n'), /"sneaky"/);
+    // raw file write, no reflog at all (a library writing .git/refs directly): detected via the authority main
+    git(repo, 'reflog', 'expire', '--expire=now', '--all');
+    fs.writeFileSync(path.join(repo, '.git', 'refs', 'heads', 'main'), base + '\n');
+    v = verify(); assert.equal(v.ok, false); assert.match(v.errors.join('\n'), /differs from authority main/);
+    // and the authority main is untouched throughout
+    assert.equal(cli(home, ['authority', 'status', '--repo', repo]).json.main, main);
+    void c;
+  } finally { await stop(d); cleanup(); }
+});

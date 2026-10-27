@@ -99,10 +99,12 @@ test('items 1,3,6: promote via the authority, overlap review case, verify + audi
     assert.deepEqual(accepted(root).filter((x) => x.kind === 'push').map((x) => x.ref).sort(), ['refs/heads/agents/a1', 'refs/heads/agents/a2', 'refs/heads/agents/a3']);
     // item 6: a local main edit is detected against the authority
     const good = git(repo, 'rev-parse', 'main');
-    git(repo, 'update-ref', 'refs/heads/main', git(repo, 'rev-parse', `${good}~1`));
+    // (the git-CLI path is refused by the ref guard; a hook-skipping write is what remains)
+    assert.throws(() => git(repo, 'update-ref', 'refs/heads/main', git(repo, 'rev-parse', `${good}~1`)), /refused/);
+    git(repo, '-c', 'core.hooksPath=/dev/null', 'update-ref', 'refs/heads/main', git(repo, 'rev-parse', `${good}~1`));
     const v2 = cli(home, ['verify', '--repo', repo]);
     assert.equal(v2.json.ok, false); assert.match(JSON.stringify(v2.json.errors), /main/);
-    git(repo, 'update-ref', 'refs/heads/main', good);
+    git(repo, '-c', 'core.hooksPath=/dev/null', 'update-ref', 'refs/heads/main', good);
     // item 6: a local DB edit (delete the newest ledger row) is detected against the authority anchors
     await stop(d);
     const db = new DatabaseSync(path.join(home, 'g4a.db'));
