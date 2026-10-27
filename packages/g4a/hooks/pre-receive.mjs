@@ -7,7 +7,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { createPublicKey, verify } from 'node:crypto';
-import { DatabaseSync } from 'node:sqlite';
+import { openSqlite } from '../src/sqlite-driver.mjs';
 import { canonicalJson } from '../../../src/lib/canonical.ts';
 import { globMatchesPath } from '../../../src/lib/claims.ts';
 
@@ -37,7 +37,7 @@ const u = updates[0];
 if (u.new === ZERO) die('ref deletes are not allowed');
 if (u.ref !== permit.ref) die(`permit is for ${permit.ref}, not ${u.ref}`);
 if (!/^[A-Za-z0-9._-]+$/.test(permit.agent) || u.ref !== `refs/heads/agents/${permit.agent}`) die('agent ref mismatch');
-const db = new DatabaseSync(path.join(root, 'state', 'g4a.db'), { readOnly: true });
+const db = openSqlite(path.join(root, 'state', 'g4a.db'), { readOnly: true });
 const row = db.prepare('SELECT status, agent FROM claims WHERE id = ?').get(permit.claim);
 db.close();
 if (!row || row.status !== 'active' || row.agent !== permit.agent) die('claim is not active on the authority');

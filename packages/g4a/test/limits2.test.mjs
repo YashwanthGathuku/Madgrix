@@ -150,3 +150,31 @@ test('limit 3: reference-transaction guard refuses git-CLI main moves (any binar
     void c;
   } finally { await stop(d); cleanup(); }
 });
+
+// Limit 4: storage behind a driver interface, exercised with node:sqlite and better-sqlite3.
+test('limit 4: sqlite driver interface works with node:sqlite and better-sqlite3 (cross-readable)', () => {
+  const bsq = process.env.G4A_BETTER_SQLITE3 || '/home/box/.cache/g4a-bsq';
+  const haveBetter = fs.existsSync(path.join(bsq, 'node_modules', 'better-sqlite3'));
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'g4a-l2-sqlite-')); tmp.push(dir); try {
+    const script = (drv, n) => `
+      const A = await import(${JSON.stringify(path.resolve('src/authority.mjs'))});
+      const db = A.openDb(${JSON.stringify(dir)});
+      db.prepare("INSERT OR REPLACE INTO meta (k, v) VALUES (?, ?)").run(${JSON.stringify(drv)}, String(${n}));
+      const rows = db.prepare('SELECT k, v FROM meta ORDER BY k').all(); db.close();
+      const ro = A.openDb(${JSON.stringify(dir)}, { readOnly: true }); const one = ro.prepare('SELECT v FROM meta WHERE k = ?').get(${JSON.stringify(drv)}); ro.close();
+      console.log(JSON.stringify({ driver: A.SQLITE.driver, rows, one }));`;
+    const run = (drv, n) => {
+      const r = spawnSync(process.execPath, ['--no-warnings', '--input-type=module', '-e', script(drv, n)], { encoding: 'utf8', env: { ...process.env, G4A_SQLITE_DRIVER: drv, G4A_BETTER_SQLITE3: bsq } });
+      assert.equal(r.status, 0, r.stderr); return JSON.parse(r.stdout.trim().split('\n').pop());
+    };
+    const a = run('node', 1);
+    assert.equal(a.driver, 'node:sqlite'); assert.equal(a.one.v, '1');
+    const bad = spawnSync(process.execPath, ['--no-warnings', '--input-type=module', '-e', `const A = await import(${JSON.stringify(path.resolve('src/authority.mjs'))}); A.openDb(${JSON.stringify(dir)})`], { encoding: 'utf8', env: { ...process.env, G4A_SQLITE_DRIVER: 'bogus' } });
+    assert.notEqual(bad.status, 0); assert.match(bad.stderr, /G4A_SQLITE_DRIVER must be/);
+    if (!haveBetter) { console.log(`# limit 4: better-sqlite3 not installed at ${bsq}; only node:sqlite exercised`); return; }
+    const b = run('better-sqlite3', 2);
+    assert.equal(b.driver, 'better-sqlite3'); assert.equal(b.one.v, '2');
+    assert.deepEqual(b.rows.map((r) => r.k), ['better-sqlite3', 'node']); // reads what node:sqlite wrote
+    const c = run('node', 3); assert.deepEqual(c.rows.map((r) => [r.k, r.v]), [['better-sqlite3', '2'], ['node', '3']]);
+  } finally { cleanup(); }
+});
