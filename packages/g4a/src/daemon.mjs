@@ -7,6 +7,9 @@ import path from 'node:path';
 import { EventEmitter } from 'node:events';
 import { Authority, repoId, rowClaim } from './authority.mjs';
 import { promote } from './promote.mjs';
+import { promoteViaAuthority } from './promote-authority.mjs';
+import { locate, call, clientAnchorRemote, fetchMain } from './authority-client.mjs';
+import { safeGit } from '../../../scripts/lib/safe-git.mjs';
 import { randomHex } from '../../../src/lib/canonical.ts';
 import { g4aHome } from './lib.mjs';
 
@@ -24,7 +27,7 @@ export async function startDaemon(home = g4aHome(), { hooks = {}, keyDir } = {})
     if (alive) throw new Error(`g4a daemon already running on ${sock}`);
     fs.rmSync(sock, { force: true }); // stale socket from a crashed daemon
   }
-  const auth = new Authority(home, keyDir ? { keyDir } : {});
+  const auth = new Authority(home, { ...(keyDir ? { keyDir } : {}), anchorRemote: (repo) => { const l = locate(repo); return l && clientAnchorRemote(l); } });
   const requeued = auth.db.prepare("UPDATE jobs SET status = 'queued' WHERE status = 'running'").run().changes;
   const bus = new EventEmitter();
   // Per-repo job queues: one worker per repo (promotions in a repo stay serialized so CAS and
@@ -40,7 +43,14 @@ export async function startDaemon(home = g4aHome(), { hooks = {}, keyDir } = {})
     try {
       const { claimId } = JSON.parse(job.payload);
       const row = auth.db.prepare('SELECT * FROM claims WHERE id = ?').get(claimId);
-      result = row ? await promote(auth, rowClaim(row), job.id, hooks) : { ok: false, status: 'refused', reason: 'claim not found' };
+      if (!row) result = { ok: false, status: 'refused', reason: 'claim not found' };
+      else {
+        const loc = locate(row.worktree);
+        // default path: through the authority. Local landing is test-only (phase-1 fixtures).
+        if (loc) result = await promoteViaAuthority(auth, rowClaim(row), job.id, loc);
+        else if (process.env.G4A_LOCAL_LAND === '1') result = await promote(auth, rowClaim(row), job.id, hooks);
+        else result = { ok: false, status: 'refused', reason: 'no_authority', hint: 'run `g4a authority init --system` (or `g4a authority init DIR`, same-user detect-only) for this repo' };
+      }
     } catch (e) { result = { ok: false, status: 'error', error: String(e.message || e) }; }
     auth.db.prepare("UPDATE jobs SET status = 'done', result = ? WHERE id = ?").run(JSON.stringify(result), job.id);
     bus.emit(job.id, result);
@@ -64,8 +74,24 @@ export async function startDaemon(home = g4aHome(), { hooks = {}, keyDir } = {})
 
   const methods = {
     ping: () => ({ ok: true, pid: process.pid, requeued }),
-    claim: (p) => auth.claim(p),
-    release: (p) => auth.release(p),
+    claim: async (p) => {
+      const loc = locate(p.repo);
+      if (!loc) return auth.claim(p);
+      // the authority decides first (overlap / witness-path guards on ITS claims); local mirrors
+      const local = safeGit(p.repo, ['rev-parse', '--verify', '--quiet', 'refs/heads/main'], { allowFailure: true }).stdout.trim();
+      const amain = fetchMain(loc, p.repo);
+      if (local !== amain) return { ok: false, refused: 'main_out_of_sync', local, authority: amain };
+      const a = call(loc, 'claim', { agent: p.agent, paths: p.paths, witnesses: p.witnesses, witnessPaths: p.witnessPaths, allowOverlap: p.allowOverlap });
+      if (!a.ok) return { ...a, via: `authority:${loc.mode}` };
+      try { const r = await auth.claim(p); if (!r.ok) call(loc, 'release', { agent: p.agent }); return { ...r, authority: { mode: loc.mode, claim: a.id } }; }
+      catch (e) { call(loc, 'release', { agent: p.agent }); throw e; }
+    },
+    release: async (p) => {
+      const r = await auth.release(p);
+      const loc = locate(p.repo);
+      if (loc) r.authority = call(loc, 'release', { agent: p.agent });
+      return r;
+    },
     status: (p) => auth.status(p),
     check: (p) => auth.check(p),
     opt_out: (p) => auth.optOut(p),

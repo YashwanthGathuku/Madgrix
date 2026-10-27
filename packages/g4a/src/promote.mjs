@@ -85,7 +85,7 @@ function unionInsertions(files, regionsHunks) {
   });
 }
 
-function combine(top, main, candidate, agent, log) {
+export function combine(top, main, candidate, agent, log) {
   if (isAncestor(top, main, candidate)) return { sha: candidate, rung: 'fast-forward' };
   const mt = safeGit(top, ['merge-tree', '--write-tree', '--name-only', '--no-messages', '-z', main, candidate], { allowFailure: true });
   const [tree, ...conflicted] = splitNul(mt.stdout);
@@ -136,7 +136,7 @@ function mergirafRung(files, log) {
     fs.writeFileSync(conflictPath, JSON.stringify({ files }));
     const r = runContained({
       command: `${JSON.stringify(process.execPath)} ${JSON.stringify(MERGIRAF_RESOLVER)}`,
-      cwd: work, writable: [work], readOnly: [], timeoutMs: 120_000, purpose: 'resolver',
+      cwd: work, writable: [work], readOnly: [], hidden: sandboxHidden(), timeoutMs: 120_000, purpose: 'resolver',
       env: { PATH: process.env.PATH ?? '/usr/bin:/bin', HOME: dir, MADGRIX_CONFLICT_PATH: conflictPath, MERGIRAF_BIN: bin },
     });
     log.push(`mergiraf rung: exit ${r.status} sandbox ${r.sandbox}${r.stderrTail ? ` (${r.stderrTail})` : ''}`);
@@ -153,6 +153,8 @@ function mergirafRung(files, log) {
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 }
 
+// authority-side runs hide the authority's keys/state/repo from witnesses and resolvers
+const sandboxHidden = () => (process.env.G4A_SANDBOX_HIDE || '').split(':').filter(Boolean);
 // Run each witness command in bubblewrap on a detached checkout of `sha`.
 const RUNNER = path.join(path.dirname(fileURLToPath(import.meta.url)), 'witness-runner.mjs');
 function runOne(spec) {
@@ -164,14 +166,14 @@ function runOne(spec) {
     ch.stdin.end(JSON.stringify(spec));
   });
 }
-async function runWitnesses(top, sha, intents) {
+export async function runWitnesses(top, sha, intents) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'g4a-witness-'));
   const wt = path.join(dir, 'tree');
   safeGit(top, ['worktree', 'add', '--quiet', '--detach', wt, sha]);
   try {
     const out = [];
     for (const { cmd, agents } of intents) {
-      const r = await runOne({ command: cmd, cwd: wt, writable: [wt], timeoutMs: 300_000, purpose: 'witness', env: { PATH: process.env.PATH ?? '/usr/bin:/bin', HOME: dir } });
+      const r = await runOne({ command: cmd, cwd: wt, writable: [wt], timeoutMs: 300_000, purpose: 'witness', hidden: sandboxHidden(), env: { PATH: process.env.PATH ?? '/usr/bin:/bin', HOME: dir } });
       out.push({ cmd, agents, exit: r.status, signal: r.signal, timedOut: r.timedOut, sandbox: r.sandbox });
     }
     return out;
@@ -286,7 +288,7 @@ export async function promote(auth, claim, jobId, hooks = {}) {
   return { ok: false, status: 'refused', reason: 'cas_retries_exhausted', log };
 }
 
-function freezeIntent(auth, claim, mainAfter) {
+export function freezeIntent(auth, claim, mainAfter) {
   // pin every witness-referenced file (globs expanded on the promoted tree) by blob hash
   const top = repoTop(claim.worktree);
   const pins = {};
@@ -306,7 +308,7 @@ function blobAt(top, sha, f) {
   return r.status === 0 ? r.stdout.trim() : null;
 }
 // the worktree (if any) that has refs/heads/main checked out; {dirty} when it is unsafe to move
-function mainCheckout(top, main) {
+export function mainCheckout(top, main) {
   const lines = safeGit(top, ['worktree', 'list', '--porcelain']).stdout.split('\n');
   let cur = null, found = null;
   for (const l of lines) {
