@@ -6,7 +6,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import readline from 'node:readline';
-import { spawn, execFileSync } from 'node:child_process';
+import { spawn, spawnSync, execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 delete process.env.G4A_LOCAL_LAND;
@@ -99,7 +99,7 @@ test('mcp: claim -> commit -> promote (via authority) -> verify -> release round
 });
 
 test('mcp: session credentials stay in memory; progress, cancellation and timeout on long promotes', async () => {
-  const home = tmp('g4a-mcp-home-'), repo = tmp('g4a-mcp-repo-'), auth = tmp('g4a-mcp-auth-');
+  const home = tmp('g4a-mcp-home-'), repo = tmp('g4a-mcp-repo-'), auth = tmp('g4a-mcp-auth-'), gateDir = tmp('g4a-mcp-gate-');
   const env = { ...process.env, G4A_HOME: home, G4A_KEY_DIR: `${home}-keys` };
   git(repo, 'init', '-q', '-b', 'main'); for (const f of ['a.txt', 'b.txt', 'c.txt']) fs.writeFileSync(path.join(repo, f), f + '\n');
   git(repo, 'add', '-A'); git(repo, 'commit', '-qm', 'base'); git(repo, 'checkout', '-q', '--detach');
@@ -132,17 +132,30 @@ test('mcp: session credentials stay in memory; progress, cancellation and timeou
     s.raw(JSON.stringify({ jsonrpc: '2.0', method: 'notifications/cancelled', params: { requestId: 900, reason: 'user' } }));
     assert.deepEqual((await s.req('ping', {})).result, {});
     await new Promise((r) => setTimeout(r, 1000)); assert.equal(answered, false, 'cancelled request gets no response');
-    await new Promise((r) => setTimeout(r, 3500)); // let the daemon finish the cancelled client's job
-    // timeout: bounded, reported as a tool error that points at g4a_status
+    // the cancelled client's job still runs to completion in the daemon: wait for it by state, not wall-clock
+    for (const end = Date.now() + 120_000; ; await new Promise((r) => setTimeout(r, 200))) {
+      if (spawnSync('git', ['-C', repo, 'show', 'main:b.txt'], { encoding: 'utf8' }).stdout.trim() === 'B') break;
+      if (Date.now() > end) assert.fail('cancelled promote never landed in the daemon');
+    }
+    // timeout: bounded, reported as a tool error that points at g4a_status. The claim is made via the
+    // CLI (no MCP timeout) so only the promote is subject to G4A_MCP_TIMEOUT_MS; its witness blocks on a
+    // release file the test controls, so the promote cannot finish before the timeout under any load.
     await t.req('initialize', { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 't', version: '0' } });
-    const c3 = await t.call('g4a_claim', { agent: 't1', paths: ['c.txt'], witnesses: ['sleep 12'] });
-    assert.equal(c3.isError, false, c3.content[0].text);
-    const wt3 = c3.structuredContent.worktree; fs.writeFileSync(path.join(wt3, 'c.txt'), 'C\n'); git(wt3, 'add', 'c.txt'); git(wt3, 'commit', '-qm', 'edit c');
+    const gate = path.join(gateDir, 'release-t1');
+    const c3 = JSON.parse(execFileSync(process.execPath, ['--no-warnings', CLI, 'claim', '--repo', repo, '--agent', 't1', '--paths', 'c.txt', '--witness', `i=0; while [ ! -e ${gate} ] && [ $i -lt 600 ]; do sleep 0.1; i=$((i+1)); done; [ -e ${gate} ]`], { env, encoding: 'utf8' }));
+    assert.equal(c3.ok, true, JSON.stringify(c3));
+    const wt3 = c3.worktree; fs.writeFileSync(path.join(wt3, 'c.txt'), 'C\n'); git(wt3, 'add', 'c.txt'); git(wt3, 'commit', '-qm', 'edit c');
     const to = await t.call('g4a_promote', { agent: 't1' });
     assert.equal(to.isError, true); assert.match(to.content[0].text, /timed out after 4000ms.*g4a_status/s);
+    // the daemon keeps the job; once released it lands, as the error message promises
+    fs.writeFileSync(gate, '');
+    for (const end = Date.now() + 120_000; ; await new Promise((r) => setTimeout(r, 200))) {
+      if (spawnSync('git', ['-C', repo, 'show', 'main:c.txt'], { encoding: 'utf8' }).stdout.trim() === 'C') break;
+      if (Date.now() > end) assert.fail('timed-out promote never landed after release');
+    }
   } finally {
     await s.close(); await t.close(); await stop(d);
-    for (const x of [home, `${home}-keys`, repo, auth]) fs.rmSync(x, { recursive: true, force: true });
+    for (const x of [home, `${home}-keys`, repo, auth, gateDir]) fs.rmSync(x, { recursive: true, force: true });
   }
 });
 

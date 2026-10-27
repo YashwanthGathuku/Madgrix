@@ -1,6 +1,7 @@
 // g4a Phase 0 core: agent detection, safe-command classification, compactors,
 // token estimate, JSONL log. Deterministic; no network, no LLM.
 import fs from 'node:fs';
+import { ensurePrivateDir, rotateLog, minimiseArgv, redactDeep, appendPrivate } from './privacy.mjs';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -44,6 +45,65 @@ export function parseArgs(argv) {
     return { globals, sub: a, rest: argv.slice(i + 1) };
   }
   return null;
+}
+
+// Full parser for git's global options (git(1) "OPTIONS"), used for enforcement. Unlike
+// parseArgs (conservative: unknown => no compaction) this knows every global option, records
+// the ones that change which repo/config/binaries git uses, and returns null only for input git
+// itself would reject. Callers in an agent context treat null as "block" (fail closed).
+const G_SEP = new Set(['-C', '-c', '--git-dir', '--work-tree', '--namespace', '--config-env', '--attr-source', '--super-prefix']);
+const G_EQ = new Set(['--git-dir', '--work-tree', '--namespace', '--config-env', '--exec-path', '--super-prefix', '--attr-source', '--list-cmds']);
+const G_BOOL = new Set(['-p', '--paginate', '-P', '--no-pager', '--bare', '--no-replace-objects', '--no-lazy-fetch', '--no-optional-locks', '--no-advice',
+  '--literal-pathspecs', '--glob-pathspecs', '--noglob-pathspecs', '--icase-pathspecs', '-v', '--version', '-h', '--help', '--html-path', '--man-path', '--info-path', '--exec-path']);
+export function parseGit(argv) {
+  const g = { C: [], config: [], configEnv: [], gitDir: null, workTree: null, execPath: null, bare: false, other: [] };
+  const set = (o, v) => {
+    if (o === '-C') g.C.push(v); else if (o === '-c') g.config.push(v); else if (o === '--config-env') g.configEnv.push(v);
+    else if (o === '--git-dir') g.gitDir = v; else if (o === '--work-tree') g.workTree = v; else if (o === '--exec-path') g.execPath = v;
+    else g.other.push(o);
+  };
+  for (let i = 0; i < argv.length; i++) {
+    const a = String(argv[i]);
+    if (G_SEP.has(a)) { if (i + 1 >= argv.length) return null; set(a, String(argv[++i])); continue; }
+    const eq = /^(--[a-z-]+)=(.*)$/s.exec(a);
+    if (eq && G_EQ.has(eq[1])) { set(eq[1], eq[2]); continue; }
+    if (G_BOOL.has(a)) { if (a === '--bare') g.bare = true; continue; }
+    if (a.startsWith('-')) return null;
+    return { ...g, sub: a, rest: argv.slice(i + 1).map(String) };
+  }
+  return { ...g, sub: null, rest: [] };
+}
+// Config keys an agent must not override per command in a g4a-managed repo: they disable the
+// reference-transaction guard / reflog evidence, define aliases, or redirect git's own files.
+export const DANGEROUS_CONFIG = /^(core\.hookspath|core\.logallrefupdates|core\.fsmonitor|core\.worktree|core\.gitproxy|core\.sshcommand|alias\..*|include\..*|includeif\..*)$/i;
+// Every config key a git process will see from the command line and the environment.
+export function configKeys(p, env = process.env) {
+  const keys = [...p.config.map((v) => v.split('=')[0]), ...p.configEnv.map((v) => v.split('=')[0])];
+  const n = Number(env.GIT_CONFIG_COUNT || 0);
+  for (let i = 0; i < n && i < 1000; i++) if (env[`GIT_CONFIG_KEY_${i}`]) keys.push(env[`GIT_CONFIG_KEY_${i}`]);
+  for (const m of String(env.GIT_CONFIG_PARAMETERS || '').matchAll(/'([^'=]*)'(?:=|\s|$)/g)) keys.push(m[1]);
+  return keys.map((k) => k.trim().toLowerCase());
+}
+
+// Subcommands that can change refs, the index, history or the work tree. `read` forms of
+// multi-purpose commands (listing tags/stashes/worktrees/notes, reading a symbolic ref, showing
+// the reflog) are not writes. Unknown subcommands are resolved as aliases by the shim first.
+export const WRITE_SUBS = new Set(['commit', 'push', 'merge', 'rebase', 'reset', 'checkout', 'switch', 'cherry-pick', 'am', 'apply', 'revert', 'pull', 'update-ref', 'branch',
+  'tag', 'stash', 'notes', 'symbolic-ref', 'replace', 'commit-tree', 'worktree', 'rm', 'mv', 'restore', 'clean', 'reflog', 'update-index', 'read-tree', 'checkout-index',
+  'fast-import', 'filter-branch', 'filter-repo', 'mktag', 'submodule', 'sparse-checkout', 'bisect']);
+export function isWrite(sub, rest = []) {
+  if (!WRITE_SUBS.has(sub)) return false;
+  const pos = rest.filter((a) => !a.startsWith('-'));
+  switch (sub) {
+    case 'tag': return pos.length > 0 || rest.some((a) => /^-[a-zA-Z]*[dfas]|^--(delete|force|annotate|sign)/.test(a));
+    case 'stash': return !['list', 'show'].includes(pos[0]);
+    case 'worktree': return pos[0] !== 'list';
+    case 'notes': return !['list', 'show', 'get-ref'].includes(pos[0] ?? 'list');
+    case 'symbolic-ref': return pos.length > 1 || rest.some((a) => /^(-d|--delete)$/.test(a));
+    case 'reflog': return ['expire', 'delete'].includes(pos[0]);
+    case 'branch': return !(pos.length === 0 && rest.every((a) => /^(-a|-r|--all|--remotes|--no-color|--color|-v|-vv|--verbose|--list|-l|--show-current|--merged|--no-merged|--contains|--sort=.*|--format=.*)$/.test(a)));
+    default: return true;
+  }
 }
 
 // Any of these anywhere in the args means a tool may be parsing the output: never touch.
@@ -121,9 +181,12 @@ export function altArgs(kind, p) {
 
 export function appendLog(rec, env = process.env) {
   try {
-    const home = g4aHome(env);
-    fs.mkdirSync(home, { recursive: true });
-    fs.appendFileSync(path.join(home, 'log.jsonl'), JSON.stringify(rec) + '\n');
+    const home = ensurePrivateDir(g4aHome(env));
+    const f = path.join(home, 'log.jsonl');
+    rotateLog(f, env);
+    const r = { ...rec };
+    if (Array.isArray(r.argv)) r.argv = minimiseArgv(r.argv, env);
+    appendPrivate(f, JSON.stringify(redactDeep(r, env)) + '\n');
   } catch { /* logging must never break git */ }
 }
 

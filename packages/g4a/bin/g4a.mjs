@@ -1,5 +1,6 @@
 #!/usr/bin/env -S node --no-warnings
 import fs from 'node:fs';
+import { redact } from '../src/privacy.mjs';
 import os from 'node:os';
 import path from 'node:path';
 import { execFileSync, spawnSync } from 'node:child_process';
@@ -129,7 +130,7 @@ function hook(args) {
   try { input = fs.readFileSync(0, 'utf8'); } catch {}
   let j = {}; try { j = JSON.parse(input); } catch {}
   const cmd = j?.tool_input?.command ?? j?.tool_input?.cmd ?? null;
-  if (typeof cmd === 'string' && /\bgit\b/.test(cmd)) appendLog({ event: 'hook', ts: new Date().toISOString(), agent: args[0] || 'unknown', session: j.session_id ?? null, tool: j.tool_name ?? null, command: cmd });
+  if (typeof cmd === 'string' && /\bgit\b/.test(cmd)) appendLog({ event: 'hook', ts: new Date().toISOString(), agent: args[0] || 'unknown', session: j.session_id ?? null, tool: j.tool_name ?? null, command: process.env.G4A_LOG_ARGV === '0' ? '[command omitted]' : cmd.replace(/(\s(?:-m|--message)[= ]?)("[^"]*"|'[^']*'|\S+)/g, (m, f, v) => `${f}[${v.length} chars]`) });
   process.exit(0);
 }
 
@@ -151,7 +152,7 @@ function opts(args) {
     const a = args[i];
     if (!a.startsWith('--')) { o._.push(a); continue; }
     const k = a.slice(2);
-    if (['allow-overlap', 'system', 'detach', 'remove-worktree', 'no-wait', 'json', 'purge', 'session-credential', 'credential-stdin'].includes(k)) { o[k] = true; continue; }
+    if (['allow-overlap', 'system', 'detach', 'remove-worktree', 'no-wait', 'json', 'purge', 'session-credential', 'credential-stdin', 'all', 'logs', 'tee', 'credentials'].includes(k)) { o[k] = true; continue; }
     const v = args[++i];
     if (k === 'witness' || k === 'witness-path' || k === 'var') (o[k] ||= []).push(v); else o[k] = v;
   }
@@ -314,8 +315,34 @@ async function authorityCmd(args) {
   console.error('usage: g4a authority init --system | init DIR | audit | status | ledger | rebind --agent A [--uid N] [--credential-out F] | unbind --agent A  [--repo R]'); process.exitCode = 2;
 }
 
+// g4a privacy: what g4a has stored locally under G4A_HOME (sizes/modes only, never contents).
+// g4a purge: delete local telemetry. The signed ledger/accepted log/authority state are not touched
+// (they are the audit trail; remove an authority root with `g4a authority uninstall`).
+const INVENTORY = [
+  ['logs', ['log.jsonl', 'log.jsonl.1', 'log.jsonl.2', 'log.jsonl.3'], 'shim/hook usage log: event, ts, cwd, redacted+minimised git argv, agent'],
+  ['tee', ['tee'], 'raw git output of compacted commands (redacted), pruned by age/count'],
+  ['credentials', ['credentials'], 'per-agent authority credentials (0600)'],
+  ['secrets', ['secrets'], 'detect-only daemon: per-claim promote secrets (dir 0700, files 0600); kept with the db'],
+  ['daemon', ['g4a.db', 'g4a.db-wal', 'g4a.db-shm', 'g4a.sock', 'g4a.pid', 'witness-ed25519.pem', 'witness-ed25519.pub.hex'], 'detect-only daemon state: claims, intents, jobs, ledger, witness key'],
+];
+function duOf(p) { let st; try { st = fs.lstatSync(p); } catch { return null; } if (!st.isDirectory()) return { bytes: st.size, files: 1, mode: (st.mode & 0o777).toString(8) }; let bytes = 0, files = 0; for (const n of fs.readdirSync(p)) { const d = duOf(path.join(p, n)); if (d) { bytes += d.bytes; files += d.files; } } return { bytes, files, mode: (st.mode & 0o777).toString(8) }; }
+function privacyCmd() {
+  const items = [];
+  for (const [kind, names, what] of INVENTORY) for (const n of names) { const d = duOf(path.join(home, n)); if (d) items.push({ kind, path: path.join(home, n), ...d, what }); }
+  const loose = items.filter((i) => parseInt(i.mode, 8) & 0o077 && !i.path.endsWith('.pub.hex'));
+  out({ ok: true, home, items, warnings: loose.map((i) => `${i.path} is mode ${i.mode}; expected owner-only`), doc: path.join(PKG, 'PRIVACY.md') });
+}
+function purgeCmd(args) {
+  const o = opts(args);
+  const kinds = o.all ? ['logs', 'tee', 'credentials'] : ['logs', 'tee', 'credentials'].filter((k) => o[k]);
+  if (!kinds.length) { console.error('usage: g4a purge [--logs] [--tee] [--credentials] | --all   (local telemetry only; the signed ledger is kept)'); process.exitCode = 2; return; }
+  const removed = [];
+  for (const [kind, names] of INVENTORY) if (kinds.includes(kind)) for (const n of names) { const p = path.join(home, n); if (fs.existsSync(p)) { fs.rmSync(p, { recursive: true, force: true }); removed.push(p); } }
+  out({ ok: true, removed, kept: 'daemon db/ledger and any authority root (audit trail)' });
+}
+
 async function mcpCmd() { await (await import('../src/mcp.mjs')).serve(); }
-({ mcp: mcpCmd, authority: authorityCmd, install, uninstall, doctor, stats: showStats, hook, hooks, daemon, claim: claimCmd, release: releaseCmd, status: statusCmd, promote: promoteCmd, ledger: ledgerCmd, verify: verifyCmd, stop: stopCmd, operator: operatorCmd, override: overrideCmd }[cmd] ?? (() => {
-  console.log('usage: g4a install [--rc FILE] | uninstall [--rc FILE] | doctor | stats | hooks claude|codex|gemini | hook <agent>\n       g4a daemon [--detach] | stop | claim --agent A --paths p1,p2 --witness CMD [--allow-overlap] [--repo R]\n       g4a release --agent A [--remove-worktree] | status | promote --agent A [--no-wait] | ledger [--out F] | verify [BUNDLE] [--pin SPKIHEX] [--anchor-remote R]\n       g4a operator init [--passphrase-file F] | override --repo R --minutes N --reason TEXT [--var G4A_ENFORCE|G4A_RAW|G4A_AGENT]  (human-only)\n       g4a authority init --system | init DIR (same-user, detect-only) | audit | status | ledger  [--repo R]\n       g4a mcp   (stdio MCP server: g4a_claim/status/promote/verify/release/authority_status)');
+({ mcp: mcpCmd, authority: authorityCmd, install, uninstall, doctor, stats: showStats, hook, hooks, daemon, claim: claimCmd, release: releaseCmd, status: statusCmd, promote: promoteCmd, ledger: ledgerCmd, verify: verifyCmd, stop: stopCmd, privacy: privacyCmd, purge: purgeCmd, operator: operatorCmd, override: overrideCmd }[cmd] ?? (() => {
+  console.log('usage: g4a install [--rc FILE] | uninstall [--rc FILE] | doctor | stats | hooks claude|codex|gemini | hook <agent> | privacy | purge [--logs|--tee|--credentials|--all]\n       g4a daemon [--detach] | stop | claim --agent A --paths p1,p2 --witness CMD [--allow-overlap] [--repo R]\n       g4a release --agent A [--remove-worktree] | status | promote --agent A [--no-wait] | ledger [--out F] | verify [BUNDLE] [--pin SPKIHEX] [--anchor-remote R]\n       g4a operator init [--passphrase-file F] | override --repo R --minutes N --reason TEXT [--var G4A_ENFORCE|G4A_RAW|G4A_AGENT]  (human-only)\n       g4a authority init --system | init DIR (same-user, detect-only) | audit | status | ledger  [--repo R]\n       g4a mcp   (stdio MCP server: g4a_claim/status/promote/verify/release/authority_status)');
   process.exitCode = cmd ? 2 : 0;
-}))(rest)?.catch?.((e) => { console.error(`g4a: ${e.message}`); process.exitCode = 1; });
+}))(rest)?.catch?.((e) => { console.error(`g4a: ${redact(String(e?.message ?? e))}`); if (process.env.G4A_DEBUG === '1') console.error(redact(String(e?.stack ?? ''))); process.exitCode = 1; });

@@ -9,6 +9,7 @@ import path from 'node:path';
 import { createHash, createPrivateKey, createPublicKey, generateKeyPairSync, sign, verify } from 'node:crypto';
 import { canonicalJson } from '../../../src/lib/canonical.ts';
 import { keyDir } from './lib.mjs';
+import { ensurePrivateDir, writePrivate } from './privacy.mjs';
 
 export const OPT_OUT_VARS = ['G4A_ENFORCE', 'G4A_RAW', 'G4A_AGENT'];
 const opFile = (kd) => path.join(kd, 'operator-ed25519.pem');
@@ -16,12 +17,12 @@ const opPub = (kd) => path.join(kd, 'operator-ed25519.pub.hex');
 export const overrideFile = (repo, kd = keyDir()) => path.join(kd, 'overrides', `${createHash('sha256').update(repo).digest('hex').slice(0, 32)}.json`);
 
 export function operatorInit({ kd = keyDir(), passphrase } = {}) {
-  fs.mkdirSync(kd, { recursive: true, mode: 0o700 });
+  ensurePrivateDir(kd); // refuses a symlinked or foreign-owned key dir
   if (fs.existsSync(opFile(kd))) return { ok: true, existed: true, pub: fs.readFileSync(opPub(kd), 'utf8').trim() };
   const { privateKey } = generateKeyPairSync('ed25519');
-  fs.writeFileSync(opFile(kd), privateKey.export({ type: 'pkcs8', format: 'pem', ...(passphrase ? { cipher: 'aes-256-cbc', passphrase } : {}) }), { mode: 0o600 });
+  writePrivate(opFile(kd), privateKey.export({ type: 'pkcs8', format: 'pem', ...(passphrase ? { cipher: 'aes-256-cbc', passphrase } : {}) }));
   const pub = createPublicKey(privateKey).export({ type: 'spki', format: 'der' }).toString('hex');
-  fs.writeFileSync(opPub(kd), pub + '\n', { mode: 0o644 });
+  writePrivate(opPub(kd), pub + '\n', 0o644); // O_NOFOLLOW
   return { ok: true, pub };
 }
 
@@ -33,8 +34,8 @@ export function grantOverride({ repo, minutes, reason, vars = OPT_OUT_VARS, kd =
   const override = { version: 'g4a-override/v1', repo, vars, until: new Date(Date.now() + minutes * 60_000).toISOString(), reason: String(reason || '') };
   const signature = sign(null, Buffer.from(canonicalJson(override)), key).toString('base64');
   const f = overrideFile(repo, kd);
-  fs.mkdirSync(path.dirname(f), { recursive: true, mode: 0o700 });
-  fs.writeFileSync(f, JSON.stringify({ override, signature }, null, 2) + '\n', { mode: 0o600 });
+  ensurePrivateDir(kd); ensurePrivateDir(path.dirname(f));
+  writePrivate(f, JSON.stringify({ override, signature }, null, 2) + '\n');
   return { ok: true, file: f, override };
 }
 

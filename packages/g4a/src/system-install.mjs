@@ -17,6 +17,26 @@ const SRC_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..'
 const sh = (cmd, args, o = {}) => execFileSync(cmd, args, { stdio: ['ignore', 'pipe', 'pipe'], encoding: 'utf8', ...o });
 const which = (n) => { const r = spawnSync('sh', ['-c', `command -v ${n}`], { encoding: 'utf8' }); return r.status === 0 ? r.stdout.trim() : null; };
 
+// Seed bundle of main for the authority user: a fresh mkdtemp dir (0700) and bundle (0600), both
+// chowned to the authority uid only (never world-readable), removed by cleanup() and on exit/signal.
+export function seedBundle(seedRepo, { uid = process.getuid(), gid = process.getgid(), tmpdir = os.tmpdir() } = {}) {
+  const dir = fs.mkdtempSync(path.join(tmpdir, 'g4a-seed-'));
+  fs.chmodSync(dir, 0o700);
+  const bundle = path.join(dir, 'seed.bundle');
+  let done = false;
+  const cleanup = () => { if (done) return; done = true; fs.rmSync(dir, { recursive: true, force: true }); process.off('exit', cleanup); for (const s of SIGS) process.off(s, onSig); };
+  const onSig = (s) => { cleanup(); process.kill(process.pid, s); };
+  const SIGS = ['SIGINT', 'SIGTERM', 'SIGHUP'];
+  process.on('exit', cleanup); for (const s of SIGS) process.once(s, onSig);
+  try {
+    const old = process.umask(0o077);
+    try { sh('git', ['-c', 'safe.directory=*', '-C', seedRepo, 'bundle', 'create', '--quiet', bundle, 'refs/heads/main']); } finally { process.umask(old); }
+    fs.chmodSync(bundle, 0o600);
+    if (uid !== process.getuid() || gid !== process.getgid()) { fs.chownSync(bundle, uid, gid); fs.chownSync(dir, uid, gid); }
+  } catch (e) { cleanup(); throw e; }
+  return { dir, bundle, cleanup };
+}
+
 export function install({ repoId, seedRepo, mergiraf }) {
   if (process.getuid() !== 0) throw new Error('system install must run as root');
   if (spawnSync('id', ['-u', USER]).status !== 0) sh('useradd', ['--system', '--home-dir', HOME, '--shell', '/usr/sbin/nologin', '--user-group', USER]);
@@ -84,13 +104,14 @@ exec ${ENV} git upload-pack "$p"
   fs.renameSync(`${SUDOERS}.tmp`, SUDOERS);
   // seed: a bundle of main, readable by the authority user, cloned authority-side
   const id = createHash('sha256').update(repoId).digest('hex').slice(0, 16);
-  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'g4a-seed-')); fs.chmodSync(tmp, 0o755);
-  const bundle = path.join(tmp, 'seed.bundle');
-  sh('git', ['-c', 'safe.directory=*', '-C', seedRepo, 'bundle', 'create', '--quiet', bundle, 'refs/heads/main']); fs.chmodSync(bundle, 0o644);
-  const b64 = Buffer.from(JSON.stringify({ seed: bundle, clientRepo: repoId, mode: 'system' })).toString('base64');
-  const env = { ...process.env }; delete env.SUDO_USER; delete env.SUDO_UID; delete env.SUDO_GID; delete env.SUDO_COMMAND;
-  const r = spawnSync('runuser', ['-u', USER, '--', `${BIN}/g4a-authority`, id, 'init-root', b64], { encoding: 'utf8', env, cwd: '/' });
-  fs.rmSync(tmp, { recursive: true, force: true });
+  const uid = Number(sh('id', ['-u', USER]).trim()), gid = Number(sh('id', ['-g', USER]).trim());
+  const seed = seedBundle(seedRepo, { uid, gid });
+  let r;
+  try {
+    const b64 = Buffer.from(JSON.stringify({ seed: seed.bundle, clientRepo: repoId, mode: 'system' })).toString('base64');
+    const env = { ...process.env }; delete env.SUDO_USER; delete env.SUDO_UID; delete env.SUDO_GID; delete env.SUDO_COMMAND;
+    r = spawnSync('runuser', ['-u', USER, '--', `${BIN}/g4a-authority`, id, 'init-root', b64], { encoding: 'utf8', env, cwd: '/' });
+  } finally { seed.cleanup(); }
   let res; try { res = JSON.parse(r.stdout.trim().split('\n').pop()); } catch { throw new Error(`authority init-root failed: ${r.stderr || r.stdout}`); }
   if (!res.ok) throw new Error(`authority init-root failed: ${res.error}`);
   fs.mkdirSync(path.dirname(MAP), { recursive: true, mode: 0o755 });

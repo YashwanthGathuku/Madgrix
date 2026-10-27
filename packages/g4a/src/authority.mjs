@@ -10,6 +10,7 @@ import { generateKeyPairSync, createPrivateKey, createPublicKey, createHash, sig
 import { globsOverlap, globMatchesPath } from '../../../src/lib/claims.ts';
 import { ledgerEntryHash, verifyLedgerChain, LEDGER_GENESIS_PREV_HASH } from '../../../src/lib/ledger.ts';
 import { canonicalJson, sha256Hex, randomHex } from '../../../src/lib/canonical.ts';
+import { redact, ensurePrivateDir, writePrivate } from './privacy.mjs';
 import { safeGit } from '../../../scripts/lib/safe-git.mjs';
 import { witnessSignerFromKey } from '../../../scripts/lib/admission.mjs';
 
@@ -40,9 +41,17 @@ CREATE TABLE IF NOT EXISTS jobs (
 
 export function openDb(home, { readOnly = false } = {}) {
   fs.mkdirSync(home, { recursive: true, mode: 0o700 });
-  const db = openSqlite(path.join(home, 'g4a.db'), { readOnly });
+  const f = path.join(home, 'g4a.db');
+  // owner-only db/WAL/SHM regardless of the caller's umask (holds claims, paths, witnesses, jobs)
+  const um = readOnly ? null : process.umask(0o077);
+  let db;
+  try {
+    db = openSqlite(f, { readOnly });
+    if (!readOnly) db.exec('PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA busy_timeout=5000;');
+  } finally { if (um !== null) process.umask(um); }
   if (!readOnly) {
-    db.exec('PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA busy_timeout=5000;'); db.exec(SCHEMA);
+    for (const x of [f, `${f}-wal`, `${f}-shm`]) try { if (fs.statSync(x).mode & 0o077) fs.chmodSync(x, 0o600); } catch {}
+    db.exec(SCHEMA);
     // additive migrations
     const cols = (t) => db.prepare(`PRAGMA table_info(${t})`).all().map((c) => c.name);
     if (!cols('claims').includes('witness_paths')) db.exec("ALTER TABLE claims ADD COLUMN witness_paths TEXT NOT NULL DEFAULT '[]'");
@@ -64,7 +73,38 @@ export function repoTop(repo) {
 // The signing key and the external anchor live outside $G4A_HOME (default
 // $XDG_CONFIG_HOME/g4a-keys), so copying or rolling back the db does not carry the key or anchor.
 export { keyDir } from './lib.mjs';
-import { keyDir } from './lib.mjs';
+import { keyDir, parseGit, isWrite } from './lib.mjs';
+// Claim inputs are repo-relative globs and witness commands; both end up in the signed ledger
+// (which cannot be redacted later), so refuse traversal/absolute paths and secret-bearing witnesses.
+const WITNESS_SECRET = [
+  /(^|\s)(-u|--user|--proxy-user)(\s+|=)?['"]?[^\s'"]*:/,
+  /(^|\s)(-H|--header|--proxy-header)(\s+|=)?['"]?[^'":\n]*(tok|auth|key|secret|pass|cookie|session|sig|cred)[^'":\n]*:/i,
+  /(^|\s)(--oauth2-bearer|--cookie)(\s+|=)\S/,
+  /\bx-[a-z0-9-]*(tok|auth|key|secret)[a-z0-9-]*\s*:/i,
+];
+// overlap is checked case-insensitively too: a case variant would collide on macOS/Windows
+export const claimOverlap = (a, b) => globsOverlap(a, b) || globsOverlap(a.toLowerCase(), b.toLowerCase());
+export function checkClaimInputs(paths, witnesses = [], witnessPaths = []) {
+  for (const p of [...paths, ...witnessPaths]) {
+    if (typeof p !== 'string' || !p || p.length > 512 || p.includes('\0')) throw new Error('claim path must be a non-empty string (<=512 chars)');
+    if (p.startsWith('/') || /^[A-Za-z]:[\\/]/.test(p) || p.startsWith('~')) throw new Error(`claim path ${JSON.stringify(p)} must be repo-relative`);
+    if (p.split(/[\\/]/).includes('..')) throw new Error(`claim path ${JSON.stringify(p)} must not contain ".."`);
+    // hygiene: no control chars, pathspec magic, non-ASCII (fullwidth dots and other lookalikes),
+    // or git/g4a internals (the signed ledger is permanent, so refuse instead of normalising)
+    if (/[\x00-\x1f\x7f]/.test(p)) throw new Error(`claim path ${JSON.stringify(p)} must not contain control characters or newlines`);
+    if (/[^\x20-\x7e]/.test(p)) throw new Error(`claim path ${JSON.stringify(p)} must be printable ASCII (no lookalike characters)`);
+    if (p.startsWith(':')) throw new Error(`claim path ${JSON.stringify(p)} must not use pathspec magic (leading ":")`);
+    if (p.startsWith('-')) throw new Error(`claim path ${JSON.stringify(p)} must not start with "-"`);
+    const segs = p.split(/[\\/]/).map((x) => x.toLowerCase());
+    if (segs.includes('.git') || segs[0] === '.g4a' || segs.includes('.')) throw new Error(`claim path ${JSON.stringify(p)} must not name .git/, .g4a/ or "." segments`);
+  }
+  if (!Array.isArray(witnesses)) throw new Error('witnesses must be an array');
+  for (const w of witnesses) {
+    if (typeof w !== 'string' || !w || w.length > 4096 || w.includes('\0')) throw new Error('witness must be a non-empty command string (<=4096 chars)');
+    if (WITNESS_SECRET.some((re) => re.test(w))) throw new Error('witness command passes credentials (-u/--user user:pass, an auth-like -H header, a bearer or cookie); witnesses are stored in the permanent signed ledger, so pass secrets via the environment instead');
+    if (redact(w) !== w) throw new Error('witness command looks like it contains a secret (token, credential URL or auth header); pass secrets via the environment instead');
+  }
+}
 const within = (child, parent) => { const r = path.relative(parent, child); return r === '' || (!r.startsWith('..') && !path.isAbsolute(r)); };
 export const ANCHOR_REF = 'refs/g4a/ledger-head';
 // safe-git denies all transports; the anchor remote may use file:// (tests, other-uid dirs) or ssh
@@ -90,8 +130,7 @@ export class Authority {
 
   // Required witness key: generated locally on first start, 0600, never leaves the box.
   ensureKey() {
-    fs.mkdirSync(this.keyDir, { recursive: true, mode: 0o700 });
-    fs.chmodSync(this.keyDir, 0o700);
+    ensurePrivateDir(this.keyDir); // refuses a symlinked or foreign-owned key dir
     const legacy = path.join(this.home, 'witness-ed25519.pem');
     if (!fs.existsSync(this.keyFile) && fs.existsSync(legacy)) fs.renameSync(legacy, this.keyFile); // phase-1 layout
     // Optional: G4A_KEY_PASSPHRASE_FILE encrypts the key at rest (PKCS#8, AES-256-CBC). The
@@ -100,7 +139,7 @@ export class Authority {
     const passphrase = pf ? fs.readFileSync(pf, 'utf8').replace(/\r?\n$/, '') : undefined;
     if (!fs.existsSync(this.keyFile)) {
       const { privateKey } = generateKeyPairSync('ed25519');
-      fs.writeFileSync(this.keyFile, privateKey.export({ type: 'pkcs8', format: 'pem', ...(passphrase ? { cipher: 'aes-256-cbc', passphrase } : {}) }), { mode: 0o600 });
+      writePrivate(this.keyFile, privateKey.export({ type: 'pkcs8', format: 'pem', ...(passphrase ? { cipher: 'aes-256-cbc', passphrase } : {}) }));
     }
     const pem = fs.readFileSync(this.keyFile, 'utf8');
     this.keyEncrypted = pem.includes('ENCRYPTED');
@@ -112,7 +151,7 @@ export class Authority {
     else if (pinned.v !== spki) throw new Error('witness key does not match the pinned public key; refusing to start');
     this.privateKey = pk;
     this.publicKeySpkiHex = spki;
-    fs.writeFileSync(path.join(this.keyDir, 'witness-ed25519.pub.hex'), spki + '\n', { mode: 0o644 });
+    writePrivate(path.join(this.keyDir, 'witness-ed25519.pub.hex'), spki + '\n', 0o644); // O_NOFOLLOW
   }
   sign(obj) { return cryptoSign(null, Buffer.from(canonicalJson(obj)), this.privateKey).toString('base64'); }
 
@@ -139,8 +178,8 @@ export class Authority {
     const f = this.anchorFile(repo);
     const cur = readFileAnchor(f)?.anchor;
     if (!cur || cur.counter < anchor.counter) {
-      fs.mkdirSync(path.dirname(f), { recursive: true, mode: 0o700 });
-      fs.writeFileSync(f + '.tmp', body, { mode: 0o600 });
+      ensurePrivateDir(path.dirname(f));
+      writePrivate(f + '.tmp', body);
       fs.renameSync(f + '.tmp', f);
     }
     // ref anchor: commit chain, CAS on the previous anchor commit
@@ -258,11 +297,12 @@ export class Authority {
       if (!/^[A-Za-z0-9._-]{1,64}$/.test(agent || '')) throw new Error('agent must match [A-Za-z0-9._-]{1,64}');
       if (!Array.isArray(paths) || paths.length === 0) throw new Error('claim needs at least one path');
       if (paths.includes('**')) throw new Error('unbounded claim "**" refused');
+      checkClaimInputs(paths, witnesses, witnessPaths);
       const repo = repoId(repoPath), top = repoTop(repoPath);
       const active = this.activeClaims(repo);
       if (active.some((c) => c.agent === agent)) throw new Error(`agent ${agent} already holds an active claim`);
       const overlaps = [];
-      for (const c of active) for (const a of paths) for (const b of c.paths) if (globsOverlap(a, b)) overlaps.push({ with: c.agent, path: a, theirs: b });
+      for (const c of active) for (const a of paths) for (const b of c.paths) if (claimOverlap(a, b)) overlaps.push({ with: c.agent, path: a, theirs: b });
       // overlap is allowed only when BOTH sides opted in; then it is resolved at promotion
       const refused = overlaps.filter((o) => !allowOverlap || !active.find((c) => c.agent === o.with).allow_overlap);
       if (refused.length) {
@@ -272,8 +312,8 @@ export class Authority {
       // a claim may not cover files another agent's witnesses depend on (and vice versa)
       const wpaths = this.witnessPathsFor(top, witnesses, witnessPaths);
       const guarded = [];
-      for (const pr of this.protectedPaths(repo, agent)) for (const a of paths) if (globsOverlap(a, pr.path)) guarded.push({ with: pr.owner, path: a, witness_path: pr.path, frozen: pr.frozen });
-      for (const c of active) for (const w of wpaths) for (const b of c.paths) if (globsOverlap(w, b)) guarded.push({ with: c.agent, witness_path: w, their_claim: b });
+      for (const pr of this.protectedPaths(repo, agent)) for (const a of paths) if (claimOverlap(a, pr.path)) guarded.push({ with: pr.owner, path: a, witness_path: pr.path, frozen: pr.frozen });
+      for (const c of active) for (const w of wpaths) for (const b of c.paths) if (claimOverlap(w, b)) guarded.push({ with: c.agent, witness_path: w, their_claim: b });
       if (guarded.length) {
         await this.appendLedger(repo, 'claim_refused', { agent, paths, reason: 'witness_paths', guarded });
         return { ok: false, refused: 'witness_paths', guarded };
@@ -287,8 +327,7 @@ export class Authority {
       safeGit(top, ['worktree', 'add', '--quiet', '-b', branch, worktree, baseline]);
       const id = `c_${randomHex(8)}`;
       const secret = randomHex(32);
-      fs.mkdirSync(path.join(this.home, 'secrets'), { recursive: true, mode: 0o700 });
-      fs.writeFileSync(path.join(this.home, 'secrets', id), secret, { mode: 0o600 });
+      writePrivate(path.join(ensurePrivateDir(path.join(this.home, 'secrets')), id), secret);
       this.db.prepare('INSERT INTO claims (id, repo, agent, paths, witnesses, allow_overlap, worktree, branch, baseline, status, secret_sha256, claimed_at, witness_paths) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
         .run(id, repo, agent, JSON.stringify(paths), JSON.stringify(witnesses), allowOverlap ? 1 : 0, worktree, branch, baseline, 'active', await sha256Hex(secret), new Date().toISOString(), JSON.stringify(wpaths));
       await this.appendLedger(repo, 'claim', { id, agent, paths, witnesses, witness_paths: wpaths, allowOverlap, baseline, branch, overlaps });
@@ -327,8 +366,13 @@ export class Authority {
   }
 
   // Called by the shim before agent write commands inside a g4a worktree.
-  check({ cwd, argv }) {
+  // `sub`/`rest` come from the shim's full global-option parser (and alias resolution); older
+  // callers that send only argv get the same parser here, never a first-non-option guess.
+  check({ cwd, argv, sub: sub0, rest: rest0 }) {
     return this.serial(async () => {
+      const pg = typeof sub0 === 'string' ? { sub: sub0, rest: Array.isArray(rest0) ? rest0.map(String) : [] } : parseGit(argv ?? []);
+      if (!pg) return { ok: false, managed: true, claim: null, warnings: ['unparseable git global options (fail closed)'] };
+      const sub = pg.sub, rest = pg.rest;
       let wtTop;
       try { wtTop = fs.realpathSync(safeGit(cwd, ['rev-parse', '--show-toplevel']).stdout.trim()); } catch { return { ok: true, managed: false }; }
       const row = this.db.prepare("SELECT * FROM claims WHERE worktree = ? AND status = 'active'").get(wtTop);
@@ -337,26 +381,33 @@ export class Authority {
         try { repo = repoId(cwd); } catch { return { ok: true, managed: false }; }
         const managed = this.db.prepare('SELECT 1 FROM claims WHERE repo = ? LIMIT 1').get(repo);
         if (!managed) return { ok: true, managed: false };
-        const sub0 = argv.find((x) => !x.startsWith('-'));
-        if (sub0 === 'branch' && !argv.some((x) => /^-[a-zA-Z]*[fdDmMcC]|^--(force|delete|move|copy)/.test(x))) return { ok: true, managed: true, claim: null, warnings: [] };
+        if (!isWrite(sub, rest)) return { ok: true, managed: true, claim: null, warnings: [] };
         const warnings = [`agent write outside a claimed worktree in a g4a-managed repo (${wtTop}); claim paths with \`g4a claim\` and work in .g4a/worktrees/<agent>`];
         await this.appendLedger(repo, 'scope_warning', { claim: null, cwd: wtTop, argv, warnings });
         return { ok: false, managed: true, claim: null, warnings };
       }
       const c = rowClaim(row);
-      const sub = argv.find((a) => !a.startsWith('-'));
       const warnings = [];
+      const isMain = (a) => /^(\+)?((refs\/heads\/)?main|HEAD:main|.*:(refs\/heads\/)?main)$/.test(a) || a.startsWith('refs/g4a/');
       if (sub === 'commit') {
-        const all = argv.includes('-a') || argv.includes('--all') || argv.some((a) => /^-[a-zA-Z]*a[a-zA-Z]*$/.test(a) && !a.startsWith('--'));
+        const all = rest.includes('--all') || rest.some((a) => /^-[a-zA-Z]*a[a-zA-Z]*$/.test(a) && !a.startsWith('--') && !/^-[a-zA-Z]*[mFCct][a-zA-Z]*a/.test(a));
         const files = new Set(splitNul(safeGit(wtTop, ['diff', '--cached', '--name-only', '-z']).stdout));
         if (all) for (const f of splitNul(safeGit(wtTop, ['diff', '--name-only', '-z']).stdout)) files.add(f);
+        const { specs, fromFile } = commitPathspecs(rest);
+        if (fromFile) warnings.push('commit --pathspec-from-file is not supported inside a claimed worktree');
+        if (specs.length) for (const f of splitNul(safeGit(wtTop, ['diff', '--name-only', '-z', 'HEAD', '--', ...specs]).stdout)) files.add(f);
         const out = [...files].filter((f) => !c.paths.some((g) => globMatchesPath(g, f)));
         if (out.length) warnings.push(`commit touches paths outside claim ${c.id} (${c.paths.join(', ')}): ${out.join(', ')}`);
       }
-      if (sub === 'push' && argv.some((a) => /(^|:)(refs\/heads\/)?main$/.test(a))) warnings.push('pushing to main bypasses g4a promotion; use `g4a promote`');
-      if (sub === 'update-ref' && argv.some((a) => a === 'main' || a === 'refs/heads/main' || a.startsWith('refs/g4a/'))) warnings.push('update-ref on main or refs/g4a/* is reserved to the g4a daemon');
-      if (sub === 'branch' && argv.some((a) => /^-(f|M|D|C|-force|-delete)$/.test(a) || /^-[a-zA-Z]*[fMDC]/.test(a)) && argv.includes('main')) warnings.push('moving or deleting main is reserved to the g4a daemon');
-      if (['reset', 'rebase', 'checkout', 'switch'].includes(sub) && argv.some((a) => a === 'main' || a.endsWith('/main'))) warnings.push(`${sub} onto main inside a claimed worktree`);
+      if (sub === 'push' && (rest.some(isMain) || rest.some((a) => /^--(mirror|all|delete)$|^-d$/.test(a)))) warnings.push('pushing to main (or --mirror/--all/--delete) bypasses g4a promotion; use `g4a promote`');
+      if (sub === 'update-ref' && (rest.some((a) => a === 'main' || a === 'refs/heads/main' || a.startsWith('refs/g4a/')) || rest.includes('--stdin'))) warnings.push('update-ref on main or refs/g4a/* (or --stdin) is reserved to the g4a daemon');
+      if (sub === 'symbolic-ref' && rest.some((a) => a === 'main' || a === 'refs/heads/main' || a.startsWith('refs/g4a/'))) warnings.push('symbolic-ref onto main or refs/g4a/* is reserved to the g4a daemon');
+      if (sub === 'replace') warnings.push('git replace rewrites how history reads; not allowed inside a claimed worktree');
+      if (sub === 'reflog' && isWrite(sub, rest)) warnings.push('expiring or deleting reflog entries destroys audit evidence; not allowed for agents');
+      if ((sub === 'filter-branch' || sub === 'filter-repo' || sub === 'fast-import') && rest.some((a) => a === 'main' || a.includes('refs/heads/main') || a === '--all')) warnings.push(`${sub} on main is reserved to the g4a daemon`);
+      if (sub === 'branch' && rest.some((a) => /^-(f|M|D|C|-force|-delete)$/.test(a) || /^-[a-zA-Z]*[fMDC]/.test(a)) && rest.includes('main')) warnings.push('moving or deleting main is reserved to the g4a daemon');
+      if (sub === 'tag' && rest.some((a) => a.startsWith('refs/'))) warnings.push('tag names must not be full refs inside a claimed worktree');
+      if (['reset', 'rebase', 'checkout', 'switch'].includes(sub) && rest.some((a) => a === 'main' || a.endsWith('/main'))) warnings.push(`${sub} onto main inside a claimed worktree`);
       if (warnings.length) await this.appendLedger(c.repo, 'scope_warning', { claim: c.id, agent: c.agent, argv, warnings });
       return { ok: warnings.length === 0, managed: true, claim: c.id, agent: c.agent, warnings };
     });
@@ -374,6 +425,22 @@ export function bundleFromDb(db, repo) {
   }
 }
 
+// Pathspecs given to `git commit` (they commit those files even when not staged).
+const COMMIT_VAL = new Set(['-m', '-F', '-C', '-c', '-t', '--message', '--file', '--author', '--date', '--cleanup', '--template', '--fixup', '--squash', '--trailer', '--reuse-message', '--reedit-message']);
+export function commitPathspecs(rest) {
+  const specs = []; let fromFile = false;
+  for (let i = 0; i < rest.length; i++) {
+    const a = rest[i];
+    if (a === '--') { specs.push(...rest.slice(i + 1)); break; }
+    if (/^--pathspec-from-file/.test(a)) { fromFile = true; if (!a.includes('=')) i++; continue; }
+    if (COMMIT_VAL.has(a)) { i++; continue; }
+    if (a.startsWith('--')) continue;
+    if (/^-[a-zA-Z]/.test(a)) { const k = [...a.slice(1)].findIndex((ch) => 'mFCct'.includes(ch)); if (k === a.length - 2) i++; continue; }
+    if (a.startsWith('-')) continue;
+    specs.push(a);
+  }
+  return { specs, fromFile };
+}
 export function rowClaim(r) { return { ...r, paths: JSON.parse(r.paths), witnesses: JSON.parse(r.witnesses), witness_paths: JSON.parse(r.witness_paths ?? '[]'), allow_overlap: !!r.allow_overlap }; }
 export function splitNul(s) { return s.split('\0').filter(Boolean); }
 
