@@ -2,7 +2,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { g4aHome, readLog, stats, appendLog, agentMarker } from '../src/lib.mjs';
 import { spawn } from 'node:child_process';
@@ -151,7 +151,7 @@ function opts(args) {
     const a = args[i];
     if (!a.startsWith('--')) { o._.push(a); continue; }
     const k = a.slice(2);
-    if (['allow-overlap', 'system', 'detach', 'remove-worktree', 'no-wait', 'json'].includes(k)) { o[k] = true; continue; }
+    if (['allow-overlap', 'system', 'detach', 'remove-worktree', 'no-wait', 'json', 'purge'].includes(k)) { o[k] = true; continue; }
     const v = args[++i];
     if (k === 'witness' || k === 'witness-path' || k === 'var') (o[k] ||= []).push(v); else o[k] = v;
   }
@@ -289,6 +289,11 @@ async function authorityCmd(args) {
     const r = initRoot({ root: path.resolve(dir), seed: top, clientRepo: id, mode: 'user' });
     safeGit(top, ['config', 'g4a.authority', path.resolve(dir)]);
     return out({ ...r, note: 'same-user authority: the agent uid can still edit it; violations are DETECTED (audit/verify), not prevented. Use --system to prevent.' });
+  }
+  if (sub === 'uninstall' && args.includes('--system')) {
+    const flag = args.includes('--purge') ? ['--purge'] : ['--uninstall', o['repo-id'] || A.repoId(o.repo)];
+    const r = spawnSync('sudo', ['-n', process.execPath, '--no-warnings', path.join(PKG, 'src', 'system-install.mjs'), ...flag], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'inherit'] });
+    try { return out(JSON.parse(r.stdout.trim().split('\n').pop())); } catch { return out({ ok: false, error: `uninstall failed (exit ${r.status})` }); }
   }
   const loc = C.locate(o.repo);
   if (!loc) { out({ ok: false, error: 'no authority for this repo (g4a authority init --system)' }); return; }

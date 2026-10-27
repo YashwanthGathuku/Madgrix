@@ -256,10 +256,13 @@ Claims and releases are mirrored. The authority claims first, and a claim is ref
   A permitted push succeeds.
 - `e2e/run-e2e.sh` runs the real CLI with several agents: an overlap that goes to REVIEW, a disjoint change that is promoted, a refused overlapping claim, and verify plus audit, in both same-user and system mode. It finishes with the system separation test.
 
+- `test/override.test.mjs` checks that, with an authority attached, the shim honors `G4A_RAW` in an agent context only for an override signed by the authority's `pub/operator.pub.hex`. The test covers a valid override, tampered vars and expiry, the wrong key, an expired override, another repo, another var, a correctly signed key-dir override (ignored), and a garbage file or missing pub key.
+- `test/identity.test.mjs` and the system test cover uid binding. A second non-sudo user `g4a-agent2` is refused for claim, permit, land and release on `g4a-agent`'s name, and cannot push with its permit.
+
 ### Phase 2 limits
 - **Separation is only as strong as the agent's own privileges.** On a box where the agent user has `sudo ALL` (this dev box), it can become root or `g4a-authority` anyway. Prevention holds against a non-sudo agent uid, and that is what the system test checks.
 - **Same-user mode is detect-only by design.**
-- **Agent names are not bound to OS users.** Any local user may call the wrappers and claim or permit any agent name. The authority enforces scope and ladder rules, not identity.
+- **Agent names are bound to OS uids, not to processes.** In system mode the wrappers pass the sudo-provided `SUDO_UID`, which the caller cannot forge. The first claim binds the name to that uid in `state/agents.json`. Another uid is then refused for claim, permit, land and release (`agent_identity`), and pre-receive rejects a permit pushed by a uid other than the one it was issued to. Root may act for any name. Two agents running as the same uid can still act as each other, so give each agent its own OS user. Bindings outlive release; there is no command to rebind a name. In same-user mode everything is one uid, so the binding adds nothing there.
 - **Witnesses run as `g4a-authority`** inside bwrap, with the authority keys, state and nonces dirs hidden. They see the authority's repo checkout.
-- **Re-running `init --system`** on an already-initialised repo keeps the existing root and its state. Uninstalling is manual: remove the user, `/var/lib/g4a-authority*`, `/usr/local/lib/g4a`, `/etc/sudoers.d/g4a-authority` and `/etc/g4a`.
+- **Re-running `init --system`** on an already-initialised repo keeps the existing root and its state. `g4a authority uninstall --system [--repo R | --repo-id GITDIR]` removes one repo's root, pub dir and map entry. When no mapped repo remains, it also removes the code copy, sudoers rule, `/etc/g4a` and the `g4a-authority` user. `--purge` removes everything. The system test and the e2e uninstall their own repo, and the system test deletes the agent users it created. `npm test` runs with a private TMPDIR that is removed afterwards.
 - **Everything is local.** No Cloudflare and no network authority. A remote host would be the next step.

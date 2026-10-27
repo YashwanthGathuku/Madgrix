@@ -18,19 +18,25 @@ const WRAP = '/usr/local/lib/g4a/bin';
 const b64 = (o) => Buffer.from(JSON.stringify(o)).toString('base64');
 
 test('system authority: agent user is prevented from bypassing the authority', { skip: !canSudo && 'needs passwordless sudo' }, () => {
-  if (sh('id g4a-agent').status !== 0) assert.equal(sh('sudo -n useradd --system --create-home --shell /bin/bash g4a-agent').status, 0);
+  const created = [];
+  for (const u of ['g4a-agent', 'g4a-agent2']) if (sh(`id ${u}`).status !== 0) { assert.equal(sh(`sudo -n useradd --system --create-home --shell /bin/bash ${u}`).status, 0); created.push(u); }
+  let repoIdStr = null;
+  const env0 = { ...process.env };
+  try {
   assert.notEqual(sh('sudo -n -l -U g4a-agent').stdout.match(/\(ALL\)/), true, 'g4a-agent must not have general sudo');
   const dir = fs.mkdtempSync('/tmp/g4a-sys-');
   fs.chmodSync(dir, 0o755);
   const repo = path.join(dir, 'repo');
   const g = `git -c user.name=t -c user.email=t@t`;
   assert.equal(sh(`mkdir ${repo} && cd ${repo} && git init -q -b main && echo a > a.txt && echo b > b.txt && ${g} add -A && ${g} commit -qm base && git checkout -q --detach`).status, 0);
+  repoIdStr = fs.realpathSync(path.join(repo, '.git'));
   const env = { ...process.env, G4A_HOME: path.join(dir, 'home'), G4A_KEY_DIR: path.join(dir, 'keys') };
   const init = spawnSync(process.execPath, ['--no-warnings', CLI, 'authority', 'init', '--system', '--repo', repo], { encoding: 'utf8', env });
   assert.equal(init.status, 0, init.stderr);
   const info = JSON.parse(init.stdout);
   const arepo = `${info.root}/repo`;
-  const call = (cmd, p) => JSON.parse(asAgent(`sudo -n -u g4a-authority ${WRAP}/g4a-authority ${info.id} ${cmd} ${b64(p)}`).stdout);
+  const callAs = (u, cmd, p) => JSON.parse(spawnSync('sudo', ['-n', '-u', u, '-H', 'sudo', '-n', '-u', 'g4a-authority', `${WRAP}/g4a-authority`, info.id, cmd, b64(p)], { encoding: 'utf8', cwd: '/tmp' }).stdout);
+  const call = (cmd, p) => callAs('g4a-agent', cmd, p);
 
   // 1. direct ref write on the authority repo: prevented by file permissions
   const ur = asAgent(`git --git-dir=${arepo} update-ref refs/heads/main HEAD~0 2>&1; echo rc=$?`);
@@ -72,8 +78,30 @@ test('system authority: agent user is prevented from bypassing the authority', {
   assert.match(asAgent(`cd ${clone} && echo z >> b.txt && ${g} commit -qam z && git push -o permit=${p2.permit} ${RP} ${arepo} HEAD:refs/heads/agents/s1 2>&1; echo rc=$?`).stdout, /rc=(?!0)\d+/, 'out-of-claim path must be refused');
   // the anchor remote via the agent wrapper only accepts refs/g4a/client-ledger, append-only
   assert.match(asAgent(`cd ${clone} && git push ${RP} ${info.root}/anchors.git HEAD:refs/g4a/authority-ledger 2>&1; echo rc=$?`).stdout, /rc=(?!0)\d+/);
+  // agent identity: s1 is bound to g4a-agent's uid; g4a-agent2 cannot claim, permit, land or release as s1
+  for (const c of ['claim', 'permit', 'land', 'release']) {
+    const r = callAs('g4a-agent2', c, { agent: 's1', paths: ['b.txt'] });
+    assert.equal(r.ok, false, `${c}: ${JSON.stringify(r)}`); assert.equal(r.reason, 'agent_identity');
+  }
+  // a permit issued to g4a-agent is useless when pushed by g4a-agent2
+  const p3 = call('permit', { agent: 's1' });
+  sh(`sudo -n -u g4a-agent2 -H git config --global safe.directory '*'`);
+  const clone2 = `/home/g4a-agent2/c-${path.basename(dir)}`;
+  const steal = spawnSync('sudo', ['-n', '-u', 'g4a-agent2', '-H', 'bash', '-c', `cd /tmp; git clone -q ${repo} ${clone2} && cd ${clone2} && echo s >> a.txt && ${g} commit -qam s && git push -o permit=${p3.permit} ${RP} ${arepo} +HEAD:refs/heads/agents/s1 2>&1; echo rc=$?`], { encoding: 'utf8' });
+  assert.match(steal.stdout, /issued to uid[\s\S]*rc=(?!0)\d+/, steal.stdout);
+  // g4a-agent2 can still use its own name
+  assert.equal(callAs('g4a-agent2', 'claim', { agent: 's2', paths: ['b.txt'] }).ok, true);
+  assert.equal(callAs('g4a-agent2', 'release', { agent: 's2' }).ok, true);
   const audit = call('audit', {});
   assert.equal(audit.ok, true, JSON.stringify(audit));
   call('release', { agent: 's1' });
-  sh(`sudo -n rm -rf ${clone}`); fs.rmSync(dir, { recursive: true, force: true });
+  sh(`sudo -n rm -rf ${clone} ${clone2}`); fs.rmSync(dir, { recursive: true, force: true });
+  } finally {
+    // self-clean: drop this repo's authority (and the whole install if no other repo uses it), and test users
+    if (repoIdStr) {
+      const u = spawnSync(process.execPath, ['--no-warnings', CLI, 'authority', 'uninstall', '--system', '--repo-id', repoIdStr], { encoding: 'utf8', env: env0 });
+      assert.match(u.stdout, /"ok":\s*true/, u.stdout + u.stderr);
+    }
+    for (const u of created) sh(`sudo -n userdel -r ${u} 2>/dev/null`);
+  }
 });

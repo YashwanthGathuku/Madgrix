@@ -43,6 +43,9 @@ export function install({ repoId, seedRepo, mergiraf }) {
     'g4a-authority': `#!/bin/sh
 # root-owned: run one authority service command for repo <id> as ${USER}
 set -eu
+# caller identity: sudo sets SUDO_UID itself (env_reset drops any caller-supplied value)
+caller="\${SUDO_UID:-\$(id -u)}"
+case "$caller" in *[!0-9]*|'') echo "g4a: bad caller uid" >&2; exit 2;; esac
 id="$1"; cmd="$2"; arg="\${3:-}"
 case "$id" in *[!0-9a-f]*|'') echo '{"ok":false,"error":"bad id"}'; exit 2;; esac
 [ \${#id} -eq 16 ] || { echo '{"ok":false,"error":"bad id"}'; exit 2; }
@@ -50,15 +53,18 @@ case "$cmd" in claim|permit|land|release|status|ledger|audit|pubinfo|operator-in
   init-root) [ -z "\${SUDO_USER:-}" ] || { echo '{"ok":false,"error":"init-root is root-only"}'; exit 2; } ;;
   *) echo '{"ok":false,"error":"bad command"}'; exit 2;; esac
 case "$arg" in *[!A-Za-z0-9+/=]*) echo '{"ok":false,"error":"bad arg"}'; exit 2;; esac
-exec ${ENV} ${BIN}/node --no-warnings ${LIB}/packages/g4a/src/authority-service.mjs --root ${REPOS}/"$id" --pub ${PUB}/"$id" "$cmd" $arg
+exec ${ENV} G4A_CALLER_UID="$caller" ${BIN}/node --no-warnings ${LIB}/packages/g4a/src/authority-service.mjs --root ${REPOS}/"$id" --pub ${PUB}/"$id" "$cmd" $arg
 `,
     'g4a-receive-pack': `#!/bin/sh
 # root-owned: git-receive-pack into an authority repo or its append-only anchor remote
 set -eu
+# caller identity: sudo sets SUDO_UID itself (env_reset drops any caller-supplied value)
+caller="\${SUDO_UID:-\$(id -u)}"
+case "$caller" in *[!0-9]*|'') echo "g4a: bad caller uid" >&2; exit 2;; esac
 p="$1"
 case "$p" in ${REPOS}/????????????????/repo|${REPOS}/????????????????/anchors.git) ;; *) echo "g4a: refused path" >&2; exit 2;; esac
 case "$p" in *..*) exit 2;; esac
-exec ${ENV} G4A_VIA=agent git receive-pack "$p"
+exec ${ENV} G4A_CALLER_UID="$caller" G4A_VIA=agent git receive-pack "$p"
 `,
     'g4a-upload-pack': `#!/bin/sh
 set -eu
@@ -94,7 +100,32 @@ exec ${ENV} git upload-pack "$p"
   return { ok: true, mode: 'system', user: USER, id, root: `${REPOS}/${id}`, pub: `${PUB}/${id}`, seed: res.seed, sudoers: SUDOERS, map: MAP };
 }
 
+// Remove one repo's authority (root dir, pub dir, map entry). When no mapped repo remains (or
+// purge), also remove the code copy, wrappers, sudoers rule, /etc/g4a and the g4a-authority user.
+export function uninstall({ repoId, purge = false }) {
+  if (process.getuid() !== 0) throw new Error('system uninstall must run as root');
+  let map = {}; try { map = JSON.parse(fs.readFileSync(MAP, 'utf8')); } catch {}
+  const removed = [];
+  const ids = purge ? Object.keys(map) : [repoId];
+  for (const r of ids) {
+    const e = map[r]; if (!e) continue;
+    if (!/^[0-9a-f]{16}$/.test(e.id)) throw new Error('corrupt map entry');
+    fs.rmSync(`${REPOS}/${e.id}`, { recursive: true, force: true }); fs.rmSync(`${PUB}/${e.id}`, { recursive: true, force: true });
+    delete map[r]; removed.push(r);
+  }
+  const left = Object.keys(map).length;
+  if (left) { fs.writeFileSync(`${MAP}.tmp`, JSON.stringify(map, null, 2) + '\n', { mode: 0o644 }); fs.renameSync(`${MAP}.tmp`, MAP); return { ok: true, removed, remaining: left }; }
+  for (const f of [SUDOERS, LIB, path.dirname(MAP), HOME, PUB]) fs.rmSync(f, { recursive: true, force: true });
+  if (spawnSync('id', ['-u', USER]).status === 0) spawnSync('userdel', [USER]);
+  return { ok: true, removed, remaining: 0, purged: true };
+}
+
 if (process.argv[1] && fs.realpathSync(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  if (process.argv[2] === '--uninstall' || process.argv[2] === '--purge') {
+    try { process.stdout.write(JSON.stringify(uninstall({ repoId: process.argv[3], purge: process.argv[2] === '--purge' })) + '\n'); }
+    catch (e) { process.stdout.write(JSON.stringify({ ok: false, error: e.message }) + '\n'); process.exitCode = 1; }
+    process.exit();
+  }
   const [repoId, seedRepo, mergiraf] = process.argv.slice(2);
   try { process.stdout.write(JSON.stringify(install({ repoId, seedRepo, mergiraf: mergiraf || which('mergiraf') })) + '\n'); }
   catch (e) { process.stdout.write(JSON.stringify({ ok: false, error: e.message }) + '\n'); process.exitCode = 1; }

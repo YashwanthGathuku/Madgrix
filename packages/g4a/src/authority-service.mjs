@@ -85,6 +85,17 @@ function withLock(L, fn) {
   const release = () => fs.rmSync(lock, { recursive: true, force: true });
   return Promise.resolve().then(fn).finally(release);
 }
+export const callerUid = () => { const v = process.env.G4A_CALLER_UID; return /^[0-9]+$/.test(v ?? '') ? Number(v) : process.getuid(); };
+// state/agents.json: { "<agent>": <uid> }. Bound on first claim; root (uid 0) may act for any agent.
+export function bindAgent(L, agent, uid, mayBind) {
+  if (!/^[A-Za-z0-9._-]{1,64}$/.test(String(agent ?? ''))) return { ok: false, error: 'bad agent name' };
+  const f = path.join(L.state, 'agents.json');
+  let m = {}; try { m = JSON.parse(fs.readFileSync(f, 'utf8')); } catch {}
+  if (agent in m) return m[agent] === uid || uid === 0 ? { ok: true } : { ok: false, error: `agent ${agent} is bound to uid ${m[agent]}, caller is uid ${uid}` };
+  if (!mayBind) return { ok: false, error: `agent ${agent} has no identity binding (claim first)` };
+  m[agent] = uid; fs.writeFileSync(f + '.tmp', JSON.stringify(m, null, 2), { mode: 0o600 }); fs.renameSync(f + '.tmp', f);
+  return { ok: true, bound: true };
+}
 const claimRow = (auth, repo, agent) => { const r = auth.db.prepare("SELECT * FROM claims WHERE repo = ? AND agent = ? AND status = 'active'").get(repo, agent); return r && rowClaim(r); };
 const strip = ({ secret_sha256, secretFile, ...c }) => c;
 
@@ -137,6 +148,12 @@ export async function run(L, cmd, p = {}) {
     const auth = new Authority(L.state, { keyDir: L.keys, anchorRemote: { url: L.anchors, ref: AUTH_ANCHOR_REF } });
     const repo = repoId(L.repo);
     try {
+      // Agent identity: an agent name is bound to the OS uid that first claimed it (system mode:
+      // the uid sudo reports via the wrapper; same-user mode: always the one uid, so detect-only).
+      if (['claim', 'permit', 'land', 'release'].includes(cmd)) {
+        const id = bindAgent(L, p.agent, callerUid(), cmd === 'claim');
+        if (!id.ok) return { ok: false, status: 'refused', reason: 'agent_identity', error: id.error };
+      }
       switch (cmd) {
         case 'claim': {
           const r = await auth.claim({ repo: L.repo, agent: p.agent, paths: p.paths, witnesses: p.witnesses ?? [], witnessPaths: p.witnessPaths ?? [], allowOverlap: !!p.allowOverlap, packageScripts: true });
@@ -146,7 +163,7 @@ export async function run(L, cmd, p = {}) {
         case 'permit': {
           const c = claimRow(auth, repo, p.agent);
           if (!c) return { ok: false, error: `no active authority claim for ${p.agent}` };
-          return { ok: true, claim: c.id, permit: signPermit(L, { kind: 'agent', agent: c.agent, claim: c.id, ref: `refs/heads/agents/${c.agent}`, paths: c.paths, baseline: c.baseline }) };
+          return { ok: true, claim: c.id, permit: signPermit(L, { kind: 'agent', uid: callerUid(), agent: c.agent, claim: c.id, ref: `refs/heads/agents/${c.agent}`, paths: c.paths, baseline: c.baseline }) };
         }
         case 'land': {
           const c = claimRow(auth, repo, p.agent);

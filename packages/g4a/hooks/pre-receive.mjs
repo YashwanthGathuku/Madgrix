@@ -30,6 +30,8 @@ try { okSig = !!permit && verify(null, Buffer.from(canonicalJson(permit)), key, 
 if (!okSig) die('permit signature invalid');
 if (permit.version !== 'g4a-permit/v1' || permit.kind !== 'agent' || !/^[0-9a-f]{32}$/.test(permit.nonce || '')) die('permit malformed');
 if (!(Date.parse(permit.exp) > Date.now())) die('permit expired');
+const caller = /^[0-9]+$/.test(process.env.G4A_CALLER_UID ?? '') ? Number(process.env.G4A_CALLER_UID) : process.getuid();
+if (permit.uid !== caller && caller !== 0) die(`permit was issued to uid ${permit.uid}, pusher is uid ${caller}`);
 if (updates.length !== 1) die('exactly one ref update per permit');
 const u = updates[0];
 if (u.new === ZERO) die('ref deletes are not allowed');

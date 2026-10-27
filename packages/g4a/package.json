@@ -6,7 +6,7 @@
   "type": "module",
   "bin": { "g4a": "bin/g4a.mjs" },
   "scripts": {
-    "test": "node --test test/*.test.mjs",
+    "test": "T=$(mktemp -d /tmp/g4at.XXXXXX) && TMPDIR=$T node --test test/*.test.mjs; r=$?; rm -rf \"$T\" 2>/dev/null; exit $r",
     "bench": "node bench/run.mjs"
   },
   "license": "MIT"

@@ -12,7 +12,13 @@ unset G4A_LOCAL_LAND
 g4a() { node --no-warnings "$CLI" "$@" || true; } # judge by JSON fields, not exit codes
 field() { node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const o=JSON.parse(s);console.log(process.argv[1].split(".").reduce((a,k)=>a?.[k],o))})' "$1"; }
 fail() { echo "E2E FAIL: $*" >&2; exit 1; }
-cleanup() { g4a stop >/dev/null 2>&1 || true; rm -rf "$W"; }
+RBID=""
+cleanup() {
+  g4a stop >/dev/null 2>&1 || true
+  # self-clean the system authority for this run's repo (removes the whole install if no other repo uses it)
+  [ -n "$RBID" ] && g4a authority uninstall --system --repo-id "$RBID" >/dev/null 2>&1 || true
+  rm -rf "$W"
+}
 trap cleanup EXIT
 
 mkrepo() {
@@ -47,6 +53,7 @@ echo "A ok: 2 promoted, 1 review, 1 overlapping claim refused, verify+audit ok"
 if sudo -n true 2>/dev/null; then
   echo "== B: system authority (g4a-authority OS user) =="
   mkrepo "$W/rb"
+  RBID=$(cd "$W/rb" && git rev-parse --path-format=absolute --git-common-dir | xargs realpath)
   g4a authority init --system --repo "$W/rb" | field mode | grep -qx system || fail "init --system"
   g4a claim --repo "$W/rb" --agent s1 --paths add.js --witness 'npm test' | field ok | grep -qx true || fail "claim s1"
   g4a claim --repo "$W/rb" --agent s2 --paths b.txt --witness 'npm test' | field ok | grep -qx true || fail "claim s2"
