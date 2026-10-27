@@ -200,20 +200,66 @@ and lets the command run (fail open).
 - There is one daemon per user, and jobs run serially. `node:sqlite` is experimental in Node 22, so the
   CLI runs it with `--no-warnings`.
 
-## Phase 2: local authority repo (no Cloudflare)
+## Phase 2: local authority (no Cloudflare)
 
-`g4a authority init DIR [--repo SEED]` creates a bare authority repo. It seeds `main` from SEED, pins the daemon's permit public key at `DIR/g4a/permit.pub.hex`, and installs a node pre-receive hook through `core.hooksPath`. It also sets `receive.denyDeletes` and `receive.denyNonFastForwards`. `g4a authority audit DIR` checks each ref against the log of updates the hook accepted.
+`g4a promote` goes through an authority by default. With no authority attached, promote is refused (`no_authority`). The old direct local landing path only runs when `G4A_LOCAL_LAND=1`, which only the Phase 0/1 test files set.
 
-The hook accepts exactly one ref update per push, and only when that push carries `-o permit=<b64>`, a permit signed by the daemon's key (`permit-ed25519.pem` in the key dir). It handles two kinds of permit:
-- **agent permit** for `refs/heads/agents/<agent>`. The pushed commit must descend from the claim baseline, every changed path must match the claim globs, and the claim must not be revoked (`g4a/revoked.json`).
-- **main permit** for `refs/heads/main`. The update must match the exact old and new values.
+### Two modes
+- `g4a authority init --system [--repo R]` (enforced). It runs `src/system-install.mjs` as root (`sudo -n`), which:
+  - creates the `g4a-authority` system user, with `/var/lib/g4a-authority/repos/<id>` at 0700, holding the keys, state DB, nonces, hooks and repo;
+  - publishes public keys under `/var/lib/g4a-authority-pub/<id>`;
+  - copies the code, node, npm and mergiraf into the root-owned `/usr/local/lib/g4a`;
+  - adds the sudoers rule `/etc/sudoers.d/g4a-authority`. Any user may run only three wrappers as `g4a-authority`: `g4a-authority` (an allow-list of commands, a hex repo id and base64 params), `g4a-receive-pack` and `g4a-upload-pack`, all under `env -i`;
+  - maps the client repo to its authority in `/etc/g4a/authority.json`.
+- `g4a authority init DIR [--repo R]` (same-user fallback, **detect-only**). The authority has the same layout but is owned by your uid, so the agent uid can edit it. `authority audit` and `verify` detect the edit; nothing prevents it.
 
-Every permit carries a nonce that can be used once (an O_EXCL file in `g4a/nonces`) and an expiry. Forged, tampered, expired and replayed permits are refused, and so are deletes, other refs and pushes with no permit. Because the check runs on the receiving side, it applies whatever git binary the pusher uses: the shim, `/usr/bin/git`, or client `-c core.hooksPath=...`.
+### Promote flow
+`src/promote-authority.mjs` runs these steps:
+1. Get a one-time permit (Ed25519, 120 s, nonce) from the authority.
+2. Push the claim branch to `refs/heads/agents/<agent>` with `-o permit=`.
+3. Ask the authority to `land`. The authority runs the full ladder on its own copy: scope, frozen witness pins, combine, sandboxed witnesses with authority dirs hidden, signed ledger and anchors.
+4. Fast-forward local main to the authority's main (CAS, clean checkout only).
+5. Record a local `promote` entry that carries the authority's `authority_entry` {seq, entry_hash}.
 
-`landAgent` runs the ladder inside the authority: the same `combine` (fast-forward, merge-tree, mergiraf, then union) and the sandboxed `runWitnesses` used in Phase 1. It then lands main by pushing with a fresh main permit.
+Claims and releases are mirrored. The authority claims first, and a claim is refused if local main is out of sync with the authority.
+
+### What the authority enforces
+- **pre-receive:** exactly one update per push, `agents/<agent>` only, never main, no deletes. The permit must carry a valid signature, be unexpired and not replayed, and belong to an active authority claim. The pushed commit must descend from the baseline and stay inside the claim paths.
+- **post-receive:** writes `accepted.jsonl` only after git has applied the update, so a rejected update leaves no line and audit reports no false mismatches.
+- **The anchor remote `anchors.git`** accepts only `refs/g4a/*` and is append-only: no deletes, no non-fast-forward. Through the agent wrapper, only `refs/g4a/client-ledger` is writable.
+- **The client's local ledger anchors** to that client ref, and the authority anchors its own ledger to `refs/g4a/authority-ledger`.
+- **`g4a verify`** also checks the following, so edits to the local DB or local main are detected against the authority:
+  - the authority bundle, pinned to the published witness key;
+  - the authority anchors;
+  - local main against authority main;
+  - every local promote's `authority_entry`.
+- **Operator key:** created authority-side by `g4a operator init`, encrypted with a passphrase of at least 10 characters. Both that command and `g4a override` read the passphrase from `/dev/tty` (they fail with no controlling terminal; piping it into stdin does not work). Signed overrides are published under `pub/overrides/`, and the shim checks them against `pub/operator.pub.hex`.
+- **Witness paths are auto-derived.** The derivation splits `&&`, `;` and `|` chains, follows `npm|yarn|pnpm [run] X` package scripts (and adds `package.json`), maps directory operands to `dir/**`, keeps globs, and adds the existing `test/**` or `tests/**` for a bare `node --test`.
+
+### Tests and e2e
+- `test/phase2.test.mjs` covers the same-user authority:
+  - refusals: no authority, no permit, a forged permit, a replay, out-of-claim paths, a push to main, a delete;
+  - the anchor is append-only;
+  - an overlap goes to REVIEW;
+  - verify and audit agree, and local main and DB edits are detected;
+  - witness-path derivation;
+  - the guard that stops tests writing to the real key dir;
+  - operator and override through a pty, plus the no-tty refusal.
+- `test/system.test.mjs` needs passwordless sudo. It creates a non-sudo `g4a-agent` user and shows these attempts **fail**:
+  - `update-ref` on the authority repo;
+  - `--receive-pack` overrides (raw, and via sudo);
+  - reading the keys, directly or via sudo;
+  - argument injection into the wrappers;
+  - unpermitted, replayed or out-of-scope pushes;
+  - writing the authority anchor ref.
+
+  A permitted push succeeds.
+- `e2e/run-e2e.sh` runs the real CLI with several agents: an overlap that goes to REVIEW, a disjoint change that is promoted, a refused overlapping claim, and verify plus audit, in both same-user and system mode. It finishes with the system separation test.
 
 ### Phase 2 limits
-- **Bypasses are only detected.** A process with the same uid can write the bare repo's refs and objects directly, or run `git push --receive-pack='git -c core.hooksPath=/dev/null receive-pack'`. Both skip the hook. `authority audit` detects them; nothing prevents them. Prevention needs the authority under another uid or host, for example with an ssh forced command.
-- **The permit key is readable.** It lives in the same key dir, so a process with the same uid can read it and mint permits.
-- **The accepted log is written early.** The hook writes it in pre-receive, so an update git rejects later (rare, for example a lock race) still leaves a log line. When that happens, audit reports a mismatch.
-- **Partial daemon wiring.** `landAgent` is a library and test entry point. The Phase 1 daemon's `promote` still lands into the local repo. It does not yet route through the authority, and witness pinning and the ledger are not applied on the authority path.
+- **Separation is only as strong as the agent's own privileges.** On a box where the agent user has `sudo ALL` (this dev box), it can become root or `g4a-authority` anyway. Prevention holds against a non-sudo agent uid, and that is what the system test checks.
+- **Same-user mode is detect-only by design.**
+- **Agent names are not bound to OS users.** Any local user may call the wrappers and claim or permit any agent name. The authority enforces scope and ladder rules, not identity.
+- **Witnesses run as `g4a-authority`** inside bwrap, with the authority keys, state and nonces dirs hidden. They see the authority's repo checkout.
+- **Re-running `init --system`** on an already-initialised repo keeps the existing root and its state. Uninstalling is manual: remove the user, `/var/lib/g4a-authority*`, `/usr/local/lib/g4a`, `/etc/sudoers.d/g4a-authority` and `/etc/g4a`.
+- **Everything is local.** No Cloudflare and no network authority. A remote host would be the next step.

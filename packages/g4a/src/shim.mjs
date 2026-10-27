@@ -47,8 +47,15 @@ if (marker) {
   if (asked.length) {
     const repo = repoCommonDir(process.cwd());
     const kd = keyDir();
+    // phase 2: with an authority, only overrides signed by the authority-side operator key count
+    let pubDir = null;
+    if (repo) {
+      try { pubDir = JSON.parse(fs.readFileSync(process.env.G4A_SYSTEM_MAP_TEST || '/etc/g4a/authority.json', 'utf8'))[repo]?.pub ?? null; } catch {}
+      if (!pubDir) { const c = spawnSync(REAL, ['config', '--get', 'g4a.authority'], { encoding: 'utf8', env: { PATH: process.env.PATH, HOME: process.env.HOME, GIT_CONFIG_GLOBAL: '/dev/null' } }); if (c.status === 0 && c.stdout.trim()) pubDir = path.join(path.resolve(c.stdout.trim()), 'pub'); }
+    }
+    const ovName = (await import('./override.mjs')).overrideName;
     for (const v of asked) {
-      const o = repo && validOverride(repo, v, kd);
+      const o = repo && (pubDir ? validOverride(repo, v, kd, Date.now(), { pubFile: path.join(pubDir, 'operator.pub.hex'), file: path.join(pubDir, 'overrides', ovName(repo)) }) : validOverride(repo, v, kd));
       honored[v] = !!o;
       if (!o) process.stderr.write(`[g4a] ignoring ${v} in an agent context (${marker}): no valid operator override for this repo\n`);
     }

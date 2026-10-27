@@ -77,8 +77,11 @@ const ZERO = '0'.repeat(40);
 const ANCHOR_ENV = { GIT_AUTHOR_NAME: 'g4a', GIT_AUTHOR_EMAIL: 'g4a@localhost', GIT_COMMITTER_NAME: 'g4a', GIT_COMMITTER_EMAIL: 'g4a@localhost', GIT_AUTHOR_DATE: '1970-01-01T00:00:00Z', GIT_COMMITTER_DATE: '1970-01-01T00:00:00Z' };
 
 export class Authority {
-  constructor(home, { keyDir: kd = keyDir() } = {}) {
+  // anchorRemote: { url, ref = ANCHOR_REF, receivePack?, uploadPack? }; defaults to G4A_ANCHOR_REMOTE.
+  // Phase 2 points it at the authority's append-only anchors.git (see authority-client.mjs).
+  constructor(home, { keyDir: kd = keyDir(), anchorRemote } = {}) {
     this.home = path.resolve(home);
+    this.anchorRemoteSpec = anchorRemote ?? null;
     this.keyDir = path.resolve(kd);
     if (within(this.keyDir, this.home) || within(this.home, this.keyDir)) throw new Error(`key dir ${this.keyDir} must not be inside or contain G4A_HOME ${this.home}`);
     this.db = openDb(home);
@@ -124,7 +127,8 @@ export class Authority {
   assertNotRolledBack(repo, { remote = false } = {}) {
     const head = this.db.prepare('SELECT seq, entry_hash FROM ledger WHERE repo = ? ORDER BY seq DESC LIMIT 1').get(repo);
     const at = (seq) => this.db.prepare('SELECT entry_hash FROM ledger WHERE repo = ? AND seq = ?').get(repo, seq)?.entry_hash;
-    const remoteA = remote && process.env.G4A_ANCHOR_REMOTE ? readRemoteAnchor(repo, process.env.G4A_ANCHOR_REMOTE)?.anchor : null;
+    const spec = this.anchorRemote(repo);
+    const remoteA = remote && spec ? readRemoteAnchor(repo, spec.url, spec)?.anchor : null;
     for (const a of [readRefAnchor(repo)?.anchor, readFileAnchor(this.anchorFile(repo))?.anchor, remoteA]) {
       if (!a) continue;
       if (!head || a.seq > head.seq) throw new Error(`ledger rollback detected for ${repo}: anchor at seq ${a.seq}, db head ${head ? head.seq : 'empty'}; refusing to write`);
@@ -156,10 +160,11 @@ export class Authority {
   // Optional external witness: push the anchor chain to a separate remote (G4A_ANCHOR_REMOTE).
   // A fast-forward-only remote on another host/uid keeps a copy a local same-uid attacker
   // cannot roll back. Failure is recorded, never fatal (the local anchors still apply).
+  anchorRemote(repo) { if (typeof this.anchorRemoteSpec === 'function') { const r = this.anchorRemoteSpec(repo); if (r) return r; } else if (this.anchorRemoteSpec) return this.anchorRemoteSpec; return (process.env.G4A_ANCHOR_REMOTE ? { url: process.env.G4A_ANCHOR_REMOTE } : null); }
   pushAnchorRemote(repo) {
-    const remote = process.env.G4A_ANCHOR_REMOTE;
-    if (!remote) return;
-    const r = safeGit(repo, [...ANCHOR_PROTO, 'push', '--quiet', remote, `${ANCHOR_REF}:${ANCHOR_REF}`], { allowFailure: true });
+    const spec = this.anchorRemote(repo);
+    if (!spec) return;
+    const r = safeGit(repo, [...ANCHOR_PROTO, 'push', '--quiet', ...(spec.receivePack ? [`--receive-pack=${spec.receivePack}`] : []), spec.url, `${ANCHOR_REF}:${spec.ref ?? ANCHOR_REF}`], { allowFailure: true });
     this.anchorRemoteError = r.status === 0 ? null : (r.stderr.trim().split('\n')[0] || `exit ${r.status}`);
   }
   reanchorAll() {
@@ -191,20 +196,58 @@ export class Authority {
   // ---- claims ----
   // Witness-referenced paths: explicit `witnessPaths` globs plus every token of a witness
   // command that names a file tracked on main (e.g. `node check.mjs` -> check.mjs).
+  // Auto-derived (phase 2): `npm|yarn|pnpm [run] test|X` follows package.json scripts on main
+  // (package.json itself is a witness path), `cmd1 && cmd2 ; cmd3` are split, tracked directory
+  // operands become `dir/**`, glob operands are kept, and `node --test` without file operands
+  // adds the default test dirs (test/**, tests/**) that exist on main.
   witnessPathsFor(top, witnesses, explicit = []) {
     const tracked = new Set(splitNul(safeGit(top, ['ls-tree', '-r', '--name-only', '-z', 'refs/heads/main']).stdout));
+    const dirs = new Set(); for (const f of tracked) { const parts = f.split('/'); for (let i = 1; i < parts.length; i++) dirs.add(parts.slice(0, i).join('/')); }
+    let scripts = null;
+    const pkgScripts = () => {
+      if (scripts) return scripts;
+      scripts = {};
+      if (tracked.has('package.json')) try { scripts = JSON.parse(safeGit(top, ['show', 'refs/heads/main:package.json']).stdout).scripts ?? {}; } catch {}
+      return scripts;
+    };
     const found = new Set(explicit);
-    // only files a witness EXECUTES (script operand of an interpreter, or the command itself);
-    // imports inside `node -e` code are the code under test, not the witness
-    for (const cmd of witnesses) {
-      const toks = cmd.trim().split(/\s+/);
-      const cands = [toks[0]];
-      for (let i = 0; i < toks.length; i++) if (/^(node|python3?|sh|bash|deno|bun|ruby|perl)$/.test(path.basename(toks[i]))) {
-        let j = i + 1; while (j < toks.length && toks[j].startsWith('-')) { if (/^-(e|c|-eval|p)$/.test(toks[j])) { j = toks.length; break; } j++; }
-        if (j < toks.length) cands.push(toks[j]);
+    const norm = (c) => c.replace(/^['"]|['"]$/g, '').replace(/^\.\//, '').replace(/\/$/, '');
+    const operand = (t) => {
+      if (!t) return false;
+      if (tracked.has(t)) { found.add(t); return true; }
+      if (dirs.has(t)) { found.add(`${t}/**`); return true; }
+      if (/[*?[]/.test(t)) { found.add(t); return true; }
+      return false;
+    };
+    const seen = new Set();
+    const walk = (cmd, depth) => {
+      if (depth > 6) return;
+      for (const part of cmd.split(/&&|\|\||;|\|/)) {
+        const toks = part.trim().split(/\s+/).filter(Boolean).filter((t) => !/^[A-Za-z_][A-Za-z0-9_]*=/.test(t));
+        if (!toks.length) continue;
+        const pm = path.basename(toks[0]);
+        if (/^(npm|yarn|pnpm)$/.test(pm)) {
+          let i = 1; while (toks[i]?.startsWith('-')) i++;
+          let name = toks[i]; if (name === 'run' || name === 'run-script') { i++; while (toks[i]?.startsWith('-')) i++; name = toks[i]; }
+          if (name === 't') name = 'test';
+          const sc = name && pkgScripts()[name];
+          if (tracked.has('package.json')) found.add('package.json');
+          if (sc && !seen.has(name)) { seen.add(name); walk(sc, depth + 1); }
+          continue;
+        }
+        operand(norm(toks[0]));
+        for (let i = 0; i < toks.length; i++) if (/^(node|python3?|sh|bash|deno|bun|ruby|perl|tsx|ts-node)$/.test(path.basename(toks[i]))) {
+          let j = i + 1, isTest = false, code = false;
+          while (j < toks.length && toks[j].startsWith('-')) { if (/^-(e|c|-eval|p)$/.test(toks[j])) { code = true; break; } if (toks[j] === '--test') isTest = true; j++; }
+          if (code) break;
+          let any = false;
+          for (let k = j; k < toks.length && (isTest || k === j); k++) any = operand(norm(toks[k])) || any;
+          if (isTest && !any) for (const d of ['test', 'tests']) if (dirs.has(d)) found.add(`${d}/**`);
+          break;
+        }
       }
-      for (const c of cands) { const t = c.replace(/^['"]|['"]$/g, '').replace(/^\.\//, ''); if (tracked.has(t)) found.add(t); }
-    }
+    };
+    for (const cmd of witnesses) walk(cmd, 0);
     return [...found];
   }
   // paths protected for others: frozen intents' pins (any agent but `agent`) + active claims' witness paths
@@ -361,6 +404,12 @@ export async function verifyBundle(bundle, { pinnedPub, anchors = [], main } = {
     if (e.kind !== 'promote' && e.kind !== 'promote_intent') continue;
     if (e.payload.recovered && !e.payload.witness) { errors.push(`entry ${e.seq} promote without witness`); continue; }
     if (e.kind === 'promote') promotions++;
+    // Authority-mediated promotions carry no local witness report; the witness signature lives in
+    // the authority's ledger and is checked there (g4a verify cross-checks authority_entry).
+    if (e.kind === 'promote' && String(e.payload.via ?? '').startsWith('authority:')) {
+      if (!e.payload.authority_entry?.entry_hash) errors.push(`entry ${e.seq} authority promote without authority_entry`);
+      continue;
+    }
     const w = e.payload.witness;
     const ok = w && cryptoVerify(null, Buffer.from(canonicalJson(w.report)), pub, Buffer.from(w.signature, 'base64'));
     if (!ok) errors.push(`entry ${e.seq} witness signature invalid`);
@@ -404,12 +453,12 @@ export function readRefAnchorChain(repo) {
 }
 // Fetch the anchor chain head of an external anchor remote into a scratch bare repo (nothing
 // is written into `repo`). null when the remote has no anchor or is unreachable.
-export function readRemoteAnchor(repo, remote) {
+export function readRemoteAnchor(repo, remote, { ref = ANCHOR_REF, uploadPack } = {}) {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'g4a-anchor-'));
   try {
     safeGit(tmp, ['init', '--quiet', '--bare']);
     const url = /^[a-z][a-z0-9+.-]*:/i.test(remote) || remote.includes('@') ? remote : path.resolve(repo, remote);
-    if (safeGit(tmp, [...ANCHOR_PROTO, 'fetch', '--quiet', url, `${ANCHOR_REF}:${ANCHOR_REF}`], { allowFailure: true }).status !== 0) return null;
+    if (safeGit(tmp, [...ANCHOR_PROTO, 'fetch', '--quiet', ...(uploadPack ? [`--upload-pack=${uploadPack}`] : []), url, `${ref}:${ANCHOR_REF}`], { allowFailure: true }).status !== 0) return null;
     return readRefAnchor(tmp);
   } finally { fs.rmSync(tmp, { recursive: true, force: true }); }
 }
@@ -418,7 +467,7 @@ export function readFileAnchor(f) { try { return JSON.parse(fs.readFileSync(f, '
 // Collect anchors for offline verification of the ledger of `repo` (a git common dir).
 export function collectAnchors(repo, kd = keyDir(), { remote } = {}) {
   const out = [];
-  if (remote) { const ra = readRemoteAnchor(repo, remote); out.push(ra ? { source: `remote anchor ${remote}`, ...ra } : { source: `remote anchor ${remote}`, missing: true }); }
+  if (remote) { const sp = typeof remote === 'string' ? { url: remote } : remote; const ra = readRemoteAnchor(repo, sp.url, sp); const src = `remote anchor ${sp.url}${sp.ref ? ` ${sp.ref}` : ''}`; out.push(ra ? { source: src, ...ra } : { source: src, missing: true }); }
   const chain = fs.existsSync(repo) ? readRefAnchorChain(repo) : [];
   if (!chain.length) out.push({ source: `repo ${ANCHOR_REF}`, missing: true });
   let prev = Infinity;

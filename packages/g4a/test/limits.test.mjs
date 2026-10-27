@@ -1,5 +1,7 @@
 // Phase 1 remaining limits (Part A): witness-path pinning, anchor remote + passphrase key,
 // checked-out main, per-repo job queues. No network, no Cloudflare.
+// phase-1 fixtures exercise the test-only local landing path (production promotes via the authority)
+process.env.G4A_LOCAL_LAND = '1';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';

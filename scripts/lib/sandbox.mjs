@@ -106,6 +106,8 @@ export function runContained(opts) {
 			];
 			const home = os.homedir();
 			if (existsSync(path.join(home, ".madgrix"))) args.push("--tmpfs", path.join(home, ".madgrix"));
+			// opts.hidden: directories replaced by an empty tmpfs (e.g. an authority's keys/state)
+			for (const dir of opts.hidden ?? []) if (existsSync(dir)) args.push("--tmpfs", dir);
 			for (const dir of opts.writable) args.push("--bind", dir, dir);
 			for (const dir of opts.readOnly ?? []) args.push("--ro-bind", dir, dir);
 			args.push("--chdir", opts.cwd, "--", "bash", "-c", opts.command);

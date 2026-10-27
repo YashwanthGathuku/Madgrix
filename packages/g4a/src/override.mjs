@@ -25,6 +25,8 @@ export function operatorInit({ kd = keyDir(), passphrase } = {}) {
   return { ok: true, pub };
 }
 
+export function signOverride(override, key) { return { override, signature: sign(null, Buffer.from(canonicalJson(override)), key).toString('base64') }; }
+export const overrideName = (repo) => `${createHash('sha256').update(repo).digest('hex').slice(0, 32)}.json`;
 export function grantOverride({ repo, minutes, reason, vars = OPT_OUT_VARS, kd = keyDir(), passphrase }) {
   const pem = fs.readFileSync(opFile(kd), 'utf8');
   const key = createPrivateKey(pem.includes('ENCRYPTED') ? { key: pem, passphrase } : pem);
@@ -37,10 +39,12 @@ export function grantOverride({ repo, minutes, reason, vars = OPT_OUT_VARS, kd =
 }
 
 // null when there is no valid, unexpired, correctly signed override covering `v` for `repo`
-export function validOverride(repo, v, kd = keyDir(), now = Date.now()) {
+// Same-user fallback reads the key-dir files; when an authority is attached the shim passes the
+// authority's public dir (operator.pub.hex + overrides/), which agents cannot write in --system mode.
+export function validOverride(repo, v, kd = keyDir(), now = Date.now(), { pubFile = opPub(kd), file = overrideFile(repo, kd) } = {}) {
   try {
-    const { override, signature } = JSON.parse(fs.readFileSync(overrideFile(repo, kd), 'utf8'));
-    const pub = createPublicKey({ key: Buffer.from(fs.readFileSync(opPub(kd), 'utf8').trim(), 'hex'), format: 'der', type: 'spki' });
+    const { override, signature } = JSON.parse(fs.readFileSync(file, 'utf8'));
+    const pub = createPublicKey({ key: Buffer.from(fs.readFileSync(pubFile, 'utf8').trim(), 'hex'), format: 'der', type: 'spki' });
     if (!verify(null, Buffer.from(canonicalJson(override)), pub, Buffer.from(signature, 'base64'))) return null;
     if (override.repo !== repo || !override.vars.includes(v) || Date.parse(override.until) < now) return null;
     return override;

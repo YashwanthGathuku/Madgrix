@@ -11,6 +11,8 @@ export function g4aHome(env = process.env) {
 // Agent context = an agent env marker. Plain non-TTY alone (e.g. `git status | grep`)
 // is NOT treated as an agent unless G4A_NONTTY_IS_AGENT=1, to keep human scripts untouched.
 export function keyDir(env = process.env) {
+  // tests must never touch the real key dir: under `node --test` an explicit G4A_KEY_DIR is required
+  if (env.NODE_TEST_CONTEXT && !env.G4A_KEY_DIR) throw new Error('g4a: G4A_KEY_DIR must be set under node --test (refusing to use the real key dir)');
   return env.G4A_KEY_DIR || path.join(env.XDG_CONFIG_HOME || path.join(os.homedir(), '.config'), 'g4a-keys');
 }
 
