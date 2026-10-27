@@ -151,7 +151,7 @@ function opts(args) {
     const a = args[i];
     if (!a.startsWith('--')) { o._.push(a); continue; }
     const k = a.slice(2);
-    if (['allow-overlap', 'system', 'detach', 'remove-worktree', 'no-wait', 'json', 'purge'].includes(k)) { o[k] = true; continue; }
+    if (['allow-overlap', 'system', 'detach', 'remove-worktree', 'no-wait', 'json', 'purge', 'session-credential', 'credential-stdin'].includes(k)) { o[k] = true; continue; }
     const v = args[++i];
     if (k === 'witness' || k === 'witness-path' || k === 'var') (o[k] ||= []).push(v); else o[k] = v;
   }
@@ -174,11 +174,14 @@ async function daemon(args) {
   const d = await startDaemon();
   console.error(`g4a daemon pid ${process.pid} on ${d.sock}${d.requeued ? ` (requeued ${d.requeued} job(s))` : ''}`);
 }
+// per-agent authority credential: --credential-stdin, else G4A_AGENT_CREDENTIAL, else the daemon's
+// file store. Never taken from argv (ps-visible).
+const credArg = (o) => { const c = o['credential-stdin'] ? fs.readFileSync(0, 'utf8').trim() : process.env.G4A_AGENT_CREDENTIAL; return c ? { credential: c } : {}; };
 async function claimCmd(args) {
   const o = opts(args);
-  out(await (await client())('claim', { repo: o.repo, agent: o.agent, paths: (o.paths || '').split(',').filter(Boolean), witnesses: o.witness || [], witnessPaths: o['witness-path'] || [], allowOverlap: !!o['allow-overlap'] }));
+  out(await (await client())('claim', { repo: o.repo, agent: o.agent, paths: (o.paths || '').split(',').filter(Boolean), witnesses: o.witness || [], witnessPaths: o['witness-path'] || [], allowOverlap: !!o['allow-overlap'], ...credArg(o), ...(o['session-credential'] ? { credentialStore: 'session' } : {}) }));
 }
-async function releaseCmd(args) { const o = opts(args); out(await (await client())('release', { repo: o.repo, agent: o.agent, removeWorktree: !!o['remove-worktree'] })); }
+async function releaseCmd(args) { const o = opts(args); out(await (await client())('release', { repo: o.repo, agent: o.agent, removeWorktree: !!o['remove-worktree'], ...credArg(o) })); }
 async function statusCmd(args) { const o = opts(args); out(await (await client())('status', { repo: o.repo })); }
 async function promoteCmd(args) {
   const o = opts(args);
@@ -187,7 +190,7 @@ async function promoteCmd(args) {
   const c = st.claims.find((x) => x.agent === o.agent);
   if (!c) { out({ ok: false, error: `no active claim for ${o.agent}` }); return; }
   const secret = fs.readFileSync(path.join(home, 'secrets', c.id), 'utf8'); // never printed
-  out(await rpc('promote', { repo: o.repo, agent: o.agent, secret, wait: !o['no-wait'] }));
+  out(await rpc('promote', { repo: o.repo, agent: o.agent, secret, wait: !o['no-wait'], ...credArg(o) }));
 }
 async function ledgerCmd(args) {
   const o = opts(args);
@@ -295,10 +298,19 @@ async function authorityCmd(args) {
     const r = spawnSync('sudo', ['-n', process.execPath, '--no-warnings', path.join(PKG, 'src', 'system-install.mjs'), ...flag], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'inherit'] });
     try { return out(JSON.parse(r.stdout.trim().split('\n').pop())); } catch { return out({ ok: false, error: `uninstall failed (exit ${r.status})` }); }
   }
+  if (sub === 'rebind' || sub === 'unbind') await refuseAgent();
   const loc = C.locate(o.repo);
   if (!loc) { out({ ok: false, error: 'no authority for this repo (g4a authority init --system)' }); return; }
   if (['audit', 'status', 'ledger'].includes(sub)) return out(C.call(loc, sub));
-  console.error('usage: g4a authority init --system | init DIR | audit | status | ledger  [--repo R]'); process.exitCode = 2;
+  if (sub === 'rebind' || sub === 'unbind') {
+    // human-only: operator passphrase typed on /dev/tty, checked authority-side; logged with an operator signature
+    await refuseAgent();
+    if (!o.agent) { console.error('usage: g4a authority rebind --agent A [--uid N] [--credential-out FILE] | unbind --agent A'); process.exitCode = 2; return; }
+    const r = C.call(loc, sub, { agent: o.agent, ...(o.uid !== undefined ? { uid: Number(o.uid) } : {}) }, { interactive: true });
+    if (r.ok && r.credential && o['credential-out']) { fs.writeFileSync(o['credential-out'], r.credential, { mode: 0o600 }); delete r.credential; r.credential_file = path.resolve(o['credential-out']); }
+    return out(r);
+  }
+  console.error('usage: g4a authority init --system | init DIR | audit | status | ledger | rebind --agent A [--uid N] [--credential-out F] | unbind --agent A  [--repo R]'); process.exitCode = 2;
 }
 
 async function mcpCmd() { await (await import('../src/mcp.mjs')).serve(); }

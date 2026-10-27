@@ -67,8 +67,15 @@ test('system authority: agent user is prevented from bypassing the authority', {
   assert.notEqual(asAgent(`sudo -n -u g4a-authority ${WRAP}/g4a-receive-pack /etc`).status, 0);
 
   // a permitted, in-scope push through the wrapper succeeds; out-of-scope is refused
-  assert.equal(call('claim', { agent: 's1', paths: ['a.txt'] }).ok, true);
-  const p1 = call('permit', { agent: 's1' });
+  const c1 = call('claim', { agent: 's1', paths: ['a.txt'] });
+  assert.equal(c1.ok, true); assert.match(c1.agent_credential, /^[A-Za-z0-9_-]{43}$/);
+  const cred = c1.agent_credential;
+  // same uid, no / wrong credential: refused (another process of g4a-agent using the name)
+  for (const c of ['permit', 'land', 'release']) for (const bad of [undefined, 'x'.repeat(43)]) {
+    const r = call(c, { agent: 's1', ...(bad ? { credential: bad } : {}) });
+    assert.equal(r.reason, 'agent_identity', `${c}: ${JSON.stringify(r)}`);
+  }
+  const p1 = call('permit', { agent: 's1', credential: cred });
   assert.equal(p1.ok, true);
   const ok = asAgent(`cd ${clone} && git push -o permit=${p1.permit} ${RP} ${arepo} HEAD:refs/heads/agents/s1 2>&1; echo rc=$?`);
   assert.match(ok.stdout, /rc=0/, ok.stdout);
@@ -80,21 +87,22 @@ test('system authority: agent user is prevented from bypassing the authority', {
   assert.match(asAgent(`cd ${clone} && git push ${RP} ${info.root}/anchors.git HEAD:refs/g4a/authority-ledger 2>&1; echo rc=$?`).stdout, /rc=(?!0)\d+/);
   // agent identity: s1 is bound to g4a-agent's uid; g4a-agent2 cannot claim, permit, land or release as s1
   for (const c of ['claim', 'permit', 'land', 'release']) {
-    const r = callAs('g4a-agent2', c, { agent: 's1', paths: ['b.txt'] });
+    const r = callAs('g4a-agent2', c, { agent: 's1', paths: ['b.txt'], credential: cred });
     assert.equal(r.ok, false, `${c}: ${JSON.stringify(r)}`); assert.equal(r.reason, 'agent_identity');
   }
   // a permit issued to g4a-agent is useless when pushed by g4a-agent2
-  const p3 = call('permit', { agent: 's1' });
+  const p3 = call('permit', { agent: 's1', credential: cred });
   sh(`sudo -n -u g4a-agent2 -H git config --global safe.directory '*'`);
   const clone2 = `/home/g4a-agent2/c-${path.basename(dir)}`;
   const steal = spawnSync('sudo', ['-n', '-u', 'g4a-agent2', '-H', 'bash', '-c', `cd /tmp; git clone -q ${repo} ${clone2} && cd ${clone2} && echo s >> a.txt && ${g} commit -qam s && git push -o permit=${p3.permit} ${RP} ${arepo} +HEAD:refs/heads/agents/s1 2>&1; echo rc=$?`], { encoding: 'utf8' });
   assert.match(steal.stdout, /issued to uid[\s\S]*rc=(?!0)\d+/, steal.stdout);
   // g4a-agent2 can still use its own name
-  assert.equal(callAs('g4a-agent2', 'claim', { agent: 's2', paths: ['b.txt'] }).ok, true);
-  assert.equal(callAs('g4a-agent2', 'release', { agent: 's2' }).ok, true);
+  const c2 = callAs('g4a-agent2', 'claim', { agent: 's2', paths: ['b.txt'] });
+  assert.equal(c2.ok, true);
+  assert.equal(callAs('g4a-agent2', 'release', { agent: 's2', credential: c2.agent_credential }).ok, true);
   const audit = call('audit', {});
   assert.equal(audit.ok, true, JSON.stringify(audit));
-  call('release', { agent: 's1' });
+  assert.equal(call('release', { agent: 's1', credential: cred }).ok, true);
   sh(`sudo -n rm -rf ${clone} ${clone2}`); fs.rmSync(dir, { recursive: true, force: true });
   } finally {
     // self-clean: drop this repo's authority (and the whole install if no other repo uses it), and test users

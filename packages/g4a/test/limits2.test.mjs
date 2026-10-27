@@ -1,0 +1,106 @@
+// Limits pass: per-agent credentials (same-uid impersonation), out-of-band ref detection,
+// SQLite driver fallback, MCP progress/cancel. Every fixture lives under os.tmpdir() and is removed.
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { spawn, spawnSync, execFileSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+
+delete process.env.G4A_LOCAL_LAND;
+const PKG = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const CLI = path.join(PKG, 'bin', 'g4a.mjs');
+const ID = { GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@t', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@t' };
+const git = (cwd, ...a) => execFileSync('git', a, { cwd, encoding: 'utf8', env: { ...process.env, ...ID, G4A_RAW: '1' } }).trim();
+const tryGit = (cwd, ...a) => spawnSync('git', ['-c', 'protocol.file.allow=always', ...a], { cwd, encoding: 'utf8', env: { ...process.env, ...ID, G4A_RAW: '1' } });
+function mkRepo(files) {
+  const d = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'g4a-l2-repo-')));
+  git(d, 'init', '-q', '-b', 'main');
+  for (const [f, t] of Object.entries(files)) { fs.mkdirSync(path.dirname(path.join(d, f)), { recursive: true }); fs.writeFileSync(path.join(d, f), t); }
+  git(d, 'add', '-A'); git(d, 'commit', '-qm', 'base'); git(d, 'checkout', '-q', '--detach');
+  return d;
+}
+const mkHome = () => fs.mkdtempSync(path.join(os.tmpdir(), 'g4a-l2-home-'));
+const H = (home) => ({ G4A_HOME: home, G4A_KEY_DIR: `${home}-keys` });
+function cli(home, args, env = {}) {
+  const r = spawnSync(process.execPath, ['--no-warnings', CLI, ...args], { encoding: 'utf8', env: { ...process.env, ...H(home), ...env } });
+  let json = null; try { json = JSON.parse(r.stdout); } catch {}
+  return { ...r, json };
+}
+function startDaemon(home) {
+  const c = spawn(process.execPath, ['--no-warnings', CLI, 'daemon'], { env: { ...process.env, ...H(home) }, stdio: ['ignore', 'ignore', 'pipe'] });
+  let err = ''; c.stderr.on('data', (d) => { err += d; });
+  return new Promise((res, rej) => {
+    const t = setInterval(() => { if (err.includes('g4a daemon pid')) { clearInterval(t); res(c); } }, 20);
+    c.on('exit', (code) => { clearInterval(t); rej(new Error(`daemon exited ${code}: ${err}`)); });
+  });
+}
+const stop = (c) => new Promise((r) => { if (c.exitCode !== null || c.signalCode) return r(); c.once('exit', r); c.kill('SIGTERM'); });
+async function rpc(home, method, params) { const { rpc } = await import('../src/daemon.mjs'); return rpc(method, params, { home }); }
+function commitIn(wt, file, text) { fs.writeFileSync(path.join(wt, file), text); git(wt, 'add', file); git(wt, 'commit', '-qm', `edit ${file}`); }
+const wt = (repo, a) => path.join(repo, '.g4a', 'worktrees', a);
+function withAuthority(home, repo) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'g4a-l2-auth-'));
+  const r = cli(home, ['authority', 'init', path.join(root, 'a'), '--repo', repo]);
+  assert.equal(r.json?.ok, true, r.stdout + r.stderr);
+  return path.join(root, 'a');
+}
+const tmp = [];
+const cleanup = () => { for (const d of tmp.splice(0)) fs.rmSync(d, { recursive: true, force: true }); };
+const hasScript = spawnSync('script', ['--version']).status === 0;
+const q = (s) => `'${String(s).replace(/'/g, "'\\''")}'`;
+const ttyCli = (home, args, input, env = {}) => spawnSync('script', ['-qec', `${q(process.execPath)} --no-warnings ${q(CLI)} ${args.map(q).join(' ')}`, '/dev/null'], { input, encoding: 'utf8', env: { ...humanEnv(), ...H(home), ...env } });
+function humanEnv() { const e = { ...process.env, G4A_AGENT: '0' }; for (const k of Object.keys(e)) if (/^(CLAUDECODE|CODEX_|GEMINI_CLI|CURSOR_AGENT|G4A_AGENT_ID)/.test(k)) delete e[k]; return e; }
+
+test('limit 1: per-agent credential: a same-uid process that only knows the name cannot promote/release; operator rebind/unbind', { skip: !hasScript && 'needs util-linux script' }, async () => {
+  const home = mkHome(); const repo = mkRepo({ 'a.txt': 'a\n', 'b.txt': 'b\n' });
+  const root = withAuthority(home, repo); tmp.push(home, `${home}-keys`, repo, path.dirname(root));
+  const d = await startDaemon(home);
+  try {
+    // session store: the daemon keeps nothing; the claimant gets the credential once
+    const c = await rpc(home, 'claim', { repo, agent: 'a1', paths: ['a.txt'], witnesses: ['true'], credentialStore: 'session' });
+    assert.equal(c.ok, true, JSON.stringify(c)); assert.equal(c.credential_store, 'session');
+    const cred = c.agent_credential; assert.match(cred, /^[A-Za-z0-9_-]{43}$/);
+    assert.ok(!fs.existsSync(path.join(home, 'credentials')), 'session credential not written to disk');
+    assert.ok(!fs.readFileSync(path.join(root, 'state', 'agents.json'), 'utf8').includes(cred), 'authority stores only the hash');
+    commitIn(wt(repo, 'a1'), 'a.txt', 'x\n');
+    // impersonator: same uid, same G4A_HOME (can read the claim secret), knows the name, no credential
+    const imp = cli(home, ['promote', '--repo', repo, '--agent', 'a1']);
+    assert.equal(imp.json.ok, false, imp.stdout); assert.match(JSON.stringify(imp.json), /credential missing or wrong/);
+    const wrong = cli(home, ['promote', '--repo', repo, '--agent', 'a1'], { G4A_AGENT_CREDENTIAL: 'z'.repeat(43) });
+    assert.equal(wrong.json.ok, false);
+    assert.equal(cli(home, ['claim', '--repo', repo, '--agent', 'a1', '--paths', 'b.txt']).json.ok, false, 're-claim of a bound name needs the credential');
+    const relImp = cli(home, ['release', '--repo', repo, '--agent', 'a1']);
+    assert.equal(relImp.json.ok, false); assert.equal(relImp.json.reason, 'agent_identity', 'neither authority nor local claim released');
+    assert.equal((await rpc(home, 'status', { repo })).claims.some((x) => x.agent === 'a1'), true);
+    // the real agent: credential on stdin (never argv)
+    const okr = spawnSync(process.execPath, ['--no-warnings', CLI, 'promote', '--repo', repo, '--agent', 'a1', '--credential-stdin'], { input: cred, encoding: 'utf8', env: { ...process.env, ...H(home) } });
+    assert.equal(JSON.parse(okr.stdout || '{}').status, 'promoted', okr.stdout + okr.stderr);
+    assert.equal(cli(home, ['release', '--repo', repo, '--agent', 'a1', '--remove-worktree'], { G4A_AGENT_CREDENTIAL: cred }).json.authority.ok, true);
+    git(repo, 'branch', '-D', 'g4a/a1');
+    // default file store: written 0600 under G4A_HOME, used automatically
+    const f = await rpc(home, 'claim', { repo, agent: 'a2', paths: ['b.txt'] });
+    assert.equal(f.credential_store, 'file'); assert.equal(f.agent_credential, undefined);
+    const cdir = path.join(home, 'credentials'); const cf = path.join(cdir, fs.readdirSync(cdir)[0], 'a2');
+    assert.equal(fs.statSync(cf).mode & 0o777, 0o600);
+    assert.equal((await rpc(home, 'release', { repo, agent: 'a2' })).authority.ok, true);
+    // operator rebind / unbind: human-only, passphrase on /dev/tty, refused for agents
+    assert.match(ttyCli(home, ['operator', 'init', '--repo', repo], 'correct horse\ncorrect horse\n').stdout, /"ok": true/);
+    const ag = spawnSync(process.execPath, ['--no-warnings', CLI, 'authority', 'rebind', '--repo', repo, '--agent', 'a1'], { encoding: 'utf8', env: { ...process.env, ...H(home), G4A_AGENT: '1' } });
+    assert.notEqual(ag.status, 0); assert.match(ag.stdout + ag.stderr, /human-only/, `${ag.status} ${ag.signal} ${ag.stdout}${ag.stderr}`);
+    assert.match(ttyCli(home, ['authority', 'rebind', '--repo', repo, '--agent', 'a1'], 'wrong passphrase\n').stdout, /wrong passphrase/);
+    const out = path.join(home, 'a1.cred');
+    const rb = ttyCli(home, ['authority', 'rebind', '--repo', repo, '--agent', 'a1', '--credential-out', out], 'correct horse\n');
+    assert.match(rb.stdout, /"ok": true/, rb.stdout); assert.ok(!rb.stdout.includes(fs.readFileSync(out, 'utf8')), 'credential not printed');
+    const nc = fs.readFileSync(out, 'utf8');
+    assert.equal(cli(home, ['claim', '--repo', repo, '--agent', 'a1', '--paths', 'a.txt'], { G4A_AGENT_CREDENTIAL: cred }).json.ok, false, 'old credential revoked');
+    const c3 = cli(home, ['claim', '--repo', repo, '--agent', 'a1', '--paths', 'a.txt'], { G4A_AGENT_CREDENTIAL: nc });
+    assert.equal(c3.json?.ok, true, c3.stdout + c3.stderr);
+    assert.equal(cli(home, ['release', '--repo', repo, '--agent', 'a1'], { G4A_AGENT_CREDENTIAL: nc }).json.authority.ok, true);
+    assert.match(ttyCli(home, ['authority', 'unbind', '--repo', repo, '--agent', 'a1'], 'correct horse\n').stdout, /"removed": true/);
+    const log = fs.readFileSync(path.join(root, 'state', 'identity.jsonl'), 'utf8');
+    assert.match(log, /"event":"rebind"[^\n]*operator_sig/); assert.match(log, /"event":"unbind"[^\n]*operator_sig/);
+    assert.ok(!log.includes(cred) && !log.includes(nc));
+  } finally { await stop(d); cleanup(); }
+});

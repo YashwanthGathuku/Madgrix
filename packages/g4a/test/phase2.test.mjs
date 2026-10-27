@@ -131,13 +131,15 @@ test('items 3,5,6: pre-receive refuses unpermitted pushes, anchors are append-on
     assert.notEqual(push('-o', `permit=${fb}`, url, 'HEAD:refs/heads/agents/a1').status, 0, 'forged');
     const { call, locate } = await import('../src/authority-client.mjs');
     const loc = locate(repo);
-    const pm = call(loc, 'permit', { agent: 'a1' }).permit;
+    const cdir = path.join(home, 'credentials'); const credential = fs.readFileSync(path.join(cdir, fs.readdirSync(cdir)[0], 'a1'), 'utf8');
+    assert.equal(call(loc, 'permit', { agent: 'a1' }).reason, 'agent_identity', 'no credential: refused');
+    const pm = call(loc, 'permit', { agent: 'a1', credential }).permit;
     assert.equal(push('-o', `permit=${pm}`, url, 'HEAD:refs/heads/agents/a1').status, 0, 'permitted push');
     commitIn(w, 'a.txt', 'y\n');
     assert.notEqual(push('-o', `permit=${pm}`, url, 'HEAD:refs/heads/agents/a1').status, 0, 'replay');
     commitIn(w, 'b.txt', 'out of scope\n');
-    assert.notEqual(push('-o', `permit=${call(loc, 'permit', { agent: 'a1' }).permit}`, url, 'HEAD:refs/heads/agents/a1').status, 0, 'out-of-claim');
-    assert.notEqual(push('-o', `permit=${call(loc, 'permit', { agent: 'a1' }).permit}`, url, ':refs/heads/agents/a1').status, 0, 'delete');
+    assert.notEqual(push('-o', `permit=${call(loc, 'permit', { agent: 'a1', credential }).permit}`, url, 'HEAD:refs/heads/agents/a1').status, 0, 'out-of-claim');
+    assert.notEqual(push('-o', `permit=${call(loc, 'permit', { agent: 'a1', credential }).permit}`, url, ':refs/heads/agents/a1').status, 0, 'delete');
     assert.equal(accepted(root).length, 1, 'only the one permitted push is logged');
     // item 5: the anchor remote is append-only
     const anchors = path.join(root, 'anchors.git');

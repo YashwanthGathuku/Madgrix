@@ -11,7 +11,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { createPrivateKey, createPublicKey, generateKeyPairSync, randomBytes, sign, createHash } from 'node:crypto';
+import { createPrivateKey, createPublicKey, generateKeyPairSync, randomBytes, sign, createHash, timingSafeEqual } from 'node:crypto';
 import { safeGit } from '../../../scripts/lib/safe-git.mjs';
 import { canonicalJson } from '../../../src/lib/canonical.ts';
 import { Authority, rowClaim, bundleFromDb, repoId } from './authority.mjs';
@@ -87,14 +87,49 @@ function withLock(L, fn) {
 }
 export const callerUid = () => { const v = process.env.G4A_CALLER_UID; return /^[0-9]+$/.test(v ?? '') ? Number(v) : process.getuid(); };
 // state/agents.json: { "<agent>": <uid> }. Bound on first claim; root (uid 0) may act for any agent.
-export function bindAgent(L, agent, uid, mayBind) {
-  if (!/^[A-Za-z0-9._-]{1,64}$/.test(String(agent ?? ''))) return { ok: false, error: 'bad agent name' };
-  const f = path.join(L.state, 'agents.json');
-  let m = {}; try { m = JSON.parse(fs.readFileSync(f, 'utf8')); } catch {}
-  if (agent in m) return m[agent] === uid || uid === 0 ? { ok: true } : { ok: false, error: `agent ${agent} is bound to uid ${m[agent]}, caller is uid ${uid}` };
+// state/agents.json: { "<agent>": { uid, cred } }. cred = sha256 of a per-agent credential the
+// authority issues on the binding claim (returned ONCE, never stored in clear authority-side).
+// claim/permit/land/release need the caller uid to match AND the credential (root skips the uid
+// check only). Legacy bindings ({agent: uid} or cred null) get a credential on their next claim.
+const credHash = (c) => createHash('sha256').update(String(c)).digest();
+const agentsFile = (L) => path.join(L.state, 'agents.json');
+const readAgents = (L) => { try { return JSON.parse(fs.readFileSync(agentsFile(L), 'utf8')); } catch { return {}; } };
+const writeAgents = (L, m) => { fs.writeFileSync(agentsFile(L) + '.tmp', JSON.stringify(m, null, 2), { mode: 0o600 }); fs.renameSync(agentsFile(L) + '.tmp', agentsFile(L)); };
+// operator actions carry an Ed25519 signature by the operator key over the canonical record
+const identityLog = (L, e, key) => { const r = { ...e, at: new Date().toISOString() }; if (key) r.operator_sig = sign(null, Buffer.from(canonicalJson(r)), key).toString('hex'); fs.appendFileSync(path.join(L.state, 'identity.jsonl'), JSON.stringify(r) + '\n', { mode: 0o600 }); };
+export const AGENT_RE = /^[A-Za-z0-9._-]{1,64}$/;
+export function bindAgent(L, agent, uid, mayBind, credential) {
+  if (!AGENT_RE.test(String(agent ?? ''))) return { ok: false, error: 'bad agent name' };
+  const m = readAgents(L);
+  let e = m[agent];
+  if (typeof e === 'number') e = { uid: e, cred: null };
+  const issue = () => { const c = randomBytes(32).toString('base64url'); m[agent] = { uid: e?.uid ?? uid, cred: credHash(c).toString('hex') }; writeAgents(L, m); identityLog(L, { event: e ? 'credential_issued' : 'bound', agent, uid: m[agent].uid }); return c; };
+  if (e) {
+    if (e.uid !== uid && uid !== 0) return { ok: false, error: `agent ${agent} is bound to uid ${e.uid}, caller is uid ${uid}` };
+    if (e.cred) {
+      const given = credential ? credHash(credential) : null;
+      if (!given || !timingSafeEqual(given, Buffer.from(e.cred, 'hex'))) { identityLog(L, { event: 'credential_refused', agent, uid }); return { ok: false, error: `agent ${agent} credential missing or wrong` }; }
+      return { ok: true };
+    }
+    return mayBind ? { ok: true, credential: issue() } : { ok: true, legacy: true };
+  }
   if (!mayBind) return { ok: false, error: `agent ${agent} has no identity binding (claim first)` };
-  m[agent] = uid; fs.writeFileSync(f + '.tmp', JSON.stringify(m, null, 2), { mode: 0o600 }); fs.renameSync(f + '.tmp', f);
-  return { ok: true, bound: true };
+  return { ok: true, bound: true, credential: issue() };
+}
+// operator-only (passphrase on /dev/tty): move a name to another uid with a fresh credential, or free it
+export function rebindAgent(L, agent, uid, key) {
+  if (!AGENT_RE.test(String(agent ?? ''))) return { ok: false, error: 'bad agent name' };
+  if (!Number.isInteger(uid) || uid < 0) return { ok: false, error: 'uid must be a non-negative integer' };
+  const m = readAgents(L); const before = m[agent] ?? null;
+  const c = randomBytes(32).toString('base64url');
+  m[agent] = { uid, cred: credHash(c).toString('hex') }; writeAgents(L, m);
+  identityLog(L, { event: 'rebind', agent, uid, before_uid: typeof before === 'number' ? before : before?.uid ?? null }, key);
+  return { ok: true, agent, uid, credential: c };
+}
+export function unbindAgent(L, agent, key) {
+  const m = readAgents(L); const had = agent in m; delete m[agent]; writeAgents(L, m);
+  identityLog(L, { event: 'unbind', agent, removed: had }, key);
+  return { ok: true, agent, removed: had };
 }
 const claimRow = (auth, repo, agent) => { const r = auth.db.prepare("SELECT * FROM claims WHERE repo = ? AND agent = ? AND status = 'active'").get(repo, agent); return r && rowClaim(r); };
 const strip = ({ secret_sha256, secretFile, ...c }) => c;
@@ -144,6 +179,11 @@ export async function run(L, cmd, p = {}) {
     fs.writeFileSync(f + '.tmp', JSON.stringify(signOverride(override, key), null, 2) + '\n', { mode: 0o644 }); fs.renameSync(f + '.tmp', f);
     return { ok: true, file: f, override };
   }
+  if (cmd === 'rebind' || cmd === 'unbind') {
+    let key;
+    try { key = createPrivateKey({ key: fs.readFileSync(operatorKeyFile(L), 'utf8'), passphrase: readTtyLine('g4a operator passphrase: ') }); } catch (e) { return { ok: false, error: /tty/.test(e.message) ? e.message : 'operator key unavailable or wrong passphrase' }; }
+    return withLock(L, () => (cmd === 'rebind' ? rebindAgent(L, p.agent, p.uid ?? callerUid(), key) : unbindAgent(L, p.agent, key)));
+  }
   return withLock(L, async () => {
     const auth = new Authority(L.state, { keyDir: L.keys, anchorRemote: { url: L.anchors, ref: AUTH_ANCHOR_REF } });
     const repo = repoId(L.repo);
@@ -151,14 +191,14 @@ export async function run(L, cmd, p = {}) {
       // Agent identity: an agent name is bound to the OS uid that first claimed it (system mode:
       // the uid sudo reports via the wrapper; same-user mode: always the one uid, so detect-only).
       if (['claim', 'permit', 'land', 'release'].includes(cmd)) {
-        const id = bindAgent(L, p.agent, callerUid(), cmd === 'claim');
+        var id = bindAgent(L, p.agent, callerUid(), cmd === 'claim', p.credential);
         if (!id.ok) return { ok: false, status: 'refused', reason: 'agent_identity', error: id.error };
       }
       switch (cmd) {
         case 'claim': {
           const r = await auth.claim({ repo: L.repo, agent: p.agent, paths: p.paths, witnesses: p.witnesses ?? [], witnessPaths: p.witnessPaths ?? [], allowOverlap: !!p.allowOverlap, packageScripts: true });
           if (r.secretFile) fs.rmSync(r.secretFile, { force: true });
-          return r.ok ? strip(r) : r;
+          return r.ok ? { ...strip(r), ...(id.credential ? { agent_credential: id.credential } : {}) } : r;
         }
         case 'permit': {
           const c = claimRow(auth, repo, p.agent);
@@ -219,6 +259,8 @@ if (process.argv[1] && fs.realpathSync(process.argv[1]) === fileURLToPath(import
   const root = opt('--root'), pub = opt('--pub');
   const [cmd, b64] = a;
   const p = b64 ? JSON.parse(Buffer.from(b64, 'base64').toString('utf8')) : {};
+  // the agent credential never rides in argv (visible in ps to every user); it comes on stdin
+  if (p.credential_stdin) { delete p.credential_stdin; const c = fs.readFileSync(0, 'utf8').trim(); if (c) p.credential = c; }
   let L = layout(root, pub);
   if (!pub && fs.existsSync(L.conf)) L = layout(root, readConf(L).pub);
   const work = cmd === 'init-root' ? Promise.resolve(initRoot({ root, pub, seed: p.seed, clientRepo: p.clientRepo, mode: p.mode || 'user' })) : run(L, cmd, p);
