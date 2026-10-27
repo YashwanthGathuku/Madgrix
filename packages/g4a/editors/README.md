@@ -50,6 +50,6 @@ Call g4a_release when you abandon the task.
 
 ## Limits
 - The server is local and stdio only, with no HTTP or SSE transport and no auth layer. Anything that can start it can already run `g4a`.
-- Tools run under the editor's uid. In system mode the agent-name binding is per uid, so two editors running as the same user can act for each other's agent names.
-- `g4a_promote` waits for witnesses. The default timeout is 600 s (`G4A_MCP_TIMEOUT_MS`), and editors may impose shorter tool timeouts of their own. Use `no_wait` and poll `g4a_status` in that case.
-- The snippets were checked against the published config formats. This box has no Claude Code, Codex or Cursor installation, so they were not loaded in a live editor; only the protocol was tested (`test/mcp.test.mjs`).
+- Tools run under the editor's uid. Agent names are bound to a uid and a per-agent credential. Set `G4A_MCP_SESSION_CREDENTIALS=1` to keep the credential in server memory only; it is never returned to the model. A same-uid process can still read the default file store or the server's memory.
+- `g4a_promote` waits for witnesses and sends `notifications/progress` when the client provides a progressToken. It honours `notifications/cancelled`. The default timeout is 600 s (`G4A_MCP_TIMEOUT_MS`), and editors may impose shorter tool timeouts of their own. Use `no_wait` and poll `g4a_status` in that case. Cancelling or a timeout does not stop a promote the daemon already queued.
+- Live handshakes passed: `claude mcp list` (Claude Code 2.1.311), Codex 0.164.0 (`initialize` + `tools/list` before an unauthenticated model call), and `cursor-agent mcp list-tools g4a`. Tool calls driven by a model were not run, because that needs a login or API key. Project-scope configs in Claude Code and Cursor need approving once (`cursor-agent mcp enable g4a`).
