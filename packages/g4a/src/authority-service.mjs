@@ -186,6 +186,9 @@ export async function run(L, cmd, p = {}) {
   const roots = conf.mode === 'system' ? fs.readdirSync(path.dirname(L.root)).map((d) => path.join(path.dirname(L.root), d)) : [L.root];
   process.env.G4A_SANDBOX_HIDE = roots.flatMap((r) => ['keys', 'state', 'nonces'].map((d) => path.join(r, d))).join(':');
   if (cmd === 'pubinfo') return { ok: true, mode: conf.mode, clientRepo: conf.clientRepo, pub: L.pub };
+  // system mode: operator-init / override only through root (sudo runuser, env -i), never through
+  // the any-uid wrapper (which always sets G4A_CALLER_UID) or a sudo session (SUDO_USER)
+  if ((cmd === 'operator-init' || cmd === 'override') && conf.mode === 'system' && (process.env.G4A_CALLER_UID !== undefined || process.env.SUDO_USER)) return { ok: false, error: `${cmd} is root-only in system mode (privileged bootstrap: run \`g4a operator init\` / \`g4a override\` as the operator, which uses sudo runuser)` };
   if (cmd === 'operator-init') {
     if (fs.existsSync(operatorKeyFile(L))) return { ok: true, existed: true };
     const a = readTtyLine('g4a operator: new passphrase (min 10 chars): '), b = readTtyLine('g4a operator: repeat passphrase: ');
@@ -227,6 +230,10 @@ export async function run(L, cmd, p = {}) {
         }
         const old = safeGit(L.repo, ['rev-parse', '--verify', '--quiet', `refs/heads/agents/${p.agent}`], { allowFailure: true }).stdout.trim();
         if (old) { safeGit(L.repo, ['update-ref', '-d', `refs/heads/agents/${p.agent}`, old]); fs.appendFileSync(L.accepted, JSON.stringify({ ref: `refs/heads/agents/${p.agent}`, old, new: ZERO, kind: 'release', at: new Date().toISOString() }) + '\n'); }
+        // the agent's own client-ledger anchor chain goes with it (the tip is kept in accepted.jsonl)
+        const aref = `${CLIENT_ANCHOR_REF}s/${p.agent}`;
+        const aold = safeGit(L.anchors, ['rev-parse', '--verify', '--quiet', aref], { allowFailure: true }).stdout.trim();
+        if (aold) { safeGit(L.anchors, ['update-ref', '-d', aref, aold]); fs.appendFileSync(L.accepted, JSON.stringify({ ref: `anchors:${aref}`, old: aold, new: ZERO, kind: 'agent-removed', at: new Date().toISOString() }) + '\n'); }
         const m = readAgents(L); const had = p.agent in m; delete m[p.agent]; writeAgents(L, m);
         const o = readOs(L); delete o.agents[p.agent]; writeOs(L, o);
         identityLog(L, { event: 'os_unbind', agent: p.agent, removed: had, released: !!c });

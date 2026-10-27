@@ -191,6 +191,16 @@ test('agent users: separate uids, scoped launcher, no impersonation, full cleanu
     const asBob = spawnSync('sudo', ['-n', '-u', 'g4a-a-bob', 'sudo', '-n', '-u', 'g4a-authority', `${WRAP}/g4a-authority`, id, 'permit', b64({ agent: 'alice' })], { encoding: 'utf8', cwd: '/tmp' });
     assert.match(asBob.stdout, /agent_identity/);
     for (const os2 of ['os-bind', 'os-unbind', 'os-policy']) assert.match(spawnSync('sudo', ['-n', '-u', 'g4a-a-bob', 'sudo', '-n', '-u', 'g4a-authority', `${WRAP}/g4a-authority`, id, os2, b64({ agent: 'bob', uid: 0 })], { encoding: 'utf8', cwd: '/tmp' }).stdout, /bad command/);
+    // N6: operator-init / override are not reachable through the any-uid wrapper (agent or operator),
+    // and the service refuses them when a caller uid or SUDO_USER is present (only root's runuser path)
+    for (const who of [['-u', 'g4a-a-bob', 'sudo', '-n'], []]) for (const oc of ['operator-init', 'override'])
+      assert.match(spawnSync('sudo', ['-n', ...who, '-u', 'g4a-authority', `${WRAP}/g4a-authority`, id, oc, b64({ minutes: 5, reason: 'rt', vars: ['G4A_ENFORCE'] })], { encoding: 'utf8', cwd: '/tmp' }).stdout, /bad command/, `${who[1] || 'operator'} ${oc}`);
+    const loc = JSON.parse(fs.readFileSync('/etc/g4a/authority.json', 'utf8'))[repoIdStr];
+    for (const ev of ['SUDO_USER=g4a-a-bob', 'G4A_CALLER_UID=1234']) for (const oc of ['operator-init', 'override']) {
+      const r = spawnSync('sudo', ['-n', 'runuser', '-u', 'g4a-authority', '--', '/usr/bin/env', '-i', ev, 'PATH=/usr/bin:/bin', `${WRAP}/node`, '--no-warnings', '/usr/local/lib/g4a/packages/g4a/src/authority-service.mjs', '--root', loc.root, '--pub', loc.pub, oc, b64({ minutes: 5, reason: 'rt', vars: ['G4A_ENFORCE'] })], { encoding: 'utf8', cwd: '/tmp', stdio: ['ignore', 'pipe', 'pipe'] });
+      assert.match(r.stdout, /root-only/, `${ev} ${oc}: ${r.stdout}${r.stderr}`);
+    }
+    assert.equal(sh(`sudo -n test -e ${loc.root}/keys/operator-ed25519.pem`).status, 1, 'no operator key may have been created');
     const op = J(g4a(['claim', '--agent', 'op', '--paths', 'b.txt', '--witness', 'true']));
     assert.equal(op.ok, false); assert.match(JSON.stringify(op), /own OS users/);
     // an agent CLI started as the operator (agent marker set) is refused on writes in the repo
@@ -222,6 +232,9 @@ test('agent users: separate uids, scoped launcher, no impersonation, full cleanu
       assert.equal(fs.existsSync(H(n)), false); assert.notEqual(sh(`pgrep -u ${uids[n]}`).status, 0);
       assert.equal(sh(`sudo -n find /tmp /var/tmp /dev/shm /var/lib /etc -xdev -uid ${uids[n]} 2>/dev/null`).stdout.trim(), '');
     }
+    // N7: agent remove deletes the agent's client-ledger anchor ref
+    assert.doesNotMatch(sh(`cd /tmp && sudo -n -u g4a-authority git -C ${anc} for-each-ref --format='%(refname)'`).stdout, /client-ledgers\/(alice|bob)/);
+    assert.equal(J(g4a(['authority', 'audit'])).ok, true, 'audit holds after the refs are removed');
     assert.equal(fs.existsSync('/etc/sudoers.d/g4a-agents'), false);
     assert.equal(fs.existsSync('/etc/g4a/agents.json'), false);
     assert.doesNotMatch(fs.readFileSync('/etc/g4a/authority.json', 'utf8'), /"agent"/);

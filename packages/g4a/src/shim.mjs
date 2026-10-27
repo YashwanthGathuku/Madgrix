@@ -111,7 +111,8 @@ if (managed) {
     const a = spawnSync(REAL, ['config', '--get', `alias.${sub}`], { cwd: fs.existsSync(eff) ? eff : process.cwd(), encoding: 'utf8', env });
     const val = a.status === 0 ? a.stdout.trim() : '';
     if (!val) break; // not an alias: a git-<name> extension or an error; nothing to check
-    if (val.startsWith('!')) break; // shell alias: any nested `git` it runs re-enters this shim and is checked there
+    // shell aliases run with git-core first on PATH, so a nested `git` never re-enters the shim
+    if (val.startsWith('!')) block(`shell alias ${sub} (!…) is not allowed for agents in a g4a-managed repo (it runs git-core git, bypassing the shim); run the underlying commands directly`);
     if (/['"\\]/.test(val)) block(`alias ${sub} uses quoting g4a cannot resolve safely; run the underlying git command`);
     const toks = val.split(/\s+/).filter(Boolean);
     if (!toks.length || toks[0].startsWith('-')) block(`alias ${sub} starts with a global option; run the underlying git command`);

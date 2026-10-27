@@ -76,12 +76,40 @@ export function parseGit(argv) {
 // Config keys an agent must not override per command in a g4a-managed repo: they disable the
 // reference-transaction guard / reflog evidence, define aliases, or redirect git's own files.
 export const DANGEROUS_CONFIG = /^(core\.hookspath|core\.logallrefupdates|core\.fsmonitor|core\.worktree|core\.gitproxy|core\.sshcommand|alias\..*|include\..*|includeif\..*)$/i;
+export const UNPARSABLE_CONFIG = 'include.<unparsable GIT_CONFIG_PARAMETERS>';
+// GIT_CONFIG_PARAMETERS as git writes and reads it (sq_quote): whitespace-separated tokens, each
+// either 'key=value' (legacy form) or 'key'='value' (git >= 2.31), where a quote inside a quoted
+// string is written '\''. Returns the keys, or null when the string is not in that form (callers
+// fail closed).
+export function parseConfigParameters(str) {
+  const keys = []; let i = 0; const n = str.length;
+  const sq = () => { // one shell-single-quoted word, possibly glued from 'a'\''b' pieces
+    if (str[i] !== "'") return null;
+    let out = '';
+    for (;;) {
+      if (str[i] !== "'") return null;
+      const j = str.indexOf("'", i + 1); if (j < 0) return null;
+      out += str.slice(i + 1, j); i = j + 1;
+      if (str[i] === '\\' && (str[i + 1] === "'" || str[i + 1] === '!') && str[i + 2] === "'") { out += str[i + 1]; i += 2; continue; }
+      return out;
+    }
+  };
+  for (;;) {
+    while (i < n && /\s/.test(str[i])) i++;
+    if (i >= n) return keys;
+    const w = sq(); if (w === null) return null;
+    if (str[i] === '=') { i++; if (sq() === null) return null; keys.push(w); }
+    else keys.push(w.includes('=') ? w.slice(0, w.indexOf('=')) : w);
+    if (i < n && !/\s/.test(str[i])) return null;
+  }
+}
 // Every config key a git process will see from the command line and the environment.
 export function configKeys(p, env = process.env) {
   const keys = [...p.config.map((v) => v.split('=')[0]), ...p.configEnv.map((v) => v.split('=')[0])];
   const n = Number(env.GIT_CONFIG_COUNT || 0);
   for (let i = 0; i < n && i < 1000; i++) if (env[`GIT_CONFIG_KEY_${i}`]) keys.push(env[`GIT_CONFIG_KEY_${i}`]);
-  for (const m of String(env.GIT_CONFIG_PARAMETERS || '').matchAll(/'([^'=]*)'(?:=|\s|$)/g)) keys.push(m[1]);
+  const gp = parseConfigParameters(env.GIT_CONFIG_PARAMETERS || '');
+  keys.push(...(gp ?? [UNPARSABLE_CONFIG]));
   return keys.map((k) => k.trim().toLowerCase());
 }
 

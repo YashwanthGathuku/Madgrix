@@ -34,7 +34,7 @@ export function redactDeep(v, env = process.env) {
 // their length), then redact. Handles separate (-m X), attached (-mX, --message=X) and combined
 // short-flag (-qm X, -am X, -qmX) forms; -S/-G/--grep values are treated as content too.
 // G4A_LOG_ARGV=0 stores only the subcommand.
-const MSG_LONG = new Set(['--message', '--file', '--template', '--grep']);
+const MSG_LONG = new Set(['--message', '--file', '--template', '--grep', '--trailer']);
 const CFG_FLAGS = new Set(['-c', '--config-env']);
 const hide = (v) => `[${String(v).length} chars]`;
 const cfg = (v, env) => redact(String(v).replace(/^([^=]*(?:extraheader|token|password|cred)[^=]*=).*/is, `$1${R}`), env);
@@ -69,7 +69,18 @@ export function minimiseArgv(argv, env = process.env) {
 }
 
 // Private files: 0700 dirs, 0600 files, refuse to follow a symlink at the final path.
+// every existing component of the path must be a real directory; a symlink is only accepted when
+// root owns it (system layout like /var -> /private/var), never one the caller could have planted
+export function noSymlinkParents(d) {
+  const abs = path.resolve(d); let cur = path.parse(abs).root;
+  for (const part of abs.slice(cur.length).split(path.sep).filter(Boolean)) {
+    cur = path.join(cur, part);
+    let st; try { st = fs.lstatSync(cur); } catch { return; }
+    if (st.isSymbolicLink() && st.uid !== 0) throw new Error(`g4a: ${cur} (a parent of ${abs}) is a symlink; refusing`);
+  }
+}
 export function ensurePrivateDir(d) {
+  noSymlinkParents(path.dirname(path.resolve(d)));
   fs.mkdirSync(d, { recursive: true, mode: 0o700 });
   const st = fs.lstatSync(d);
   if (st.isSymbolicLink() || !st.isDirectory()) throw new Error(`g4a: ${d} is not a real directory`);
@@ -80,13 +91,14 @@ export function ensurePrivateDir(d) {
 const NOFOLLOW = fs.constants.O_NOFOLLOW ?? 0;
 export function appendPrivate(f, data) {
   const fd = fs.openSync(f, fs.constants.O_WRONLY | fs.constants.O_APPEND | fs.constants.O_CREAT | NOFOLLOW, 0o600);
-  try { const st = fs.fstatSync(fd); if (st.mode & 0o077) fs.fchmodSync(fd, 0o600); fs.writeSync(fd, data); } finally { fs.closeSync(fd); }
+  try { const st = fs.fstatSync(fd); if (st.nlink > 1) throw new Error(`g4a: ${f} has ${st.nlink} hard links; refusing to write`); if (st.mode & 0o077) fs.fchmodSync(fd, 0o600); fs.writeSync(fd, data); } finally { fs.closeSync(fd); }
 }
 export function writePrivate(f, data, mode = 0o600) {
   const fd = fs.openSync(f, fs.constants.O_WRONLY | fs.constants.O_CREAT | NOFOLLOW, mode);
   try {
     const st = fs.fstatSync(fd);
     if (!st.isFile()) throw new Error(`g4a: ${f} is not a regular file`);
+    if (st.nlink > 1) throw new Error(`g4a: ${f} has ${st.nlink} hard links; refusing to write`);
     if (typeof process.getuid === 'function' && st.uid !== process.getuid()) throw new Error(`g4a: ${f} is owned by uid ${st.uid}, not ${process.getuid()}`);
     fs.ftruncateSync(fd, 0); fs.fchmodSync(fd, mode); fs.writeSync(fd, data); } finally { fs.closeSync(fd); }
 }

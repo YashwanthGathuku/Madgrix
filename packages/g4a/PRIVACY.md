@@ -8,7 +8,8 @@ your machine (paths, sizes and modes, never contents). Run `g4a purge` to delete
 ## What is stored, where, and for how long
 
 `G4A_HOME` defaults to `~/.g4a`. The directory is created `0700`, and g4a refuses to use it if it
-is a symlink or is owned by another uid.
+is a symlink or is owned by another uid. Key directories with a symlinked parent, and private
+files with more than one hardlink, are refused rather than written.
 
 | Data | Location | Contents | Mode | Retention |
 |---|---|---|---|---|
@@ -35,7 +36,8 @@ error messages shown by the CLI, the daemon and the authority, and all MCP tool 
   private-key blocks.
 - **Minimised git argv:** values given with `-m`, `--message`, `-F`, `--file` and `--template`
   are replaced by `[N chars]`, in every form: separate (`-m X`), attached (`-mX`,
-  `--message=X`) and combined short flags (`-qm X`, `-am X`, `-qmX`). Search content
+  `--message=X`) and combined short flags (`-qm X`, `-am X`, `-qmX`). `--trailer` values
+  (`--trailer K: V`, `--trailer=K: V`) are minimised too. Search content
   (`--grep`, `-S`, `-G`) is minimised the same way. A `-c` value whose key looks like a header, token or credential is redacted.
 - **`G4A_LOG_ARGV=0`:** stores no argv and no hook command string at all.
 - **`G4A_REDACT_EMAILS=1`:** also replaces email addresses. This is off by default because git
@@ -54,8 +56,9 @@ keep secrets out of it, `claim` refuses:
 
 - any witness command that contains something that looks like a secret (pass secrets to
   witnesses through the environment instead);
-- witness commands that pass credentials (`-u`/`--user user:pass`, auth-like `-H` headers,
-  `--oauth2-bearer`, `--cookie`);
+- witness commands that pass credentials (`-u`/`--user user:pass`, any `-H` header outside a
+  short plain-header allowlist, glued `-Hname:` included, `--oauth2-bearer`, `-b`/`--cookie`,
+  `mysql`-family `-pX`/`--password`, `sshpass -p`, any `--password=`);
 - claim or witness paths that are absolute, start with `~`, contain `..`, control characters,
   newlines or non-ASCII characters, use pathspec magic (a leading `:`), or point into `.git/` or
   `.g4a/`.

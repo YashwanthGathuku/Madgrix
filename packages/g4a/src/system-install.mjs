@@ -71,7 +71,7 @@ case "$caller" in *[!0-9]*|'') echo "g4a: bad caller uid" >&2; exit 2;; esac
 id="$1"; cmd="$2"; arg="\${3:-}"
 case "$id" in *[!0-9a-f]*|'') echo '{"ok":false,"error":"bad id"}'; exit 2;; esac
 [ \${#id} -eq 16 ] || { echo '{"ok":false,"error":"bad id"}'; exit 2; }
-case "$cmd" in claim|permit|land|release|status|ledger|audit|pubinfo|operator-init|override) ;;
+case "$cmd" in claim|permit|land|release|status|ledger|audit|pubinfo) ;;
   init-root) [ -z "\${SUDO_USER:-}" ] || { echo '{"ok":false,"error":"init-root is root-only"}'; exit 2; } ;;
   *) echo '{"ok":false,"error":"bad command"}'; exit 2;; esac
 case "$arg" in *[!A-Za-z0-9+/=]*) echo '{"ok":false,"error":"bad arg"}'; exit 2;; esac
