@@ -1,0 +1,5 @@
+# ~/.codex/config.toml
+[mcp_servers.g4a]
+command = "node"
+args = ["--no-warnings", "/ABS/PATH/TO/Madgrix/packages/g4a/bin/g4a.mjs", "mcp"]
+env = { G4A_AGENT = "1" }
