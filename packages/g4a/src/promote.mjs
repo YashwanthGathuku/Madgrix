@@ -85,7 +85,7 @@ function unionInsertions(files, regionsHunks) {
   });
 }
 
-function combine(top, main, candidate, agent, log) {
+export function combine(top, main, candidate, agent, log) {
   if (isAncestor(top, main, candidate)) return { sha: candidate, rung: 'fast-forward' };
   const mt = safeGit(top, ['merge-tree', '--write-tree', '--name-only', '--no-messages', '-z', main, candidate], { allowFailure: true });
   const [tree, ...conflicted] = splitNul(mt.stdout);
@@ -164,7 +164,7 @@ function runOne(spec) {
     ch.stdin.end(JSON.stringify(spec));
   });
 }
-async function runWitnesses(top, sha, intents) {
+export async function runWitnesses(top, sha, intents) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'g4a-witness-'));
   const wt = path.join(dir, 'tree');
   safeGit(top, ['worktree', 'add', '--quiet', '--detach', wt, sha]);

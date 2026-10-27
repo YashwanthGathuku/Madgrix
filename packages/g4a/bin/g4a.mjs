@@ -235,7 +235,16 @@ async function overrideCmd(args) {
 async function stopCmd() { try { out(await (await client())('shutdown')); } catch (e) { out({ ok: false, error: e.message }); } }
 
 const [cmd, ...rest] = process.argv.slice(2);
-({ install, uninstall, doctor, stats: showStats, hook, hooks, daemon, claim: claimCmd, release: releaseCmd, status: statusCmd, promote: promoteCmd, ledger: ledgerCmd, verify: verifyCmd, stop: stopCmd, operator: operatorCmd, override: overrideCmd }[cmd] ?? (() => {
-  console.log('usage: g4a install [--rc FILE] | uninstall [--rc FILE] | doctor | stats | hooks claude|codex|gemini | hook <agent>\n       g4a daemon [--detach] | stop | claim --agent A --paths p1,p2 --witness CMD [--allow-overlap] [--repo R]\n       g4a release --agent A [--remove-worktree] | status | promote --agent A [--no-wait] | ledger [--out F] | verify [BUNDLE] [--pin SPKIHEX] [--anchor-remote R]\n       g4a operator init [--passphrase-file F] | override --repo R --minutes N --reason TEXT [--var G4A_ENFORCE|G4A_RAW|G4A_AGENT]  (human-only)');
+// Phase 2: local bare authority repo with a permit-enforcing pre-receive hook.
+async function authorityCmd(args) {
+  const o = opts(args);
+  const A = await import('../src/authority-repo.mjs');
+  if (o._[0] === 'init' && o._[1]) return out(A.initAuthority({ dir: o._[1], seedRepo: o.repo ?? process.cwd() }));
+  if (o._[0] === 'audit' && o._[1]) { const r = A.auditAuthority(o._[1]); out(r); if (!r.ok) process.exitCode = 1; return; }
+  console.error('usage: g4a authority init DIR [--repo SEED] | authority audit DIR'); process.exitCode = 2;
+}
+
+({ authority: authorityCmd, install, uninstall, doctor, stats: showStats, hook, hooks, daemon, claim: claimCmd, release: releaseCmd, status: statusCmd, promote: promoteCmd, ledger: ledgerCmd, verify: verifyCmd, stop: stopCmd, operator: operatorCmd, override: overrideCmd }[cmd] ?? (() => {
+  console.log('usage: g4a install [--rc FILE] | uninstall [--rc FILE] | doctor | stats | hooks claude|codex|gemini | hook <agent>\n       g4a daemon [--detach] | stop | claim --agent A --paths p1,p2 --witness CMD [--allow-overlap] [--repo R]\n       g4a release --agent A [--remove-worktree] | status | promote --agent A [--no-wait] | ledger [--out F] | verify [BUNDLE] [--pin SPKIHEX] [--anchor-remote R]\n       g4a operator init [--passphrase-file F] | override --repo R --minutes N --reason TEXT [--var G4A_ENFORCE|G4A_RAW|G4A_AGENT]  (human-only)\n       g4a authority init DIR [--repo SEED] | authority audit DIR');
   process.exitCode = cmd ? 2 : 0;
 }))(rest)?.catch?.((e) => { console.error(`g4a: ${e.message}`); process.exitCode = 1; });

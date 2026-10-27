@@ -199,3 +199,21 @@ and lets the command run (fail open).
   main worktree detached.
 - There is one daemon per user, and jobs run serially. `node:sqlite` is experimental in Node 22, so the
   CLI runs it with `--no-warnings`.
+
+## Phase 2: local authority repo (no Cloudflare)
+
+`g4a authority init DIR [--repo SEED]` creates a bare authority repo. It seeds `main` from SEED, pins the daemon's permit public key at `DIR/g4a/permit.pub.hex`, and installs a node pre-receive hook through `core.hooksPath`. It also sets `receive.denyDeletes` and `receive.denyNonFastForwards`. `g4a authority audit DIR` checks each ref against the log of updates the hook accepted.
+
+The hook accepts exactly one ref update per push, and only when that push carries `-o permit=<b64>`, a permit signed by the daemon's key (`permit-ed25519.pem` in the key dir). It handles two kinds of permit:
+- **agent permit** for `refs/heads/agents/<agent>`. The pushed commit must descend from the claim baseline, every changed path must match the claim globs, and the claim must not be revoked (`g4a/revoked.json`).
+- **main permit** for `refs/heads/main`. The update must match the exact old and new values.
+
+Every permit carries a nonce that can be used once (an O_EXCL file in `g4a/nonces`) and an expiry. Forged, tampered, expired and replayed permits are refused, and so are deletes, other refs and pushes with no permit. Because the check runs on the receiving side, it applies whatever git binary the pusher uses: the shim, `/usr/bin/git`, or client `-c core.hooksPath=...`.
+
+`landAgent` runs the ladder inside the authority: the same `combine` (fast-forward, merge-tree, mergiraf, then union) and the sandboxed `runWitnesses` used in Phase 1. It then lands main by pushing with a fresh main permit.
+
+### Phase 2 limits
+- **Bypasses are only detected.** A process with the same uid can write the bare repo's refs and objects directly, or run `git push --receive-pack='git -c core.hooksPath=/dev/null receive-pack'`. Both skip the hook. `authority audit` detects them; nothing prevents them. Prevention needs the authority under another uid or host, for example with an ssh forced command.
+- **The permit key is readable.** It lives in the same key dir, so a process with the same uid can read it and mint permits.
+- **The accepted log is written early.** The hook writes it in pre-receive, so an update git rejects later (rare, for example a lock race) still leaves a log line. When that happens, audit reports a mismatch.
+- **Partial daemon wiring.** `landAgent` is a library and test entry point. The Phase 1 daemon's `promote` still lands into the local repo. It does not yet route through the authority, and witness pinning and the ledger are not applied on the authority path.
