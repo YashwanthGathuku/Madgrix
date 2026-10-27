@@ -10,6 +10,10 @@ export function g4aHome(env = process.env) {
 
 // Agent context = an agent env marker. Plain non-TTY alone (e.g. `git status | grep`)
 // is NOT treated as an agent unless G4A_NONTTY_IS_AGENT=1, to keep human scripts untouched.
+export function keyDir(env = process.env) {
+  return env.G4A_KEY_DIR || path.join(env.XDG_CONFIG_HOME || path.join(os.homedir(), '.config'), 'g4a-keys');
+}
+
 export function agentMarker(env = process.env) {
   if (env.G4A_AGENT === '1') return 'G4A_AGENT';
   if (env.CLAUDECODE) return 'CLAUDECODE';
