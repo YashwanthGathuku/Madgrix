@@ -266,3 +266,17 @@ Claims and releases are mirrored. The authority claims first, and a claim is ref
 - **Witnesses run as `g4a-authority`** inside bwrap, with the authority keys, state and nonces dirs hidden. They see the authority's repo checkout.
 - **Re-running `init --system`** on an already-initialised repo keeps the existing root and its state. `g4a authority uninstall --system [--repo R | --repo-id GITDIR]` removes one repo's root, pub dir and map entry. When no mapped repo remains, it also removes the code copy, sudoers rule, `/etc/g4a` and the `g4a-authority` user. `--purge` removes everything. The system test and the e2e uninstall their own repo, and the system test deletes the agent users it created. `npm test` runs with a private TMPDIR that is removed afterwards.
 - **Everything is local.** No Cloudflare and no network authority. A remote host would be the next step.
+
+## Phase 3: MCP server and editor support
+`g4a mcp` is a stdio MCP server (JSON-RPC 2.0, protocol 2025-06-18; it also accepts 2025-03-26 and 2024-11-05). Its tools are `g4a_claim`, `g4a_status`, `g4a_promote`, `g4a_verify`, `g4a_release` and `g4a_authority_status`. Each tool is a thin wrapper over the CLI, with argv-only calls and flag-injection checks, so the server has no privileges of its own.
+
+Config snippets for Claude Code (`.mcp.json`), Codex (`~/.codex/config.toml`) and Cursor (`.cursor/mcp.json`) are in `editors/`. So are agent instructions and guidance on editor SCM panels; see `editors/README.md`.
+
+`test/mcp.test.mjs` starts the real server over stdio and checks:
+- initialize, version negotiation, tools/list, ping, and the parse, method and param errors;
+- argument validation;
+- that a stopped daemon gives a tool error;
+- a full claim → commit → promote (through a same-user authority) → verify → release round trip;
+- that the snippets parse.
+
+The snippets were not loaded in a live editor, because none is installed on the build box.
