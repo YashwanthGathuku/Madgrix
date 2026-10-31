@@ -50,7 +50,8 @@ export function openDb(home, { readOnly = false } = {}) {
   let db;
   try {
     db = openSqlite(f, { readOnly });
-    if (!readOnly) db.exec('PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA busy_timeout=5000;');
+    if (!readOnly) db.exec('PRAGMA busy_timeout=30000; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;');
+    else db.exec('PRAGMA busy_timeout=30000;');
   } finally { if (um !== null) process.umask(um); }
   if (!readOnly) {
     for (const x of [f, `${f}-wal`, `${f}-shm`]) try { if (fs.statSync(x).mode & 0o077) fs.chmodSync(x, 0o600); } catch {}

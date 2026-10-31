@@ -35,6 +35,21 @@ Here is how one uncontended g4a op splits up, as the median of 3 runs with N=1:
 | promote | 0.8–1.9 s |
 | release | about 0.75 s |
 
+## After batch landing (grok/g4a-gaps)
+
+Same machine, same workload (16 agents x 60 s, offline network namespace). `land` now enqueues;
+one leader per repo witnesses the combined SHA once and lands every disjoint claim with one
+compare-and-swap; authority-backed promote jobs run concurrently (`G4A_LAND_PARALLEL`, default 16).
+
+| target | before ops/s | after ops/s | before p50 ms | after p50 ms | after p95 ms | errors |
+|---|---|---|---|---|---|---|
+| g4a same-user | 0.21 | **1.28** | 40379 | **10614** | 23106 | 0 |
+| g4a system | 0.23 | **1.29** | 37852 | **9477** | 23644 | 0 |
+
+About 6x the throughput and 4x lower median latency, with the same guarantees (one-time signed
+permits, exact reviewed SHA per claim, a ledger entry per claim plus the batch record). Plain
+git push is still ~95 ops/s: a g4a op is claim + witness + review + release, not one push.
+
 ## Why ForgeMark can't drive g4a directly
 
 ForgeMark speaks smart-HTTP and pushes plain `refs/forgemark/*` branches with no push options.
