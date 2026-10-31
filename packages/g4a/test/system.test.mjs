@@ -173,7 +173,20 @@ test('agent users: separate uids, scoped launcher, no impersonation, full cleanu
     assert.equal(inj.stdout.trim(), '$(id -u); `id` && id');
     // caller-supplied env (other than the allowlist) does not reach the agent
     const ev = spawnSync(process.execPath, ['--no-warnings', CLI, 'run', '--agent', 'alice', '--', 'sh', '-c', 'echo "${LD_PRELOAD:-none} ${G4A_RAW:-none} ${ANTHROPIC_API_KEY:-none}"'], { encoding: 'utf8', cwd: repo, env: { ...env, LD_PRELOAD: '/tmp/x.so', G4A_RAW: '1', ANTHROPIC_API_KEY: 'k-test' } });
-    assert.equal(ev.stdout.trim(), 'none none k-test');
+    assert.equal(ev.stdout.trim(), 'none none none', 'operator API keys no longer pass through to agents');
+    // per-agent key grant: value on stdin, only that agent sees it, bad names refused
+    const grant = spawnSync(process.execPath, ['--no-warnings', CLI, 'agent', 'key', 'alice', 'ANTHROPIC_API_KEY'], { encoding: 'utf8', cwd: repo, env, input: 'k-alice\n' });
+    assert.equal(J(grant).ok, true, grant.stderr);
+    assert.doesNotMatch(grant.stdout, /k-alice/, 'key value never echoed');
+    for (const bad of ['LD_PRELOAD', 'PATH', 'G4A_RAW_KEY', 'GIT_SSH_KEY', 'x_api_key', 'NODE_OPTIONS'])
+      assert.equal(J(spawnSync(process.execPath, ['--no-warnings', CLI, 'agent', 'key', 'alice', bad], { encoding: 'utf8', cwd: repo, env, input: 'v\n' })).ok, false, `key name ${bad}`);
+    assert.equal(run('alice', 'echo "${ANTHROPIC_API_KEY:-none}"').stdout.trim(), 'k-alice');
+    assert.equal(run('bob', 'echo "${ANTHROPIC_API_KEY:-none}"').stdout.trim(), 'none', 'bob does not get alice\'s key');
+    // a key file the agent itself plants under a dangerous name is ignored by the launcher
+    run('alice', 'printf /tmp/evil.so > $HOME/.g4a/keys/LD_PRELOAD');
+    assert.equal(run('alice', 'echo "${LD_PRELOAD:-none}"').stdout.trim(), 'none');
+    assert.equal(J(spawnSync(process.execPath, ['--no-warnings', CLI, 'agent', 'key', 'alice', 'ANTHROPIC_API_KEY', '--remove'], { encoding: 'utf8', cwd: repo, env })).ok, true);
+    assert.equal(run('alice', 'echo "${ANTHROPIC_API_KEY:-none}"').stdout.trim(), 'none');
 
     // separation between agents: credential, clone/worktree, impersonation
     const credA = sh(`sudo -n find ${H('alice')}/.g4a/credentials -type f`).stdout.trim();

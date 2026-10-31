@@ -37,6 +37,9 @@ CREATE TABLE IF NOT EXISTS intents (
 CREATE TABLE IF NOT EXISTS jobs (
   id TEXT PRIMARY KEY, kind TEXT NOT NULL, payload TEXT NOT NULL, status TEXT NOT NULL,
   attempts INTEGER NOT NULL DEFAULT 0, result TEXT, created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS landq (
+  job TEXT PRIMARY KEY, agent TEXT NOT NULL, claim TEXT NOT NULL, candidate TEXT NOT NULL,
+  created_at TEXT NOT NULL, result TEXT);
 `;
 
 export function openDb(home, { readOnly = false } = {}) {
@@ -47,7 +50,8 @@ export function openDb(home, { readOnly = false } = {}) {
   let db;
   try {
     db = openSqlite(f, { readOnly });
-    if (!readOnly) db.exec('PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA busy_timeout=5000;');
+    if (!readOnly) db.exec('PRAGMA busy_timeout=30000; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;');
+    else db.exec('PRAGMA busy_timeout=30000;');
   } finally { if (um !== null) process.umask(um); }
   if (!readOnly) {
     for (const x of [f, `${f}-wal`, `${f}-shm`]) try { if (fs.statSync(x).mode & 0o077) fs.chmodSync(x, 0o600); } catch {}
@@ -90,6 +94,20 @@ const WITNESS_SECRET = [
 ];
 // overlap is checked case-insensitively too: a case variant would collide on macOS/Windows
 export const claimOverlap = (a, b) => globsOverlap(a, b) || globsOverlap(a.toLowerCase(), b.toLowerCase());
+// Claim globs g4a matches: an exact path, "dir/**", or "**". A trailing slash ("dir/") means the
+// directory and is normalised to "dir/**" (it used to match nothing, so a claim on "src/" landed
+// no file at all). Any other wildcard is refused instead of silently matching only itself.
+export function normalizeClaimPaths(list) {
+  return [...new Set(list.map((p) => {
+    if (typeof p !== 'string') return p; // checkClaimInputs reports it
+    let q = p;
+    if (/\/$/.test(q) && !/\/\/$/.test(q)) q = q.slice(0, -1) + (q === '/' ? '' : '/**');
+    const body = q === '**' ? '' : q.endsWith('/**') ? q.slice(0, -3) : q;
+    if (/[*?[\]{}]/.test(body)) throw new Error(`claim path ${JSON.stringify(p)} uses a wildcard g4a does not match; use an exact path, "dir/" or "dir/**"`);
+    if (q !== '**' && body.split('/').some((seg) => seg === '')) throw new Error(`claim path ${JSON.stringify(p)} has an empty path segment`);
+    return q;
+  }))];
+}
 export function checkClaimInputs(paths, witnesses = [], witnessPaths = []) {
   for (const p of [...paths, ...witnessPaths]) {
     if (typeof p !== 'string' || !p || p.length > 512 || p.includes('\0')) throw new Error('claim path must be a non-empty string (<=512 chars)');
@@ -302,6 +320,8 @@ export class Authority {
     return this.serial(async () => {
       if (!/^[A-Za-z0-9._-]{1,64}$/.test(agent || '')) throw new Error('agent must match [A-Za-z0-9._-]{1,64}');
       if (!Array.isArray(paths) || paths.length === 0) throw new Error('claim needs at least one path');
+      if (!Array.isArray(witnessPaths)) throw new Error('witnessPaths must be an array');
+      paths = normalizeClaimPaths(paths); witnessPaths = normalizeClaimPaths(witnessPaths);
       if (paths.includes('**')) throw new Error('unbounded claim "**" refused');
       checkClaimInputs(paths, witnesses, witnessPaths);
       const repo = repoId(repoPath), top = repoTop(repoPath);
@@ -566,7 +586,7 @@ export async function verifyBundle(bundle, { pinnedPub, anchors = [], main } = {
   }
   if (main) {
     const lastMain = [...(bundle.entries ?? [])].reverse().find((e) => e.kind === 'promote' || e.kind === 'main_external');
-    const expect = lastMain && (lastMain.payload.main_after ?? lastMain.payload.actual);
+    const expect = lastMain && (lastMain.payload.batch?.main_after ?? lastMain.payload.main_after ?? lastMain.payload.actual);
     if (expect && expect !== main) warnings.push(`main is ${main} but the last recorded main is ${expect}: main moved outside the g4a daemon since then`);
   }
   return { ok: errors.length === 0, head: chain.ok ? chain.head : null, entries: bundle.entries?.length ?? 0, promotions, anchors: checkedAnchors, errors, warnings };

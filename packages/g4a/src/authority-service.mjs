@@ -16,7 +16,7 @@ import { createPrivateKey, createPublicKey, generateKeyPairSync, randomBytes, si
 import { safeGit } from '../../../scripts/lib/safe-git.mjs';
 import { canonicalJson } from '../../../src/lib/canonical.ts';
 import { Authority, rowClaim, bundleFromDb, repoId } from './authority.mjs';
-import { promote } from './promote.mjs';
+import { planBatch, runBatchWitnesses, commitBatch } from './promote.mjs';
 import { signOverride, overrideName, OPT_OUT_VARS } from './override.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -73,8 +73,8 @@ export function initRoot({ root, pub, seed, clientRepo, mode }) {
 }
 
 // ---- service commands ----
-function withLock(L, fn) {
-  const lock = path.join(L.root, 'lock.d');
+function withLock(L, fn, name = 'lock.d') {
+  const lock = path.join(L.root, name);
   const t0 = Date.now();
   for (;;) {
     try { fs.mkdirSync(lock); fs.writeFileSync(path.join(lock, 'pid'), String(process.pid)); break; } catch {
@@ -241,8 +241,8 @@ export async function run(L, cmd, p = {}) {
       } finally { auth.db.close(); }
     });
   }
-  return withLock(L, async () => {
-    const auth = new Authority(L.state, { keyDir: L.keys, anchorRemote: { url: L.anchors, ref: AUTH_ANCHOR_REF } });
+  const r = await withLock(L, async () => {
+    const auth = openAuth(L);
     const repo = repoId(L.repo);
     try {
       // Agent identity: an agent name is bound to the OS uid that first claimed it (system mode:
@@ -265,16 +265,24 @@ export async function run(L, cmd, p = {}) {
           return { ok: true, claim: c.id, permit: signPermit(L, { kind: 'agent', uid: callerUid(), agent: c.agent, claim: c.id, ref: `refs/heads/agents/${c.agent}`, paths: c.paths, baseline: c.baseline }) };
         }
         case 'land': {
+          // Enqueue only (under the authority lock). The caller then waits in landWait(), where
+          // one leader at a time drains the queue in file-disjoint batches.
           const c = claimRow(auth, repo, p.agent);
           if (!c) return { ok: false, status: 'refused', reason: `no active authority claim for ${p.agent}` };
           const ref = safeGit(L.repo, ['rev-parse', '--verify', '--quiet', `refs/heads/agents/${c.agent}`], { allowFailure: true }).stdout.trim();
           if (!ref) return { ok: false, status: 'refused', reason: 'nothing pushed to the authority for this claim' };
           if (p.candidate && p.candidate !== ref) return { ok: false, status: 'refused', reason: 'authority agent ref differs from the client branch', authority: ref, client: p.candidate };
-          safeGit(L.repo, ['update-ref', `refs/heads/${c.branch}`, ref]);
+          if (p.job !== undefined && !JOB_RE.test(String(p.job))) return { ok: false, status: 'refused', reason: 'bad job id' };
           const job = p.job || `j_${randomBytes(6).toString('hex')}`;
-          const r = await promote(auth, c, job);
-          const head = auth.db.prepare('SELECT seq, entry_hash FROM ledger WHERE repo = ? ORDER BY seq DESC LIMIT 1').get(repo);
-          return { ...r, authority_entry: head, job };
+          // a job id belongs to the agent that first used it (ledger or queue): no cross-agent reuse
+          const owner = auth.db.prepare("SELECT json_extract(payload, '$.agent') AS a FROM ledger WHERE repo = ? AND json_extract(payload, '$.job') = ? AND json_extract(payload, '$.agent') IS NOT NULL LIMIT 1").get(repo, job)?.a
+            ?? auth.db.prepare('SELECT agent FROM landq WHERE job = ?').get(job)?.agent;
+          if (owner && owner !== c.agent) return { ok: false, status: 'refused', reason: 'job id belongs to another agent' };
+          const q = auth.db.prepare('SELECT result FROM landq WHERE job = ?').get(job);
+          if (q && q.result === null) return { ok: false, status: 'refused', reason: 'job already queued' };
+          safeGit(L.repo, ['update-ref', `refs/heads/${c.branch}`, ref]);
+          auth.db.prepare('INSERT OR REPLACE INTO landq (job, agent, claim, candidate, created_at, result) VALUES (?, ?, ?, ?, ?, NULL)').run(job, c.agent, c.id, ref, new Date().toISOString());
+          return { ok: true, status: 'queued', job, __land: true };
         }
         case 'release': {
           const c = claimRow(auth, repo, p.agent);
@@ -293,6 +301,68 @@ export async function run(L, cmd, p = {}) {
       }
     } finally { auth.db.close(); }
   });
+  if (r && r.__land) return landWait(L, r.job);
+  return r;
+}
+
+// ---- batched landing ----
+const JOB_RE = /^[A-Za-z0-9_-]{1,80}$/;
+const openAuth = (L) => new Authority(L.state, { keyDir: L.keys, anchorRemote: { url: L.anchors, ref: AUTH_ANCHOR_REF } });
+const revq = (L, r) => safeGit(L.repo, ['rev-parse', '--verify', '--quiet', r], { allowFailure: true }).stdout.trim();
+function setResult(auth, repo, job, r) {
+  const head = auth.db.prepare('SELECT seq, entry_hash FROM ledger WHERE repo = ? ORDER BY seq DESC LIMIT 1').get(repo);
+  auth.db.prepare('UPDATE landq SET result = ? WHERE job = ?').run(JSON.stringify({ ...r, authority_entry: head, job }), job);
+}
+function takeResult(L, job) {
+  return withLock(L, () => {
+    const auth = openAuth(L);
+    try {
+      const q = auth.db.prepare('SELECT result FROM landq WHERE job = ?').get(job);
+      if (!q) return { ok: false, status: 'error', error: 'land request vanished', job };
+      if (q.result === null) return null;
+      auth.db.prepare('DELETE FROM landq WHERE job = ?').run(job);
+      return JSON.parse(q.result);
+    } finally { auth.db.close(); }
+  });
+}
+// one leader at a time (land.d lock, taken before lock.d, never the other way round)
+async function landWait(L, job) {
+  for (let round = 0; ; round++) {
+    const r = await withLock(L, async () => (await takeResult(L, job)) ?? (await leadBatch(L), takeResult(L, job)), 'land.d');
+    if (r) return r;
+    if (round > 10_000) return { ok: false, status: 'error', error: 'land queue did not drain', job };
+  }
+}
+async function leadBatch(L) {
+  const auth = openAuth(L);
+  const repo = repoId(L.repo);
+  try {
+    let plan = null;
+    await withLock(L, async () => {
+      const items = [];
+      for (const q of auth.db.prepare('SELECT * FROM landq WHERE result IS NULL ORDER BY created_at, job').all()) {
+        const c = claimRow(auth, repo, q.agent);
+        if (!c || c.id !== q.claim) { setResult(auth, repo, q.job, { ok: false, status: 'refused', reason: 'claim released before landing' }); continue; }
+        if (revq(L, `refs/heads/agents/${c.agent}`) !== q.candidate) { setResult(auth, repo, q.job, { ok: false, status: 'refused', reason: 'authority agent ref moved after the land request' }); continue; }
+        safeGit(L.repo, ['update-ref', `refs/heads/${c.branch}`, q.candidate]);
+        items.push({ claim: c, jobId: q.job });
+      }
+      plan = await planBatch(auth, items);
+      for (const [job, r] of plan.results) setResult(auth, repo, job, r);
+    });
+    if (!plan?.batch) return;
+    const w = await runBatchWitnesses(plan.batch);
+    await withLock(L, async () => {
+      const valid = (ms) => ms.every((m) => {
+        const c = claimRow(auth, repo, m.claim.agent);
+        const q = auth.db.prepare('SELECT candidate, result FROM landq WHERE job = ?').get(m.jobId);
+        return c && c.id === m.claim.id && q && q.result === null && q.candidate === m.candidate
+          && revq(L, `refs/heads/agents/${c.agent}`) === m.candidate && revq(L, `refs/heads/${c.branch}`) === m.candidate;
+      });
+      const out = await commitBatch(auth, plan.batch, w, valid);
+      for (const [job, r] of out) setResult(auth, repo, job, r);
+    });
+  } finally { auth.db.close(); }
 }
 
 // refs that moved without the hook / ladder: main must equal the last ledger promote (or seed);
@@ -300,7 +370,8 @@ export async function run(L, cmd, p = {}) {
 export function audit(L, auth, repo, conf = readConf(L)) {
   const bad = [];
   const last = auth.db.prepare("SELECT payload FROM ledger WHERE repo = ? AND kind = 'promote' ORDER BY seq DESC LIMIT 1").get(repo);
-  const expectMain = last ? JSON.parse(last.payload).main_after : conf.seed;
+  const lp = last && JSON.parse(last.payload);
+  const expectMain = lp ? (lp.batch?.main_after ?? lp.main_after) : conf.seed;
   const main = safeGit(L.repo, ['rev-parse', 'refs/heads/main']).stdout.trim();
   if (main !== expectMain) bad.push({ ref: 'refs/heads/main', sha: main, expected: expectMain });
   const acc = new Map();

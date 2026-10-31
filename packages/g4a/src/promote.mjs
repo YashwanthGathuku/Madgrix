@@ -234,7 +234,8 @@ export async function promote(auth, claim, jobId, hooks = {}) {
     }
     if (attempt === 0) {
       const lastMain = auth.db.prepare("SELECT payload FROM ledger WHERE repo = ? AND kind IN ('promote', 'main_external') ORDER BY seq DESC LIMIT 1").get(claim.repo);
-      const expect = lastMain && (JSON.parse(lastMain.payload).main_after ?? JSON.parse(lastMain.payload).actual);
+      const lp = lastMain && JSON.parse(lastMain.payload);
+      const expect = lp && (lp.batch?.main_after ?? lp.main_after ?? lp.actual);
       if (expect && expect !== main) await auth.serial(() => auth.appendLedger(claim.repo, 'main_external', { job: jobId, expected: expect, actual: main, note: 'main moved outside the g4a daemon' }));
     }
     const c = combine(top, main, candidate, claim.agent, log);
@@ -286,6 +287,114 @@ export async function promote(auth, claim, jobId, hooks = {}) {
   }
   await auth.serial(() => auth.appendLedger(claim.repo, 'promote_refused', { job: jobId, claim: claim.id, agent: claim.agent, reason: 'cas_retries_exhausted' }));
   return { ok: false, status: 'refused', reason: 'cas_retries_exhausted', log };
+}
+
+// ---- parallel batch landing ----
+// Queued land requests whose changes touch disjoint files (and none of each other's witness
+// paths) are combined into one chain m0 -> m1 -> ... -> final (every candidate is a parent of
+// its step, so each exact pushed SHA lands), the union of their frozen + own witnesses runs ONCE
+// on `final`, and one CAS moves main m0 -> final. Each claim still gets its own promote_intent
+// and promote ledger entry (main_before/main_after = its chain step; batch.main_after = final)
+// carrying the shared signed witness report. Anything the batch cannot take cleanly (refusals,
+// review, conflicts, mergiraf/union rungs, pins, recovery) goes through promote() unchanged.
+const BATCH_RUNGS = new Set(['fast-forward', 'git-merge-tree']);
+export const MAX_BATCH = 32;
+const hitsGlobs = (globs, f) => globs.some((g) => f === g || globMatchesPath(g, f));
+// items: [{ claim, jobId }] in queue order. Runs under the caller's lock. Returns
+// { results: Map(jobId -> result), batch: plan | null }; items in neither are deferred.
+export async function planBatch(auth, items) {
+  const results = new Map();
+  if (!items.length) return { results, batch: null };
+  const top = repoTop(items[0].claim.worktree);
+  const repo = items[0].claim.repo;
+  const pins = frozenPins(auth, repo);
+  const eligible = [], solo = [];
+  for (const it of items) {
+    const { claim, jobId } = it;
+    if (claim.repo !== repo) { solo.push(it); continue; }
+    const done = auth.db.prepare("SELECT 1 FROM ledger WHERE repo = ? AND kind IN ('promote', 'promote_intent') AND json_extract(payload, '$.job') = ?").get(repo, jobId);
+    const candidate = safeGit(top, ['rev-parse', '--verify', `refs/heads/${claim.branch}^{commit}`]).stdout.trim();
+    if (done || candidate === claim.baseline || !claim.witnesses.length || isAncestor(top, candidate, readMain(top))) { solo.push(it); continue; }
+    const changed = splitNul(safeGit(top, ['diff', '--name-only', '-z', `${claim.baseline}...${candidate}`]).stdout);
+    if (!changed.length || changed.some((f) => !claim.paths.some((g) => globMatchesPath(g, f)) || pins.has(f))) { solo.push(it); continue; }
+    eligible.push({ ...it, candidate, changed });
+  }
+  for (const it of solo) results.set(it.jobId, await promote(auth, it.claim, it.jobId));
+  if (eligible.length === 0) return { results, batch: null };
+  const m0 = readMain(top);
+  let cur = m0;
+  const used = new Set(), wglobs = [], members = [];
+  for (const it of eligible) {
+    if (members.length >= MAX_BATCH) break;
+    const wp = it.claim.witness_paths ?? [];
+    if (it.changed.some((f) => used.has(f) || hitsGlobs(wglobs, f)) || members.some((m) => m.changed.some((f) => hitsGlobs(wp, f)))) continue;
+    const c = combine(top, cur, it.candidate, it.claim.agent, []);
+    if (!c.sha || !BATCH_RUNGS.has(c.rung)) continue;
+    members.push({ ...it, before: cur, after: c.sha, rung: c.rung });
+    cur = c.sha; for (const f of it.changed) used.add(f); wglobs.push(...wp);
+  }
+  const drift = members.length >= 2 && [...pins].some(([f, p]) => blobAt(top, cur, f) !== p.blob);
+  if (members.length < 2 || drift) {
+    // nothing to batch: land the oldest eligible request alone (the rest stay queued)
+    const first = eligible[0];
+    results.set(first.jobId, await promote(auth, first.claim, first.jobId));
+    return { results, batch: null };
+  }
+  const lastMain = auth.db.prepare("SELECT payload FROM ledger WHERE repo = ? AND kind IN ('promote', 'main_external') ORDER BY seq DESC LIMIT 1").get(repo);
+  const lp = lastMain && JSON.parse(lastMain.payload);
+  const expect = lp && (lp.batch?.main_after ?? lp.main_after ?? lp.actual);
+  if (expect && expect !== m0) await auth.serial(() => auth.appendLedger(repo, 'main_external', { job: members[0].jobId, expected: expect, actual: m0, note: 'main moved outside the g4a daemon' }));
+  const wit = new Map();
+  for (const m of members) for (const w of intentWitnesses(auth, m.claim)) {
+    const e = wit.get(w.cmd) ?? { cmd: w.cmd, agents: [] };
+    for (const a of w.agents) if (!e.agents.includes(a)) e.agents.push(a);
+    wit.set(w.cmd, e);
+  }
+  return { results, batch: { top, repo, m0, final: cur, members, witnesses: [...wit.values()] } };
+}
+// Runs WITHOUT the authority lock: witnesses on the exact final tree.
+export const runBatchWitnesses = (b) => runWitnesses(b.top, b.final, b.witnesses);
+// Under the lock again. stillValid(members) re-checks claims and pushed refs. Returns a Map of
+// results; an empty map means "deferred" (main or a claim changed while witnesses ran).
+export async function commitBatch(auth, b, results, stillValid = () => true) {
+  const out = new Map();
+  const { top, repo, m0, final, members } = b;
+  if (readMain(top) !== m0 || !stillValid(members)) return out;
+  const tree = safeGit(top, ['rev-parse', `${final}^{tree}`]).stdout.trim();
+  const report = { version: 'g4a-witness-report/v1', merged: final, tree, candidate: null, main_before: m0, rung: 'batch',
+    batch: members.map((m) => ({ job: m.jobId, claim: m.claim.id, agent: m.claim.agent, candidate: m.candidate, main_before: m.before, main_after: m.after, rung: m.rung })), results };
+  const signer = await auth.signer();
+  const { signature } = await signer.sign(Buffer.from(canonicalJson(report)));
+  if (!results.every((r) => r.exit === 0)) {
+    // attribute the failure: each claim goes through the full sequential ladder on its own
+    await auth.serial(() => auth.appendLedger(repo, 'batch_witness_failed', { jobs: members.map((m) => m.jobId), final, witness: { report, signature, keyId: signer.keyId } }));
+    for (const m of members) out.set(m.jobId, await promote(auth, m.claim, m.jobId));
+    return out;
+  }
+  const id = `b_${final.slice(0, 12)}`;
+  const witness = { report, signature, keyId: signer.keyId };
+  const payloads = members.map((m, i) => ({ job: m.jobId, claim: m.claim.id, agent: m.claim.agent, candidate: m.candidate, main_before: m.before, main_after: m.after, rung: m.rung, verdict: 'ADMIT', witness, attempts: 1,
+    batch: { id, index: i, size: members.length, main_before: m0, main_after: final } }));
+  for (const p of payloads) await auth.serial(() => auth.appendLedger(repo, 'promote_intent', p));
+  const mco = mainCheckout(top, m0);
+  if (mco?.dirty) {
+    for (const m of members) {
+      await auth.serial(() => auth.appendLedger(repo, 'promote_refused', { job: m.jobId, claim: m.claim.id, agent: m.claim.agent, verdict: 'REFUSE', reason: 'main_checked_out_dirty', worktree: mco.path, detail: mco.dirty }));
+      out.set(m.jobId, { ok: false, status: 'refused', verdict: 'REFUSE', reason: 'main_checked_out_dirty', worktree: mco.path });
+    }
+    return out;
+  }
+  const cas = safeGit(top, ['update-ref', '-m', `g4a promote batch ${id} (${members.length})`, 'refs/heads/main', final, m0 || ZERO], { allowFailure: true });
+  if (cas.status !== 0) return out;
+  let checkout;
+  if (mco) { const rt = safeGit(mco.path, ['read-tree', '-u', '-m', m0, final], { allowFailure: true }); checkout = { path: mco.path, updated: rt.status === 0 }; }
+  for (let i = 0; i < members.length; i++) {
+    const m = members[i], p = payloads[i];
+    if (checkout) p.main_checkout = checkout;
+    const e = await auth.serial(async () => { const r = await auth.appendLedger(repo, 'promote', p); freezeIntent(auth, m.claim, m.after); return r; });
+    out.set(m.jobId, { ok: true, status: 'promoted', verdict: 'ADMIT', main: final, rung: m.rung, attempts: 1, entry: e.seq, batch: { id, index: i, size: members.length } });
+  }
+  return out;
 }
 
 export function freezeIntent(auth, claim, mainAfter) {
