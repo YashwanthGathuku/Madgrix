@@ -10,7 +10,7 @@ import { createHash } from 'node:crypto';
 import { Authority, repoId, rowClaim } from './authority.mjs';
 import { promote } from './promote.mjs';
 import { promoteViaAuthority } from './promote-authority.mjs';
-import { locate, call, clientAnchorRemote, fetchMain } from './authority-client.mjs';
+import { locate, callAsync, clientAnchorRemote, fetchMainAsync } from './authority-client.mjs';
 import { safeGit } from '../../../scripts/lib/safe-git.mjs';
 import { randomHex } from '../../../src/lib/canonical.ts';
 import { g4aHome } from './lib.mjs';
@@ -63,22 +63,43 @@ export async function startDaemon(home = g4aHome(), { hooks = {}, keyDir } = {})
     auth.db.prepare("UPDATE jobs SET status = 'done', result = ? WHERE id = ?").run(JSON.stringify(redactDeep(result)), job.id);
     bus.emit(job.id, result);
   }
+  // Authority-backed jobs run concurrently (bounded): the authority serializes them under its
+  // lock and lands file-disjoint ones together in one witnessed batch. Local landing
+  // (G4A_LOCAL_LAND, test-only) keeps the one-worker-per-repo order.
+  const MAX_PARALLEL = Math.max(1, Math.min(64, Number(process.env.G4A_LAND_PARALLEL) || 16));
+  const running = new Set();
+  const viaAuthority = (job) => {
+    try { const row = auth.db.prepare('SELECT worktree FROM claims WHERE id = ?').get(JSON.parse(job.payload).claimId); return !!(row && locate(row.worktree)); } catch { return false; }
+  };
   function loop() {
     const queued = auth.db.prepare("SELECT * FROM jobs WHERE status = 'queued' ORDER BY created_at, id").all();
     for (const job of queued) {
+      if (running.has(job.id)) continue;
+      if (viaAuthority(job)) {
+        if (running.size >= MAX_PARALLEL) continue;
+        running.add(job.id);
+        runJob(job).finally(() => { running.delete(job.id); setImmediate(loop); });
+        continue;
+      }
       const repo = jobRepo(job);
       if (workers.has(repo)) continue;
       const w = (async () => {
         try {
           for (let j = job; j; ) {
             await runJob(j);
-            j = auth.db.prepare("SELECT * FROM jobs WHERE status = 'queued' ORDER BY created_at, id").all().find((x) => jobRepo(x) === repo);
+            j = auth.db.prepare("SELECT * FROM jobs WHERE status = 'queued' ORDER BY created_at, id").all().find((x) => jobRepo(x) === repo && !viaAuthority(x));
           }
         } finally { workers.delete(repo); }
       })();
       workers.set(repo, w);
     }
   }
+  let scratchN = 0;
+  const fetchMainScratch = async (loc, repo) => {
+    const ref = `refs/g4a/authority-main-c${process.pid}-${++scratchN}`;
+    try { return await fetchMainAsync(loc, repo, ref); }
+    finally { const o = safeGit(repo, ['rev-parse', '--verify', '--quiet', ref], { allowFailure: true }).stdout.trim(); if (o) safeGit(repo, ['update-ref', '-d', ref, o], { allowFailure: true }); }
+  };
 
   const methods = {
     ping: () => ({ ok: true, pid: process.pid, requeued }),
@@ -87,9 +108,9 @@ export async function startDaemon(home = g4aHome(), { hooks = {}, keyDir } = {})
       if (!loc) return auth.claim(p);
       // the authority decides first (overlap / witness-path guards on ITS claims); local mirrors
       const local = safeGit(p.repo, ['rev-parse', '--verify', '--quiet', 'refs/heads/main'], { allowFailure: true }).stdout.trim();
-      const amain = fetchMain(loc, p.repo);
+      const amain = await fetchMainScratch(loc, p.repo);
       if (local !== amain) return { ok: false, refused: 'main_out_of_sync', local, authority: amain };
-      const a = call(loc, 'claim', { agent: p.agent, paths: p.paths, witnesses: p.witnesses, witnessPaths: p.witnessPaths, allowOverlap: p.allowOverlap, credential: credOf(p) });
+      const a = await callAsync(loc, 'claim', { agent: p.agent, paths: p.paths, witnesses: p.witnesses, witnessPaths: p.witnessPaths, allowOverlap: p.allowOverlap, credential: credOf(p) });
       if (!a.ok) return { ...a, via: `authority:${loc.mode}` };
       const cred = a.agent_credential ?? credOf(p);
       let issued = {};
@@ -97,13 +118,13 @@ export async function startDaemon(home = g4aHome(), { hooks = {}, keyDir } = {})
         if (p.credentialStore === 'session') issued = { agent_credential: a.agent_credential, credential_store: 'session' };
         else { const f = credPath(p.repo, p.agent); ensurePrivateDir(path.dirname(path.dirname(f))); ensurePrivateDir(path.dirname(f)); writePrivate(f, a.agent_credential); issued = { credential_store: 'file' }; }
       }
-      try { const r = await auth.claim({ ...p, expectBaseline: a.baseline }); if (!r.ok) call(loc, 'release', { agent: p.agent, credential: cred }); return { ...r, ...issued, authority: { mode: loc.mode, claim: a.id } }; }
-      catch (e) { call(loc, 'release', { agent: p.agent, credential: cred }); throw e; }
+      try { const r = await auth.claim({ ...p, expectBaseline: a.baseline }); if (!r.ok) await callAsync(loc, 'release', { agent: p.agent, credential: cred }); return { ...r, ...issued, authority: { mode: loc.mode, claim: a.id } }; }
+      catch (e) { await callAsync(loc, 'release', { agent: p.agent, credential: cred }); throw e; }
     },
     release: async (p) => {
       // the authority decides first: a caller without the agent's credential cannot release it locally either
       const loc = locate(p.repo);
-      const a = loc ? call(loc, 'release', { agent: p.agent, credential: credOf(p) }) : null;
+      const a = loc ? await callAsync(loc, 'release', { agent: p.agent, credential: credOf(p) }) : null;
       if (a && !a.ok && a.reason === 'agent_identity') return { ok: false, status: 'refused', reason: 'agent_identity', error: a.error, authority: a };
       const r = await auth.release(p);
       if (a) r.authority = a;

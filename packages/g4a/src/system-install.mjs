@@ -114,6 +114,18 @@ h=${AGENTS_HOME}/"$name"
 [ "$#" -gt 0 ] || { echo "usage: g4a run --agent <name> -- <command> [args]" >&2; exit 2; }
 export HOME="$h" USER="$me" LOGNAME="$me" G4A_HOME="$h/.g4a" G4A_AGENT=1 G4A_AGENT_NAME="$name"
 export PATH="$h/.g4a/bin:${BIN}:${LIB}/node/bin:/usr/local/bin:/usr/bin:/bin"
+# keys granted to THIS agent only (g4a agent key NAME VAR); names re-checked here
+if [ -d "$h/.g4a/keys" ]; then
+  for f in "$h/.g4a/keys"/*; do
+    [ -f "$f" ] || continue
+    n=\${f##*/}
+    case "$n" in *[!A-Z0-9_]*|''|[!A-Z]*) continue;; esac
+    case "$n" in G4A_*|GIT_*|LD_*|NODE_*|DYLD_*|SSH_*|GPG_*|SUDO_*|BASH_*|PYTHON*|NPM_CONFIG_*) continue;; esac
+    case "$n" in *_API_KEY|*_KEY|*_TOKEN) ;; *) continue;; esac
+    v=$(head -n 1 "$f")
+    export "$n=$v"
+  done
+fi
 cd "$h/repo"
 ${BIN}/g4a daemon --detach >/dev/null 2>&1 || true
 ${BIN}/g4a authority sync --repo "$h/repo" >/dev/null 2>&1 || true
