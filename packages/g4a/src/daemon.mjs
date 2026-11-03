@@ -159,7 +159,9 @@ export async function startDaemon(home = g4aHome(), { hooks = {}, keyDir } = {})
       if (local !== amain && amain && local && process.env.G4A_AUTOSYNC !== '0'
         && safeGit(p.repo, ['symbolic-ref', '-q', 'HEAD'], { allowFailure: true }).stdout.trim() !== 'refs/heads/main'
         && safeGit(p.repo, ['merge-base', '--is-ancestor', local, amain], { allowFailure: true }).status === 0
-        && safeGit(p.repo, ['update-ref', '-m', 'g4a: auto-sync to authority main', 'refs/heads/main', amain, local], { allowFailure: true }).status === 0) local = amain;
+        && safeGit(p.repo, ['update-ref', '-m', 'g4a promote auto-sync (authority main)', 'refs/heads/main', amain, local], { allowFailure: true }).status === 0) local = amain;
+      // a concurrent promote may have moved the mirror while we fetched: judge its current value
+      if (local !== amain) local = safeGit(p.repo, ['rev-parse', '--verify', '--quiet', 'refs/heads/main'], { allowFailure: true }).stdout.trim();
       if (local !== amain) return { ok: false, refused: 'main_out_of_sync', local, authority: amain };
       const a = await callAsync(loc, 'claim', { agent: p.agent, paths: p.paths, witnesses: p.witnesses, witnessPaths: p.witnessPaths, allowOverlap: p.allowOverlap, credential: credOf(p) });
       if (!a.ok) return { ...a, via: `authority:${loc.mode}` };

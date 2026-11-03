@@ -364,7 +364,11 @@ export class Authority {
         await this.appendLedger(repo, 'claim_refused', { agent, paths, reason: 'witness_paths', guarded });
         return { ok: false, refused: 'witness_paths', guarded };
       }
-      const baseline = safeGit(top, ['rev-parse', '--verify', 'refs/heads/main^{commit}']).stdout.trim();
+      let baseline = safeGit(top, ['rev-parse', '--verify', 'refs/heads/main^{commit}']).stdout.trim();
+      // local main raced ahead of the authority's baseline (a peer landed meanwhile): branch from the
+      // authority's exact baseline when it is in local history, so the permit check is unchanged
+      if (expectBaseline && expectBaseline !== baseline && /^[0-9a-f]{40,64}$/.test(expectBaseline)
+        && safeGit(top, ['merge-base', '--is-ancestor', expectBaseline, baseline], { allowFailure: true }).status === 0) baseline = expectBaseline;
       // mirrored claims: the authority already fixed the baseline its permit will check; a local
       // worktree on any other main would carry foreign paths into the push (refused out-of-claim)
       if (expectBaseline && expectBaseline !== baseline) return { ok: false, refused: 'main_out_of_sync', local: baseline, authority: expectBaseline };

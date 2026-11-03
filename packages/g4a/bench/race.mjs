@@ -79,7 +79,7 @@ const wall = (Date.now() - t0) / 1000;
 lat.sort((a, b) => a - b);
 const q = (p) => (lat.length ? lat[Math.min(lat.length - 1, Math.floor(p * lat.length))].toFixed(0) : null);
 let verify = null;
-if (mode === 'g4a') verify = json((await g4a(['verify', '--repo', repo])).stdout).ok ?? null;
+if (mode === 'g4a') { const v = json((await g4a(['verify', '--repo', repo])).stdout); verify = v.ok ?? null; if (verify === false) errSamples.push('verify: ' + JSON.stringify(v.errors ?? v).slice(0, 300)); }
 console.log(JSON.stringify({ mode: mode + (system ? ':system' : ''), remote, agents: N, secs: SECS, wall: +wall.toFixed(1), ops: lat.length, opsPerSec: +(lat.length / wall).toFixed(2), p50: q(0.5), p95: q(0.95), p99: q(0.99), max: lat.length ? lat[lat.length - 1].toFixed(0) : null, errors, syncRetries, errSamples, verify, stepsMedianMs: Object.fromEntries(Object.entries(steps).map(([k, v]) => [k, v.sort((a, b) => a - b)[v.length >> 1]])) }));
 await g4a(['stop']);
 if (system) await g4a(['authority', 'uninstall', '--system', '--repo', repo]);

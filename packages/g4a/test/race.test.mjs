@@ -20,7 +20,11 @@ test('claim with expectBaseline refuses when local main differs, and creates no 
     const old = git('rev-parse', 'HEAD');
     fs.writeFileSync(path.join(repo, 'b'), '2'); git('add', '-A'); git('commit', '-qm', 'two'); git('checkout', '-q', '--detach');
     const auth = new Authority(path.join(W, 'home'), { keyDir: path.join(W, 'keys') });
-    const r = await auth.claim({ repo, agent: 'x', paths: ['x/**'], expectBaseline: old });
+    // an authority baseline that local main has moved past (a peer landed): branch from it exactly
+    const behind = await auth.claim({ repo, agent: 'y', paths: ['y/**'], expectBaseline: old });
+    assert.equal(behind.ok, true); assert.equal(behind.baseline, old);
+    // a baseline NOT in local history (diverged / unknown): refuse, no worktree
+    const r = await auth.claim({ repo, agent: 'x', paths: ['x/**'], expectBaseline: 'f'.repeat(40) });
     assert.equal(r.ok, false);
     assert.equal(r.refused, 'main_out_of_sync');
     assert.equal(fs.existsSync(path.join(repo, '.g4a', 'worktrees', 'x')), false);

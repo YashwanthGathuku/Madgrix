@@ -54,7 +54,13 @@ async function syncLocal(auth, claim, jobId, loc, top, candidate, base, r) {
   const payload = { ...base, candidate, main_before: local, main_after: target, verdict: 'ADMIT', rung: r.rung, authority_entry: r.authority_entry, authority_status: r.status, ...(r.batch ? { authority_batch: r.batch } : {}) };
   if (local !== target) {
     const cas = safeGit(top, ['update-ref', '-m', `g4a promote ${claim.agent} (authority)`, 'refs/heads/main', target, local || ZERO], { allowFailure: true });
-    if (cas.status !== 0) return { ok: false, status: 'refused', reason: 'local main moved during sync', landed_on_authority: true };
+    if (cas.status !== 0) {
+      // a concurrent auto-sync/promote may already have carried the mirror to (or past) target
+      const now = rev(top, 'refs/heads/main');
+      if (!(now === target || (now && safeGit(top, ['merge-base', '--is-ancestor', target, now], { allowFailure: true }).status === 0)))
+        return { ok: false, status: 'refused', reason: 'local main moved during sync', landed_on_authority: true };
+      payload.main_after_mirror = now;
+    }
     if (mco) { const rt = safeGit(mco.path, ['read-tree', '-u', '-m', local, target], { allowFailure: true }); payload.main_checkout = { path: mco.path, updated: rt.status === 0 }; }
   }
   const x = await auth.appendLedger(claim.repo, 'promote', payload); freezeIntent(auth, claim, target);
