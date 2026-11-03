@@ -30,7 +30,7 @@ export async function startDaemon(home = g4aHome(), { hooks = {}, keyDir } = {})
     if (alive) throw new Error(`g4a daemon already running on ${sock}`);
     fs.rmSync(sock, { force: true }); // stale socket from a crashed daemon
   }
-  const auth = new Authority(home, { ...(keyDir ? { keyDir } : {}), anchorRemote: (repo) => { const l = locate(repo); return l && clientAnchorRemote(l); } });
+  const auth = new Authority(home, { ...(keyDir ? { keyDir } : {}), anchorRemote: (repo) => { const l = locate(repo); return l && clientAnchorRemote(l); }, deferAnchors: 'auto' });
   const requeued = auth.db.prepare("UPDATE jobs SET status = 'queued' WHERE status = 'running'").run().changes;
   const bus = new EventEmitter();
   // Per-agent authority credentials. Default store: G4A_HOME/credentials/<repo-hash>/<agent> (0600,
@@ -63,6 +63,7 @@ export async function startDaemon(home = g4aHome(), { hooks = {}, keyDir } = {})
       }
     } catch (e) { result = { ok: false, status: 'error', error: redact(String(e.message || e)) }; }
     auth.db.prepare("UPDATE jobs SET status = 'done', result = ? WHERE id = ?").run(JSON.stringify(redactDeep(result)), job.id);
+    try { auth.flushAnchors(); } catch {}
     bus.emit(job.id, result);
   }
   // Authority-backed jobs run concurrently (bounded): the authority serializes them under its
@@ -205,7 +206,7 @@ export async function startDaemon(home = g4aHome(), { hooks = {}, keyDir } = {})
           const m = methods[req.method];
           if (!m) throw new Error(`unknown method ${req.method}`);
           return m(req.params || {});
-        }).then((result) => conn.write(JSON.stringify({ id: req.id, result }) + '\n'), (e) => conn.write(JSON.stringify({ id: req.id, error: redact(String(e.message || e)) }) + '\n'))
+        }).then((result) => { try { auth.flushAnchors(); } catch {} return result; }).then((result) => conn.write(JSON.stringify({ id: req.id, result }) + '\n'), (e) => conn.write(JSON.stringify({ id: req.id, error: redact(String(e.message || e)) }) + '\n'))
           .catch(() => {});
       }
     });

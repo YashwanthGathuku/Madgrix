@@ -50,6 +50,33 @@ About 6x the throughput and 4x lower median latency, with the same guarantees (o
 permits, exact reviewed SHA per claim, a ledger entry per claim plus the batch record). Plain
 git push is still ~95 ops/s: a g4a op is claim + witness + review + release, not one push.
 
+## Entire's published numbers vs. g4a (honest comparison)
+
+Entire's ForgeMark race preset (16 agents, 1-3 files x 1 KB, 60 s, one branch per agent,
+vendor-run on their hardware): Entire 418 pushes/s; GitHub 4.7 (rate-limited); Cursor Origin 65;
+Pierre 15; GitLab 10. Those are raw branch pushes to a hosted forge.
+
+g4a measures something else: every op here is claim -> signed permit -> witness run -> CAS landing
+of the exact reviewed SHA onto `main` -> signed, hash-chained ledger entries -> release, with
+claim-scope checks. g4a does **not** beat 418/s and is not close; a governed landing is not a
+branch push. Plain local `git push` on this box is the comparable ceiling for raw pushes (see
+Results above).
+
+| run (this box, `node bench/race.mjs g4a N S`) | before | after group-committed anchors + lock backoff |
+|---|---|---|
+| N=16, ops/s | 0.74-0.94 | 1.08 (20 s run; p50 12.4 s) |
+| N=1, ops/s | 0.42 | 0.34 (12 s run, 5 ops: within noise) |
+
+Profile (temporary trace, N=1): each authority call is a fresh node process (~80-100 ms boot +
+~40 ms reanchor); each ledger append used to write and push its own anchor (~82 ms push); the
+authority lock is held ~700 ms per op, which caps serial throughput near 1.4 ops/s. The change:
+anchors are written once per locked authority command (and in the daemon within 5 ms / before
+each reply) for the latest head, instead of once per entry. Nothing is skipped: every entry is
+still chained and signed, rollback checks run before every append, anchors only move forward,
+and a crash before a flush is caught up by `reanchorAll()` at next start (test/anchors.test.mjs).
+Next steps that would matter more: a long-lived authority process (removes per-call boot and
+reanchor), and fewer git spawns per anchor.
+
 ## Why ForgeMark can't drive g4a directly
 
 ForgeMark speaks smart-HTTP and pushes plain `refs/forgemark/*` branches with no push options.

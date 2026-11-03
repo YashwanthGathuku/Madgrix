@@ -75,14 +75,15 @@ export function initRoot({ root, pub, seed, clientRepo, mode }) {
 // ---- service commands ----
 function withLock(L, fn, name = 'lock.d') {
   const lock = path.join(L.root, name);
-  const t0 = Date.now();
+  const t0 = Date.now(); let spins = 0;
   for (;;) {
     try { fs.mkdirSync(lock); fs.writeFileSync(path.join(lock, 'pid'), String(process.pid)); break; } catch {
       let pid = 0; try { pid = Number(fs.readFileSync(path.join(lock, 'pid'), 'utf8')); } catch {}
       let alive = false; try { if (pid) { process.kill(pid, 0); alive = true; } } catch {}
       if (pid && !alive) { fs.rmSync(lock, { recursive: true, force: true }); continue; }
       if (Date.now() - t0 > 900_000) throw new Error('authority lock timeout');
-      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
+      // short, growing, jittered waits (2 ms .. 25 ms): a waiter takes the lock soon after release
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Math.min(25, 2 + (spins++) * 2) + Math.random() * 3);
     }
   }
   const release = () => fs.rmSync(lock, { recursive: true, force: true });
@@ -299,7 +300,7 @@ export async function run(L, cmd, p = {}) {
         case 'audit': { await ingestRefusals(L, auth, repo); return audit(L, auth, repo, conf); }
         default: return { ok: false, error: `unknown authority command ${cmd}` };
       }
-    } finally { auth.db.close(); }
+    } finally { try { auth.flushAnchors(); } finally { auth.db.close(); } }
   });
   if (r && r.__land) return landWait(L, r.job);
   return r;
@@ -307,7 +308,7 @@ export async function run(L, cmd, p = {}) {
 
 // ---- batched landing ----
 const JOB_RE = /^[A-Za-z0-9_-]{1,80}$/;
-const openAuth = (L) => new Authority(L.state, { keyDir: L.keys, anchorRemote: { url: L.anchors, ref: AUTH_ANCHOR_REF } });
+const openAuth = (L) => new Authority(L.state, { keyDir: L.keys, anchorRemote: { url: L.anchors, ref: AUTH_ANCHOR_REF }, deferAnchors: 'manual' });
 const revq = (L, r) => safeGit(L.repo, ['rev-parse', '--verify', '--quiet', r], { allowFailure: true }).stdout.trim();
 function setResult(auth, repo, job, r) {
   const head = auth.db.prepare('SELECT seq, entry_hash FROM ledger WHERE repo = ? ORDER BY seq DESC LIMIT 1').get(repo);
@@ -386,6 +387,7 @@ async function leadBatch(L) {
       }
       plan = await planBatch(auth, items);
       for (const [job, r] of plan.results) setResult(auth, repo, job, r);
+      auth.flushAnchors(); // anchors reach the new head before the lock is released
     });
     if (!plan?.batch) return;
     const w = await runBatchWitnesses(plan.batch);
@@ -398,6 +400,7 @@ async function leadBatch(L) {
       });
       const out = await commitBatch(auth, plan.batch, w, valid);
       for (const [job, r] of out) setResult(auth, repo, job, r);
+      auth.flushAnchors();
     });
   } finally { auth.db.close(); }
 }

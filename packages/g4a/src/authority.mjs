@@ -141,8 +141,14 @@ const ANCHOR_ENV = { GIT_AUTHOR_NAME: 'g4a', GIT_AUTHOR_EMAIL: 'g4a@localhost', 
 export class Authority {
   // anchorRemote: { url, ref = ANCHOR_REF, receivePack?, uploadPack? }; defaults to G4A_ANCHOR_REMOTE.
   // Phase 2 points it at the authority's append-only anchors.git (see authority-client.mjs).
-  constructor(home, { keyDir: kd = keyDir(), anchorRemote } = {}) {
+  // deferAnchors: group commit for the ledger-head anchors. Entries are chained and stored at once;
+  // the anchors (file, ref chain, remote push) are written for the latest head by flushAnchors()
+  // ('manual': the caller flushes before releasing its lock; 'auto': within ~5 ms and before every
+  // daemon reply). A crash in between is the same window as a crash between append and anchor
+  // today: reanchorAll() catches up on the next start, and anchors never move backwards.
+  constructor(home, { keyDir: kd = keyDir(), anchorRemote, deferAnchors = false } = {}) {
     this.home = path.resolve(home);
+    this.deferAnchors = deferAnchors; this.pendingAnchors = new Set(); this.anchorTimer = null;
     this.anchorRemoteSpec = anchorRemote ?? null;
     this.keyDir = path.resolve(kd);
     if (within(this.keyDir, this.home) || within(this.home, this.keyDir)) throw new Error(`key dir ${this.keyDir} must not be inside or contain G4A_HOME ${this.home}`);
@@ -236,6 +242,14 @@ export class Authority {
       this.writeAnchor(repo, h.seq, h.entry_hash); // catches up after a crash between append and anchor
     }
   }
+  flushAnchors() {
+    if (this.anchorTimer) { clearTimeout(this.anchorTimer); this.anchorTimer = null; }
+    for (const repo of [...this.pendingAnchors]) {
+      const h = this.db.prepare('SELECT seq, entry_hash FROM ledger WHERE repo = ? ORDER BY seq DESC LIMIT 1').get(repo);
+      if (h) this.writeAnchor(repo, h.seq, h.entry_hash);
+      this.pendingAnchors.delete(repo);
+    }
+  }
   async signer() { return witnessSignerFromKey(this.privateKey); }
 
   // ---- ledger (hash chain from src/lib/ledger.ts) ----
@@ -246,7 +260,11 @@ export class Authority {
     const entry_hash = await ledgerEntryHash(fields, sha256Hex);
     this.db.prepare('INSERT INTO ledger (repo, seq, ts, kind, payload, payload_hash, prev_hash, entry_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
       .run(repo, fields.seq, fields.ts, kind, canonicalJson(payload), fields.payload_hash, fields.prev_hash, entry_hash);
-    this.writeAnchor(repo, fields.seq, entry_hash);
+    if (!this.deferAnchors) this.writeAnchor(repo, fields.seq, entry_hash);
+    else {
+      this.pendingAnchors.add(repo);
+      if (this.deferAnchors === 'auto' && !this.anchorTimer) this.anchorTimer = setTimeout(() => { try { this.flushAnchors(); } catch {} }, 5);
+    }
     return { ...fields, entry_hash };
   }
 

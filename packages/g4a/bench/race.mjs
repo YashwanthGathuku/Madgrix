@@ -23,7 +23,8 @@ fs.chmodSync(W, 0o755);
 const env = { ...process.env, G4A_HOME: path.join(W, 'home'), G4A_KEY_DIR: path.join(W, 'keys'), GIT_AUTHOR_NAME: 'race', GIT_AUTHOR_EMAIL: 'race@local', GIT_COMMITTER_NAME: 'race', GIT_COMMITTER_EMAIL: 'race@local', G4A_RAW: '1' };
 for (const k of Object.keys(env)) if (k.startsWith('CODEX_') || k === 'CLAUDECODE' || k === 'G4A_AGENT' || k === 'G4A_LOCAL_LAND') delete env[k];
 const run = (cmd, args, opts = {}) => new Promise((res) => execFile(cmd, args, { env, maxBuffer: 1 << 24, ...opts }, (err, stdout, stderr) => res({ code: err ? (err.code ?? 1) : 0, stdout: String(stdout), stderr: String(stderr) })));
-const g4a = (args) => run(process.execPath, ['--no-warnings', CLI, ...args]);
+const steps = {};
+const g4a = async (args) => { const t = Date.now(); const r = await run(process.execPath, ['--no-warnings', CLI, ...args]); (steps[args[0]] ??= []).push(Date.now() - t); return r; };
 const json = (s) => { try { return JSON.parse(s); } catch { return {}; } };
 const files = (dir, tag) => { const n = 1 + crypto.randomInt(3); for (let i = 0; i < n; i++) fs.writeFileSync(path.join(dir, `f${i}.txt`), crypto.randomBytes(512).toString('hex')); return n; };
 
@@ -79,7 +80,7 @@ lat.sort((a, b) => a - b);
 const q = (p) => (lat.length ? lat[Math.min(lat.length - 1, Math.floor(p * lat.length))].toFixed(0) : null);
 let verify = null;
 if (mode === 'g4a') verify = json((await g4a(['verify', '--repo', repo])).stdout).ok ?? null;
-console.log(JSON.stringify({ mode: mode + (system ? ':system' : ''), remote, agents: N, secs: SECS, wall: +wall.toFixed(1), ops: lat.length, opsPerSec: +(lat.length / wall).toFixed(2), p50: q(0.5), p95: q(0.95), p99: q(0.99), max: lat.length ? lat[lat.length - 1].toFixed(0) : null, errors, syncRetries, errSamples, verify }));
+console.log(JSON.stringify({ mode: mode + (system ? ':system' : ''), remote, agents: N, secs: SECS, wall: +wall.toFixed(1), ops: lat.length, opsPerSec: +(lat.length / wall).toFixed(2), p50: q(0.5), p95: q(0.95), p99: q(0.99), max: lat.length ? lat[lat.length - 1].toFixed(0) : null, errors, syncRetries, errSamples, verify, stepsMedianMs: Object.fromEntries(Object.entries(steps).map(([k, v]) => [k, v.sort((a, b) => a - b)[v.length >> 1]])) }));
 await g4a(['stop']);
 if (system) await g4a(['authority', 'uninstall', '--system', '--repo', repo]);
 fs.rmSync(W, { recursive: true, force: true });
