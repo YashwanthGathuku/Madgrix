@@ -88,8 +88,9 @@ export async function serve(root, { idleMs = Number(process.env.G4A_SERVE_IDLE_M
   const old = process.umask(0o177);
   try { await new Promise((res, rej) => server.listen(sock, res).on('error', rej)); } finally { process.umask(old); }
   fs.chmodSync(sock, 0o600);
+  fs.writeFileSync(path.join(dir, 'pid'), String(process.pid), { mode: 0o600 });
   bump();
-  for (const s of ['SIGINT', 'SIGTERM']) process.on(s, () => { server.close(); fs.rmSync(sock, { force: true }); process.exit(0); });
+  for (const s of ['SIGINT', 'SIGTERM']) process.on(s, () => { server.close(); fs.rmSync(sock, { force: true }); fs.rmSync(path.join(dir, 'pid'), { force: true }); process.exit(0); });
   return { ok: true, sock, pid: process.pid };
 }
 
@@ -169,6 +170,24 @@ async function serveSystem(L, idleMs) {
   return { ok: true, sock, pid: process.pid, system: true };
 }
 
+// pid of the live server for this authority, or 0. Only a process whose argv is this server file
+// with this exact --root is accepted (a recycled or planted pid is never signalled).
+export function serverPid(root, { system = false, pub } = {}) {
+  const f = system ? path.join(path.dirname(sysSock(pub)), 'serve.d', 'pid') : path.join(runDir(root), 'pid');
+  let pid = 0; try { pid = Number(fs.readFileSync(f, 'utf8').trim()); } catch { return 0; }
+  if (!Number.isInteger(pid) || pid <= 1) return 0;
+  let argv; try { argv = fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8').split('\0'); } catch { return 0; }
+  const me = fileURLToPath(import.meta.url), i = argv.indexOf('--root');
+  return argv.includes(me) && i > 0 && path.resolve(argv[i + 1] ?? '') === path.resolve(root) && argv.includes('--fg') === system ? pid : 0;
+}
+export async function stopServer(root, opts = {}) {
+  const pid = serverPid(root, opts);
+  if (!pid) return { ok: true, running: false };
+  try { process.kill(pid, 'SIGTERM'); } catch (e) { return { ok: false, error: `cannot stop server pid ${pid}: ${e.code}` }; }
+  for (let i = 0; i < 50; i++) { try { process.kill(pid, 0); } catch { return { ok: true, stopped: pid }; } await new Promise((r) => setTimeout(r, 100)); }
+  return { ok: false, error: `server pid ${pid} did not exit` };
+}
+
 // client: one request over the socket; null when no server is reachable (caller falls back)
 // system: { pub } of a system-mode authority (socket PUB/<id>/run/s.sock, kernel peer uid, no token)
 export function request(root, cmd, p, { timeoutMs = 900_000, system = false, pub } = {}) {
@@ -209,7 +228,10 @@ export function request(root, cmd, p, { timeoutMs = 900_000, system = false, pub
 if (process.argv[1] && fs.realpathSync(process.argv[1]) === fileURLToPath(import.meta.url)) {
   const arg = (k) => { const i = process.argv.indexOf(k); return i > 0 ? process.argv[i + 1] : undefined; };
   const system = process.argv.includes('--system');
-  if (system && !process.argv.includes('--fg')) {
+  const root = arg('--root'), pub = arg('--pub');
+  if (process.argv.includes('--stop')) stopServer(root, { system, pub }).then((r) => { process.stdout.write(JSON.stringify(r) + '\n'); process.exit(r.ok ? 0 : 1); });
+  else if (process.argv.includes('--status')) { const pid = serverPid(root, { system, pub }); process.stdout.write(JSON.stringify({ ok: true, running: !!pid, pid: pid || null }) + '\n'); }
+  else if (system && !process.argv.includes('--fg')) {
     // detach from the caller's sudo session (whose monitor keeps the caller uid alive, which would
     // block that agent user's removal): re-exec in a new session, wait until the socket is up, exit
     const ch = spawn(process.execPath, ['--no-warnings', fileURLToPath(import.meta.url), ...process.argv.slice(2), '--fg'], { detached: true, stdio: 'ignore', cwd: '/' });

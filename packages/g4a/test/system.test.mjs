@@ -388,6 +388,16 @@ test('system authority server: kernel peer uid identity, attacks refused', { ski
     // ledger chain still verifies after server-side traffic (per-call path)
     const au = JSON.parse(spawnSync('sudo', ['-n', '-u', 'g4a-authority', `${WRAP}/g4a-authority`, info.id, 'audit', Buffer.from('{}').toString('base64')], { encoding: 'utf8', cwd: '/tmp' }).stdout);
     assert.equal(au.ok, true, JSON.stringify(au));
+    // CLI: serve --status / --stop / g4a stop (system mode, via the wrapper's serve-status/serve-stop)
+    const c = (...a) => JSON.parse(spawnSync(process.execPath, ['--no-warnings', CLI, ...a, '--repo', repo], { encoding: 'utf8', env }).stdout);
+    const s0 = c('authority', 'serve', '--status'); assert.equal(s0.running, true, JSON.stringify(s0));
+    assert.ok(c('authority', 'serve', '--stop').stopped > 1);
+    assert.equal(c('authority', 'serve', '--status').running, false);
+    assert.equal(fs.existsSync(sock), false, 'socket removed on stop');
+    assert.equal(c('authority', 'serve').running, true, 'CLI start in system mode');
+    assert.ok(c('stop').server?.stopped > 1, 'g4a stop covers the system server');
+    // serve-stop takes no argument either
+    assert.match(sh(`sudo -n -u g4a-agent sudo -n -u g4a-authority ${WRAP}/g4a-authority ${info.id} serve-stop eA== 2>&1; echo rc=$?`).stdout, /rc=(?!0)\d+/);
   } finally {
     spawnSync('sudo', ['-n', 'pkill', '-u', 'g4a-authority', '-f', 'authority-server.mjs']);
     if (repoIdStr) {

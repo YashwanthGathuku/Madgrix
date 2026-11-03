@@ -67,6 +67,29 @@ function startServer(loc) {
   const [bin, args] = loc.mode === 'system' ? ['sudo', ['-n', '-u', SYSTEM_USER, WRAP('g4a-authority'), loc.id, 'serve']] : [process.execPath, ['--no-warnings', SERVER, '--root', loc.root]];
   try { const ch = spawn(bin, args, { detached: true, stdio: 'ignore' }); ch.on('error', () => {}); ch.unref(); } catch {}
 }
+// `g4a authority serve`: start | fg | stop | status for this repo's server
+export async function serverCtl(loc, act) {
+  const sys = loc.mode === 'system';
+  if (sys) {
+    const sub = { start: 'serve', fg: 'serve', stop: 'serve-stop', status: 'serve-status' }[act];
+    const r = spawnSync('sudo', ['-n', '-u', SYSTEM_USER, WRAP('g4a-authority'), loc.id, sub], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+    if (sub !== 'serve') { try { return JSON.parse(r.stdout.trim().split('\n').pop()); } catch { return { ok: false, error: `server ${act} failed (exit ${r.status})` }; } }
+    if (r.status !== 0) return { ok: false, error: `server start failed (exit ${r.status})` };
+  } else {
+    const M = await import('./authority-server.mjs');
+    if (act === 'stop') return M.stopServer(loc.root);
+    if (act === 'status') { const pid = M.serverPid(loc.root); return { ok: true, running: !!pid, pid: pid || null }; }
+    if (act === 'fg') { const r = await M.serve(loc.root); process.stdout.write(JSON.stringify(r) + '\n'); if (r.already) return r; return new Promise(() => {}); }
+    started.delete(loc.root); startServer(loc);
+  }
+  const { request } = await import('./authority-server.mjs');
+  for (let i = 0; i < 50; i++) {
+    const r = await request(loc.root, 'pubinfo', {}, { system: sys, pub: loc.pub, timeoutMs: 5000 });
+    if (r !== null) return { ok: true, running: true, mode: loc.mode };
+    await new Promise((res) => setTimeout(res, 100));
+  }
+  return { ok: false, error: 'server did not come up' };
+}
 export async function callAsync(loc, cmd, params = {}) {
   if (process.env.G4A_AUTHORITY_SERVER !== '0') {
     const { SERVE_CMDS, request } = await import('./authority-server.mjs');

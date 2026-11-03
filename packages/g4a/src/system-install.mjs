@@ -80,6 +80,9 @@ case "$cmd" in claim|permit|land|release|status|ledger|audit|pubinfo) ;;
   serve) [ -z "$arg" ] || exit 2
     # long-running server for this repo (kernel peer-uid gate, see peer-gate.py); detached by the client
     exec ${ENV} ${BIN}/node --no-warnings ${LIB}/packages/g4a/src/authority-server.mjs --system --root ${REPOS}/"$id" --pub ${PUB}/"$id" ;;
+  serve-stop|serve-status) [ -z "$arg" ] || exit 2
+    # any local uid may stop it (it is restarted on demand; calls fall back to the per-call path)
+    exec ${ENV} ${BIN}/node --no-warnings ${LIB}/packages/g4a/src/authority-server.mjs --system --\${cmd#serve-} --root ${REPOS}/"$id" --pub ${PUB}/"$id" ;;
   init-root) [ -z "\${SUDO_USER:-}" ] || { echo '{"ok":false,"error":"init-root is root-only"}'; exit 2; } ;;
   *) echo '{"ok":false,"error":"bad command"}'; exit 2;; esac
 case "$arg" in *[!A-Za-z0-9+/=]*) echo '{"ok":false,"error":"bad arg"}'; exit 2;; esac

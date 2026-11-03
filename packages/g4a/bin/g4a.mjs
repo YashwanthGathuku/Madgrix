@@ -183,7 +183,7 @@ function opts(args) {
     const a = args[i];
     if (!a.startsWith('--')) { o._.push(a); continue; }
     const k = a.slice(2);
-    if (['allow-overlap', 'system', 'detach', 'remove', 'remove-worktree', 'no-wait', 'json', 'purge', 'session-credential', 'credential-stdin', 'all', 'logs', 'tee', 'credentials'].includes(k)) { o[k] = true; continue; }
+    if (['allow-overlap', 'system', 'detach', 'remove', 'remove-worktree', 'no-wait', 'json', 'purge', 'session-credential', 'credential-stdin', 'all', 'logs', 'tee', 'credentials', 'stop', 'status', 'fg'].includes(k)) { o[k] = true; continue; }
     const v = args[++i];
     if (k === 'witness' || k === 'witness-path' || k === 'var') (o[k] ||= []).push(v); else o[k] = v;
   }
@@ -303,7 +303,13 @@ async function overrideCmd(args) {
   const { repoId } = await import('../src/authority.mjs');
   out({ ...(await import('../src/override.mjs')).grantOverride({ repo: repoId(o.repo), minutes, reason: o.reason, ...(o.var ? { vars: o.var } : {}), passphrase: passOf(o) }), mode: 'same-user (detect-only)' });
 }
-async function stopCmd() { try { out(await (await client())('shutdown')); } catch (e) { out({ ok: false, error: e.message }); } }
+async function stopCmd(args = []) {
+  // stops the daemon and, when this repo has an authority, its long-running server
+  let daemon; try { daemon = await (await client())('shutdown'); } catch (e) { daemon = { ok: false, error: e.message }; }
+  let server = null;
+  try { const C = await import('../src/authority-client.mjs'); const loc = C.locate(opts(args).repo); if (loc) server = await C.serverCtl(loc, 'stop'); } catch (e) { server = { ok: false, error: e.message }; }
+  out(server ? { ...daemon, server } : daemon);
+}
 
 const [cmd, ...rest] = process.argv.slice(2);
 // Phase 2 authority. `init --system`: separate OS user (enforced). `init DIR`: same uid (detect-only).
@@ -337,6 +343,12 @@ async function authorityCmd(args) {
   const loc = C.locate(o.repo);
   if (!loc) { out({ ok: false, error: 'no authority for this repo (g4a authority init --system)' }); return; }
   if (['audit', 'status', 'ledger'].includes(sub)) return out(C.call(loc, sub));
+  if (sub === 'serve') {
+    // long-running authority server: start (default, background), --fg, --stop, --status
+    const act = args.includes('--stop') ? 'stop' : args.includes('--status') ? 'status' : args.includes('--fg') ? 'fg' : 'start';
+    const r = await C.serverCtl(loc, act);
+    out(r); if (!r.ok) process.exitCode = 1; return;
+  }
   if (sub === 'sync') {
     // fast-forward local main to authority main (no merge; refuses a diverged local main)
     const top = A.repoTop(o.repo);
@@ -447,6 +459,6 @@ function purgeCmd(args) {
 
 async function mcpCmd() { await (await import('../src/mcp.mjs')).serve(); }
 ({ mcp: mcpCmd, authority: authorityCmd, install, uninstall, doctor, stats: showStats, hook, hooks, daemon, claim: claimCmd, release: releaseCmd, status: statusCmd, promote: promoteCmd, ledger: ledgerCmd, verify: verifyCmd, stop: stopCmd, privacy: privacyCmd, purge: purgeCmd, operator: operatorCmd, override: overrideCmd, agent: agentCmd, run: runCmd }[cmd] ?? (() => {
-  console.log('usage: g4a install [--rc FILE] | uninstall [--rc FILE] | doctor | stats | hooks claude|codex|gemini | hook <agent> | privacy | purge [--logs|--tee|--credentials|--all]\n       g4a daemon [--detach] | stop | claim --agent A --paths p1,p2 --witness CMD [--allow-overlap] [--repo R]\n       g4a release --agent A [--remove-worktree] | status | promote --agent A [--no-wait] | ledger [--out F] | verify [BUNDLE] [--pin SPKIHEX] [--anchor-remote R]\n       g4a operator init [--passphrase-file F] | override --repo R --minutes N --reason TEXT [--var G4A_ENFORCE|G4A_RAW|G4A_AGENT]  (human-only)\n       g4a authority init --system | init DIR (same-user, detect-only) | audit | status | ledger | sync  [--repo R]\n       g4a agent add NAME | remove NAME | list | policy --allow-operator on|off | key NAME VAR (stdin)  (system mode: one OS user per agent)\n       g4a run --agent NAME -- COMMAND [ARGS...]   (run an agent CLI as its own OS user g4a-a-NAME)\n       g4a mcp   (stdio MCP server: g4a_claim/status/promote/verify/release/authority_status)');
+  console.log('usage: g4a install [--rc FILE] | uninstall [--rc FILE] | doctor | stats | hooks claude|codex|gemini | hook <agent> | privacy | purge [--logs|--tee|--credentials|--all]\n       g4a daemon [--detach] | stop | claim --agent A --paths p1,p2 --witness CMD [--allow-overlap] [--repo R]\n       g4a release --agent A [--remove-worktree] | status | promote --agent A [--no-wait] | ledger [--out F] | verify [BUNDLE] [--pin SPKIHEX] [--anchor-remote R]\n       g4a operator init [--passphrase-file F] | override --repo R --minutes N --reason TEXT [--var G4A_ENFORCE|G4A_RAW|G4A_AGENT]  (human-only)\n       g4a authority init --system | init DIR (same-user, detect-only) | audit | status | ledger | sync | serve [--fg|--stop|--status]  [--repo R]\n       g4a agent add NAME | remove NAME | list | policy --allow-operator on|off | key NAME VAR (stdin)  (system mode: one OS user per agent)\n       g4a run --agent NAME -- COMMAND [ARGS...]   (run an agent CLI as its own OS user g4a-a-NAME)\n       g4a mcp   (stdio MCP server: g4a_claim/status/promote/verify/release/authority_status)');
   process.exitCode = cmd ? 2 : 0;
 }))(rest)?.catch?.((e) => { console.error(`g4a: ${redact(String(e?.message ?? e))}`); if (process.env.G4A_DEBUG === '1') console.error(redact(String(e?.stack ?? ''))); process.exitCode = 1; });
