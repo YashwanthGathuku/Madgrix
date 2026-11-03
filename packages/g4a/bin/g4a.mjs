@@ -211,7 +211,10 @@ async function daemon(args) {
 const credArg = (o) => { const c = o['credential-stdin'] ? fs.readFileSync(0, 'utf8').trim() : process.env.G4A_AGENT_CREDENTIAL; return c ? { credential: c } : {}; };
 async function claimCmd(args) {
   const o = opts(args);
-  out(await (await client())('claim', { repo: o.repo, agent: o.agent, paths: (o.paths || '').split(',').filter(Boolean), witnesses: o.witness || [], witnessPaths: o['witness-path'] || [], allowOverlap: !!o['allow-overlap'], ...credArg(o), ...(o['session-credential'] ? { credentialStore: 'session' } : {}) }));
+  const r = await (await client())('claim', { repo: o.repo, agent: o.agent, paths: (o.paths || '').split(',').filter(Boolean), witnesses: o.witness || [], witnessPaths: o['witness-path'] || [], allowOverlap: !!o['allow-overlap'], ...credArg(o), ...(o['session-credential'] ? { credentialStore: 'session' } : {}) });
+  const G = await import('../src/gap6.mjs');
+  G.capture(o.repo, o.agent, 'claim', { intent: o.intent, paths: o.paths, ok: r.ok, reason: r.reason });
+  out(r);
 }
 async function releaseCmd(args) { const o = opts(args); out(await (await client())('release', { repo: o.repo, agent: o.agent, removeWorktree: !!o['remove-worktree'], ...credArg(o) })); }
 async function statusCmd(args) { const o = opts(args); out(await (await client())('status', { repo: o.repo })); }
@@ -222,8 +225,15 @@ async function promoteCmd(args) {
   const c = st.claims.find((x) => x.agent === o.agent);
   if (!c) { out({ ok: false, error: `no active claim for ${o.agent}` }); return; }
   const secret = fs.readFileSync(path.join(home, 'secrets', c.id), 'utf8'); // never printed
-  out(await rpc('promote', { repo: o.repo, agent: o.agent, secret, wait: !o['no-wait'], ...credArg(o) }));
+  const r = await rpc('promote', { repo: o.repo, agent: o.agent, secret, wait: !o['no-wait'], ...credArg(o) });
+  const G = await import('../src/gap6.mjs');
+  const ev = r && r.ok && r.status !== 'queued' ? G.evalHook(r) : undefined; // advisory only: never changes ok/status
+  if (ev) r.advisory_eval = ev;
+  G.capture(o.repo, o.agent, 'promote', { intent: o.intent, ok: r.ok, status: r.status, reason: r.reason, sha: r.sha ?? r.main_after, eval_exit: ev?.exit });
+  out(r);
 }
+async function searchCmd(args) { const o = opts(args); const G = await import('../src/gap6.mjs'); out(G.search(o.repo || '.', o._.join(' '))); }
+async function reviewCmd(args) { const o = opts(args); const G = await import('../src/gap6.mjs'); out({ ok: true, wrote: G.writeReview(o.repo || '.', o.out) }); }
 async function ledgerCmd(args) {
   const o = opts(args);
   const b = await (await client())('export', { repo: o.repo });
@@ -458,7 +468,7 @@ function purgeCmd(args) {
 }
 
 async function mcpCmd() { await (await import('../src/mcp.mjs')).serve(); }
-({ mcp: mcpCmd, authority: authorityCmd, install, uninstall, doctor, stats: showStats, hook, hooks, daemon, claim: claimCmd, release: releaseCmd, status: statusCmd, promote: promoteCmd, ledger: ledgerCmd, verify: verifyCmd, stop: stopCmd, privacy: privacyCmd, purge: purgeCmd, operator: operatorCmd, override: overrideCmd, agent: agentCmd, run: runCmd }[cmd] ?? (() => {
-  console.log('usage: g4a install [--rc FILE] | uninstall [--rc FILE] | doctor | stats | hooks claude|codex|gemini | hook <agent> | privacy | purge [--logs|--tee|--credentials|--all]\n       g4a daemon [--detach] | stop | claim --agent A --paths p1,p2 --witness CMD [--allow-overlap] [--repo R]\n       g4a release --agent A [--remove-worktree] | status | promote --agent A [--no-wait] | ledger [--out F] | verify [BUNDLE] [--pin SPKIHEX] [--anchor-remote R]\n       g4a operator init [--passphrase-file F] | override --repo R --minutes N --reason TEXT [--var G4A_ENFORCE|G4A_RAW|G4A_AGENT]  (human-only)\n       g4a authority init --system | init DIR (same-user, detect-only) | audit | status | ledger | sync | serve [--fg|--stop|--status]  [--repo R]\n       g4a agent add NAME | remove NAME | list | policy --allow-operator on|off | key NAME VAR (stdin)  (system mode: one OS user per agent)\n       g4a run --agent NAME -- COMMAND [ARGS...]   (run an agent CLI as its own OS user g4a-a-NAME)\n       g4a mcp   (stdio MCP server: g4a_claim/status/promote/verify/release/authority_status)');
+({ mcp: mcpCmd, authority: authorityCmd, install, uninstall, doctor, stats: showStats, hook, hooks, daemon, claim: claimCmd, release: releaseCmd, status: statusCmd, promote: promoteCmd, ledger: ledgerCmd, verify: verifyCmd, stop: stopCmd, privacy: privacyCmd, purge: purgeCmd, operator: operatorCmd, override: overrideCmd, agent: agentCmd, run: runCmd, search: searchCmd, review: reviewCmd }[cmd] ?? (() => {
+  console.log('usage: g4a install [--rc FILE] | uninstall [--rc FILE] | doctor | stats | hooks claude|codex|gemini | hook <agent> | privacy | purge [--logs|--tee|--credentials|--all]\n       g4a daemon [--detach] | stop | claim --agent A --paths p1,p2 --witness CMD [--allow-overlap] [--repo R]\n       g4a release --agent A [--remove-worktree] | status | promote --agent A [--no-wait] | ledger [--out F] | verify [BUNDLE] [--pin SPKIHEX] [--anchor-remote R]\n       g4a operator init [--passphrase-file F] | override --repo R --minutes N --reason TEXT [--var G4A_ENFORCE|G4A_RAW|G4A_AGENT]  (human-only)\n       g4a authority init --system | init DIR (same-user, detect-only) | audit | status | ledger | sync | serve [--fg|--stop|--status]  [--repo R]\n       g4a agent add NAME | remove NAME | list | policy --allow-operator on|off | key NAME VAR (stdin)  (system mode: one OS user per agent)\n       g4a run --agent NAME -- COMMAND [ARGS...]   (run an agent CLI as its own OS user g4a-a-NAME)\n       g4a search QUERY [--repo R] | review [--out F.html] [--repo R]   (local only; capture with G4A_CAPTURE=1, claim/promote --intent TEXT; G4A_EVAL_HOOK=CMD is advisory)\n       g4a mcp   (stdio MCP server: g4a_claim/status/promote/verify/release/authority_status)');
   process.exitCode = cmd ? 2 : 0;
 }))(rest)?.catch?.((e) => { console.error(`g4a: ${redact(String(e?.message ?? e))}`); if (process.env.G4A_DEBUG === '1') console.error(redact(String(e?.stack ?? ''))); process.exitCode = 1; });
