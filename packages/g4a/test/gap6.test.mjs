@@ -28,6 +28,9 @@ test('capture is off by default; on, it is redacted, 0600, outside the repo, nev
     assert.equal(G.capture(repo, 'a1', 'claim', { intent: `fix login token=${TOK}`, secret: 's3', credential: 'c3' }, env, home), true);
     assert.equal(G.capture(repo, '../evil', 'claim', {}, env, home), false); // agent name cannot escape the dir
     const ss = G.sessions(repo, home); assert.equal(ss.length, 1);
+    const ln = path.join(d, 'alias'); fs.symlinkSync(repo, ln); assert.equal(G.sessions(ln, home).length, 1); // same repo via a symlink path
+    const sd = fs.readdirSync(path.join(home, 'sessions'))[0]; fs.symlinkSync('/etc/passwd', path.join(home, 'sessions', sd, 'evil.jsonl'));
+    assert.throws(() => G.capture(repo, 'evil', 'x', {}, env, home)); // O_NOFOLLOW: a planted symlink is never written through
     const raw = JSON.stringify(ss);
     assert.ok(!raw.includes(TOK) && !raw.includes('s3') && !raw.includes('c3'), raw);
     assert.match(ss[0].intent, /fix login/);

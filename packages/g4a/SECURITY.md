@@ -151,6 +151,13 @@ and that the service refuses both commands with a caller uid or `SUDO_USER` set.
 - **Purging telemetry.** Any process running as your uid can delete or edit `G4A_HOME` logs.
   They are a convenience record, not evidence. The ledger and anchors are the evidence.
 
+## Added on grok/g4a-gaps (Nov 2026)
+- **System-mode server peer check:** the uid comes from `SO_PEERCRED`, never from the request. Red-team tests cover forged agent names, other agents' credentials, a stop or serve with injected arguments (refused), and planted pid files (never signalled unless the /proc cmdline matches).
+- **Witness cache:** memory only, passes only, keyed on the exact tree, command, sandbox and PATH. An agent uid cannot poison it, and the signed report marks cached results.
+- **Auto-sync:** fast-forward only, from the authority mirror. A baseline outside local history is refused.
+- **Gap 6:** off by default and never in the trust path. Capture is redacted, stays local (0600) and excludes secrets and credentials. Review HTML is escaped and script-free. The eval hook is advisory, runs as the caller without `G4A_AGENT_CREDENTIAL`, has a timeout and gets redacted input.
+- **Raw push mode:** still needs a one-time permit, and the authority's scope check applies to every push.
+
 ## Known gaps and risks
 
 - **Same-uid agents are not isolated from each other.** This is why one OS user per agent is now

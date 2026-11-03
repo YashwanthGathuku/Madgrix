@@ -13,7 +13,8 @@ import { spawnSync, execFileSync } from 'node:child_process';
 import { redact, redactDeep, ensurePrivateDir, appendPrivate, writePrivate } from './privacy.mjs';
 import { g4aHome } from './lib.mjs';
 
-const rid = (repo) => createHash('sha256').update(path.resolve(repo || '.')).digest('hex').slice(0, 16);
+const real = (r) => { try { return fs.realpathSync(r); } catch { return path.resolve(r); } };
+const rid = (repo) => createHash('sha256').update(real(repo || '.')).digest('hex').slice(0, 16);
 const AGENT = /^[A-Za-z0-9._-]{1,64}$/;
 export const captureOn = (env = process.env) => env.G4A_CAPTURE === '1';
 const sdir = (repo, home = g4aHome()) => path.join(home, 'sessions', rid(repo));
@@ -29,7 +30,7 @@ export function capture(repo, agent, event, data, env = process.env, home = g4aH
 export function sessions(repo, home = g4aHome()) {
   const d = sdir(repo, home); const out = [];
   let names = []; try { names = fs.readdirSync(d).filter((f) => f.endsWith('.jsonl')); } catch { return out; }
-  for (const f of names) for (const l of fs.readFileSync(path.join(d, f), 'utf8').split('\n')) { if (!l) continue; try { out.push(JSON.parse(l)); } catch {} }
+  for (const f of names.filter((n) => fs.lstatSync(path.join(d, n)).isFile())) for (const l of fs.readFileSync(path.join(d, f), 'utf8').split('\n')) { if (!l) continue; try { out.push(JSON.parse(l)); } catch {} }
   return out.sort((a, b) => String(a.ts).localeCompare(String(b.ts)));
 }
 const git = (repo, args) => { try { return execFileSync('git', ['-C', repo, ...args], { encoding: 'utf8', maxBuffer: 64 << 20 }); } catch { return ''; } };

@@ -356,3 +356,24 @@ This section says which limits are now **prevented**, which are only **detected*
 - **What changed.** Storage goes through `src/sqlite-driver.mjs`, which is used by authority `openDb` and the authority pre-receive hook. `G4A_SQLITE_DRIVER=auto|node|better-sqlite3`: the default is node:sqlite when present, else better-sqlite3. better-sqlite3 is an optional native module; point `G4A_BETTER_SQLITE3` at a directory that holds `node_modules/better-sqlite3`. Both drivers read and write the same file.
 - **Supported Node versions.** `package.json` pins `engines.node` to `>=22.13 <25`.
 - **Tests.** The full g4a suite passes with `G4A_SQLITE_DRIVER=node` and with `G4A_SQLITE_DRIVER=better-sqlite3` (better-sqlite3 12, SQLite 3.53). `test/limits2.test.mjs` checks the cross-driver round trip. It skips the better-sqlite3 half when that driver is not installed and says so. Some tamper tests open the DB directly with node:sqlite.
+
+## Gap work on grok/g4a-gaps (Nov 2026)
+All local; no Cloudflare and no LLM. Everything new is off by default unless noted.
+
+- **Authority server (both modes).** `g4a authority serve [--fg|--status|--stop] --repo R` starts a long-lived authority process, so agents skip a CLI boot on every call. In user mode the pid file is `run/pid` (0600). In system mode the root-owned wrapper runs it as `g4a-authority <id> serve|serve-status|serve-stop` (it takes no arguments), and a peer gate reads the caller's uid from `SO_PEERCRED` on every connection, so a connection cannot claim another agent's identity. `g4a stop` also stops the repo's server. A stop signals a pid only when its `/proc` cmdline is authority-server.mjs with the exact `--root`.
+- **Defaults.** `g4a install --login` puts the shim on login-shell PATHs (idempotent, reversible). System mode (one OS user per agent) is the recommended default. `g4a-admin` is the narrowed sudo entry point.
+- **Anchors, credential proxy, watcher, tamper check.** The ledger anchor chain can be pushed to a fast-forward-only remote (`G4A_ANCHOR_REMOTE`, checked by `verify --anchor-remote`). In system mode a local credential proxy means agents never hold API keys. The daemon watcher and a land-time tamper audit refuse out-of-claim landings and record them in the ledger.
+- **Auto-sync main before a claim.** If local main is behind the authority, it is fast-forwarded from the mirror (reflog message `g4a promote auto-sync (authority main)`). If local main is ahead and the authority baseline is one of its ancestors, the claim branches from that baseline. An unknown baseline is still refused with `main_out_of_sync`.
+- **Landing speedups.** An in-memory witness cache holds passes only. It is keyed by tree, command, sandbox and PATH, the signed report marks cached results `cached:true`, it is never written to disk, and `G4A_WITNESS_CACHE=0` turns it off. The batch cap adapts: it halves after a failed batch and doubles after a clean one (1..32). freezeIntent skips the full tree listing when nothing is pinned.
+- **Gap 6 (opt-in, never gates landing).** `G4A_CAPTURE=1` records claim and promote events, including `--intent TEXT`, as redacted JSONL under `$G4A_HOME/sessions/` (0600, outside the repo, never pushed). `g4a search QUERY` searches those sessions and main's commits. `g4a review [--out F]` writes static HTML with every value escaped and a CSP of `default-src 'none'`. `G4A_EVAL_HOOK=CMD` runs after a landed promote with the redacted result on stdin, without the agent credential in its env. Its exit code and output are attached as `advisory_eval` and never change `ok` or `status`.
+
+### Benchmarks (local, 16 agents, 0 errors; see bench/FORGEMARK.md)
+| mode | ops/s | p50 |
+|---|---|---|
+| governed landing, user mode (claim, commit, witness, promote, release), session start | 1.73 | n/a |
+| governed landing, user mode, now | 2.86 | 5.4 s |
+| governed landing, system mode, now (verify ok) | 2.66–2.71 | 5.7 s |
+| raw branch push (`g4a-push`: permit plus scope-checked push to agents/<id>, no landing), user | 16.48 | 691 ms |
+| raw branch push, system | 16.79 | 651 ms |
+
+Entire's published 418/s counts local checkpoint commits with no remote authority, scope check or witness, so the two numbers are not comparable. g4a does not reach that rate with governance on, and it keeps governance on.
