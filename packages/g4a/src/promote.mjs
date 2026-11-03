@@ -166,7 +166,19 @@ function runOne(spec) {
     ch.stdin.end(JSON.stringify(spec));
   });
 }
+// Witness cache: passes only, keyed by (exact tree, command, sandbox-hidden set, PATH), held in
+// memory by the long-running authority process (never on disk, so nothing the agent uid can write
+// feeds it). A cached pass is marked `cached: true` in the signed report. G4A_WITNESS_CACHE=0 disables.
+const WCACHE = new Map(), WCACHE_MAX = 4096;
+const wkey = (tree, cmd) => JSON.stringify([tree, cmd, sandboxHidden(), process.env.PATH ?? '']);
+export const witnessCacheStats = { hits: 0, misses: 0, clear: () => WCACHE.clear() };
 export async function runWitnesses(top, sha, intents) {
+  const useCache = process.env.G4A_WITNESS_CACHE !== '0';
+  const tree = useCache ? safeGit(top, ['rev-parse', `${sha}^{tree}`]).stdout.trim() : null;
+  if (useCache && intents.every(({ cmd }) => WCACHE.has(wkey(tree, cmd)))) {
+    witnessCacheStats.hits += intents.length;
+    return intents.map(({ cmd, agents }) => ({ cmd, agents, ...WCACHE.get(wkey(tree, cmd)), cached: true }));
+  }
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'g4a-witness-'));
   const wt = path.join(dir, 'tree');
   safeGit(top, ['worktree', 'add', '--quiet', '--detach', wt, sha]);
@@ -175,6 +187,13 @@ export async function runWitnesses(top, sha, intents) {
     for (const { cmd, agents } of intents) {
       const r = await runOne({ command: cmd, cwd: wt, writable: [wt], timeoutMs: 300_000, purpose: 'witness', hidden: sandboxHidden(), env: { PATH: process.env.PATH ?? '/usr/bin:/bin', HOME: dir } });
       out.push({ cmd, agents, exit: r.status, signal: r.signal, timedOut: r.timedOut, sandbox: r.sandbox });
+      if (useCache) {
+        witnessCacheStats.misses++;
+        if (r.status === 0 && !r.timedOut && r.sandbox && r.sandbox !== 'runner_failed') {
+          if (WCACHE.size >= WCACHE_MAX) WCACHE.delete(WCACHE.keys().next().value);
+          WCACHE.set(wkey(tree, cmd), { exit: 0, signal: null, timedOut: false, sandbox: r.sandbox });
+        }
+      }
     }
     return out;
   } finally {
@@ -299,6 +318,11 @@ export async function promote(auth, claim, jobId, hooks = {}) {
 // review, conflicts, mergiraf/union rungs, pins, recovery) goes through promote() unchanged.
 const BATCH_RUNGS = new Set(['fast-forward', 'git-merge-tree']);
 export const MAX_BATCH = 32;
+// adaptive batch size per repo: halves after a batch whose witnesses failed (every member then
+// re-runs alone, so a big failing batch is expensive), doubles back after each clean batch
+const batchCap = new Map();
+export const batchCapOf = (repo) => batchCap.get(repo) ?? MAX_BATCH;
+export function noteBatchOutcome(repo, size, ok) { batchCap.set(repo, ok ? Math.min(MAX_BATCH, batchCapOf(repo) * 2) : Math.max(1, Math.ceil(size / 2))); }
 const hitsGlobs = (globs, f) => globs.some((g) => f === g || globMatchesPath(g, f));
 // items: [{ claim, jobId }] in queue order. Runs under the caller's lock. Returns
 // { results: Map(jobId -> result), batch: plan | null }; items in neither are deferred.
@@ -325,7 +349,7 @@ export async function planBatch(auth, items) {
   let cur = m0;
   const used = new Set(), wglobs = [], members = [];
   for (const it of eligible) {
-    if (members.length >= MAX_BATCH) break;
+    if (members.length >= batchCapOf(repo)) break;
     const wp = it.claim.witness_paths ?? [];
     if (it.changed.some((f) => used.has(f) || hitsGlobs(wglobs, f)) || members.some((m) => m.changed.some((f) => hitsGlobs(wp, f)))) continue;
     const c = combine(top, cur, it.candidate, it.claim.agent, []);
@@ -370,9 +394,11 @@ export async function commitBatch(auth, b, results, stillValid = () => true) {
   if (!results.every((r) => r.exit === 0)) {
     // attribute the failure: each claim goes through the full sequential ladder on its own
     await auth.serial(() => auth.appendLedger(repo, 'batch_witness_failed', { jobs: members.map((m) => m.jobId), final, witness: { report, signature, keyId: signer.keyId } }));
+    noteBatchOutcome(repo, members.length, false);
     for (const m of members) out.set(m.jobId, await promote(auth, m.claim, m.jobId));
     return out;
   }
+  noteBatchOutcome(repo, members.length, true);
   const id = `b_${final.slice(0, 12)}`;
   const witness = { report, signature, keyId: signer.keyId };
   const payloads = members.map((m, i) => ({ job: m.jobId, claim: m.claim.id, agent: m.claim.agent, candidate: m.candidate, main_before: m.before, main_after: m.after, rung: m.rung, verdict: 'ADMIT', witness, attempts: 1,
@@ -403,7 +429,7 @@ export function freezeIntent(auth, claim, mainAfter) {
   // pin every witness-referenced file (globs expanded on the promoted tree) by blob hash
   const top = repoTop(claim.worktree);
   const pins = {};
-  const files = splitNul(safeGit(top, ['ls-tree', '-r', '--name-only', '-z', mainAfter]).stdout);
+  const files = !(claim.witness_paths ?? []).length ? [] : splitNul(safeGit(top, ['ls-tree', '-r', '--name-only', '-z', mainAfter]).stdout);
   for (const g of claim.witness_paths ?? []) for (const f of files) if (f === g || globMatchesPath(g, f)) pins[f] = blobAt(top, mainAfter, f);
   auth.db.prepare('INSERT OR IGNORE INTO intents (repo, claim, agent, witnesses, frozen_at, pins) VALUES (?, ?, ?, ?, ?, ?)')
     .run(claim.repo, claim.id, claim.agent, JSON.stringify(claim.witnesses), new Date().toISOString(), JSON.stringify(pins));
