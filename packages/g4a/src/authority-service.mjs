@@ -296,7 +296,7 @@ export async function run(L, cmd, p = {}) {
         }
         case 'status': return { ok: true, mode: conf.mode, main: safeGit(L.repo, ['rev-parse', 'refs/heads/main']).stdout.trim(), ...auth.status({ repo: L.repo }) };
         case 'ledger': return { ok: true, mode: conf.mode, bundle: bundleFromDb(auth.db, repo), witness_pub: auth.publicKeySpkiHex, main: safeGit(L.repo, ['rev-parse', 'refs/heads/main']).stdout.trim() };
-        case 'audit': return audit(L, auth, repo, conf);
+        case 'audit': { await ingestRefusals(L, auth, repo); return audit(L, auth, repo, conf); }
         default: return { ok: false, error: `unknown authority command ${cmd}` };
       }
     } finally { auth.db.close(); }
@@ -333,16 +333,53 @@ async function landWait(L, job) {
     if (round > 10_000) return { ok: false, status: 'error', error: 'land queue did not drain', job };
   }
 }
+// fold pre-receive refusals (appended by the hook) into the signed ledger as push_refused
+export async function ingestRefusals(L, auth, repo) {
+  const f = path.join(L.state, 'refusals.jsonl'), off = path.join(L.state, 'refusals.offset');
+  let st; try { st = fs.statSync(f); } catch { return 0; }
+  let from = 0; try { from = Number(fs.readFileSync(off, 'utf8')) || 0; } catch {}
+  if (from > st.size) from = 0;
+  if (from === st.size) return 0;
+  const fd = fs.openSync(f, 'r'); const buf = Buffer.alloc(Math.min(st.size - from, 1 << 20));
+  try { fs.readSync(fd, buf, 0, buf.length, from); } finally { fs.closeSync(fd); }
+  const text = buf.toString('utf8'), end = text.lastIndexOf('\n') + 1;
+  let n = 0;
+  for (const l of text.slice(0, end).split('\n').filter(Boolean)) {
+    let e; try { e = JSON.parse(l); } catch { continue; }
+    await auth.appendLedger(repo, 'push_refused', { at: String(e.at ?? '').slice(0, 40), reason: String(e.reason ?? '').slice(0, 400), uid: String(e.uid ?? '').slice(0, 12), refs: Array.isArray(e.refs) ? e.refs.slice(0, 4).map((r) => String(r).slice(0, 200)) : [] });
+    n++;
+  }
+  fs.writeFileSync(off, String(from + Buffer.byteLength(text.slice(0, end))));
+  return n;
+}
+// land-time tamper audit: main moved outside the ladder refuses the whole batch; an agent ref that
+// moved without a confirmed push refuses that agent. Each distinct finding is logged once.
+async function tamperCheck(L, auth, repo) {
+  const au = audit(L, auth, repo);
+  if (!au.ok) {
+    const sig = createHash('sha256').update(JSON.stringify(au.external)).digest('hex');
+    const last = auth.db.prepare("SELECT payload FROM ledger WHERE repo = ? AND kind = 'tamper_detected' ORDER BY seq DESC LIMIT 1").get(repo);
+    if (!last || JSON.parse(last.payload).sig !== sig) await auth.appendLedger(repo, 'tamper_detected', { sig, at: 'land', mode: au.mode, external: au.external });
+  }
+  return { main: au.external.some((x) => x.ref === 'refs/heads/main'), agents: new Set(au.external.filter((x) => x.ref.startsWith('refs/heads/agents/')).map((x) => x.ref.slice(18))) };
+}
 async function leadBatch(L) {
   const auth = openAuth(L);
   const repo = repoId(L.repo);
   try {
     let plan = null;
     await withLock(L, async () => {
+      await ingestRefusals(L, auth, repo);
+      const t = await tamperCheck(L, auth, repo);
       const items = [];
       for (const q of auth.db.prepare('SELECT * FROM landq WHERE result IS NULL ORDER BY created_at, job').all()) {
         const c = claimRow(auth, repo, q.agent);
         if (!c || c.id !== q.claim) { setResult(auth, repo, q.job, { ok: false, status: 'refused', reason: 'claim released before landing' }); continue; }
+        if (t.main || t.agents.has(c.agent)) {
+          await auth.appendLedger(repo, 'promote_refused', { job: q.job, claim: c.id, agent: c.agent, reason: 'authority_tampered' });
+          setResult(auth, repo, q.job, { ok: false, status: 'refused', reason: 'authority_tampered', hint: 'refs moved outside g4a; run `g4a authority audit` and restore before landing' });
+          continue;
+        }
         if (revq(L, `refs/heads/agents/${c.agent}`) !== q.candidate) { setResult(auth, repo, q.job, { ok: false, status: 'refused', reason: 'authority agent ref moved after the land request' }); continue; }
         safeGit(L.repo, ['update-ref', `refs/heads/${c.branch}`, q.candidate]);
         items.push({ claim: c, jobId: q.job });

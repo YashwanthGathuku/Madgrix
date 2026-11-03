@@ -14,6 +14,8 @@ import { locate, callAsync, clientAnchorRemote, fetchMainAsync } from './authori
 import { safeGit } from '../../../scripts/lib/safe-git.mjs';
 import { randomHex } from '../../../src/lib/canonical.ts';
 import { g4aHome } from './lib.mjs';
+import { splitNul } from './authority.mjs';
+import { globMatchesPath } from '../../../src/lib/claims.ts';
 
 export const socketPath = (home = g4aHome()) => path.join(home, 'g4a.sock');
 
@@ -101,7 +103,47 @@ export async function startDaemon(home = g4aHome(), { hooks = {}, keyDir } = {})
     finally { const o = safeGit(repo, ['rev-parse', '--verify', '--quiet', ref], { allowFailure: true }).stdout.trim(); if (o) safeGit(repo, ['update-ref', '-d', ref, o], { allowFailure: true }); }
   };
 
+  // Periodic watch (G4A_AUDIT_MS, default 30 s; 0 disables): (1) authority tamper audit per repo
+  // with active claims, (2) every claim worktree (committed + uncommitted) checked against its
+  // claim globs. Findings go to the signed local ledger once per distinct state; landing of
+  // out-of-claim work and tampered authorities is refused at the authority regardless.
+  const watch = { at: null, audits: {}, violations: {} };
+  const seen = new Map();
+  const once = async (key, kind, payload) => {
+    const sig = createHash('sha256').update(JSON.stringify(payload)).digest('hex');
+    if (seen.get(key) === sig) return false;
+    seen.set(key, sig); await auth.serial(() => auth.appendLedger(payload.repo, kind, payload)); return true;
+  };
+  async function periodicWatch() {
+    const claims = auth.db.prepare("SELECT * FROM claims WHERE status = 'active'").all().map(rowClaim);
+    const byRepo = new Map(); for (const c of claims) if (!byRepo.has(c.repo)) byRepo.set(c.repo, c.worktree);
+    for (const [repo, wt] of byRepo) {
+      const loc = locate(wt); if (!loc) continue;
+      try {
+        const a = await callAsync(loc, 'audit', {});
+        watch.audits[repo] = { ok: !!a.ok, external: a.external ?? [] };
+        if (a.ok === false && Array.isArray(a.external) && a.external.length) await once(`t:${repo}`, 'tamper_detected', { repo, at: 'daemon', mode: a.mode, external: a.external });
+        else seen.delete(`t:${repo}`);
+      } catch {}
+    }
+    for (const c of claims) {
+      if (!fs.existsSync(c.worktree)) continue;
+      const g = (args) => safeGit(c.worktree, args, { allowFailure: true });
+      const files = new Set([...splitNul(g(['diff', '--no-ext-diff', '--no-textconv', '--name-only', '-z', `${c.baseline}...HEAD`]).stdout), ...splitNul(g(['diff', '--no-ext-diff', '--no-textconv', '--name-only', '-z', 'HEAD']).stdout), ...splitNul(g(['ls-files', '--others', '--exclude-standard', '-z']).stdout)]);
+      const out = [...files].filter((f) => !c.paths.some((p) => globMatchesPath(p, f))).sort();
+      watch.violations[c.id] = out.slice(0, 50);
+      if (out.length) await once(`s:${c.id}`, 'scope_violation', { repo: c.repo, claim: c.id, agent: c.agent, paths: out.slice(0, 50), count: out.length, note: 'out-of-claim changes in the claim worktree; landing them is refused' });
+      else seen.delete(`s:${c.id}`);
+    }
+    watch.at = new Date().toISOString();
+  }
+  const AUDIT_MS = Number(process.env.G4A_AUDIT_MS ?? 30000);
+  let watching = false;
+  const tick = () => { if (watching) return; watching = true; periodicWatch().catch(() => {}).finally(() => { watching = false; }); };
+  if (AUDIT_MS > 0) setInterval(tick, Math.max(1000, AUDIT_MS)).unref();
+
   const methods = {
+    watch: async (p) => { if (p.now) { while (watching) await new Promise((r) => setTimeout(r, 20)); watching = true; try { await periodicWatch(); } finally { watching = false; } } return { ok: true, ...watch }; },
     ping: () => ({ ok: true, pid: process.pid, requeued }),
     claim: async (p) => {
       const loc = locate(p.repo);

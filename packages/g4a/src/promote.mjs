@@ -333,8 +333,10 @@ export async function planBatch(auth, items) {
     members.push({ ...it, before: cur, after: c.sha, rung: c.rung });
     cur = c.sha; for (const f of it.changed) used.add(f); wglobs.push(...wp);
   }
-  const drift = members.length >= 2 && [...pins].some(([f, p]) => blobAt(top, cur, f) !== p.blob);
-  if (members.length < 2 || drift) {
+  // a single clean (fast-forward / merge-tree) request also takes the batch path: its witnesses
+  // run outside the authority lock, so other land requests can queue meanwhile (and batch next)
+  const drift = members.length >= 1 && [...pins].some(([f, p]) => blobAt(top, cur, f) !== p.blob);
+  if (members.length < 1 || drift) {
     // nothing to batch: land the oldest eligible request alone (the rest stay queued)
     const first = eligible[0];
     results.set(first.jobId, await promote(auth, first.claim, first.jobId));
