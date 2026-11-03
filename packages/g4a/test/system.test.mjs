@@ -154,13 +154,20 @@ test('agent users: separate uids, scoped launcher, no impersonation, full cleanu
     const me = os.userInfo().username;
     assert.deepEqual(rules.split('\n').filter((x) => x && !x.startsWith('#') && !x.startsWith('Defaults')), [`${me} ALL=(g4a-a-alice) NOPASSWD: ${WRAP}/g4a-agent-exec`, `${me} ALL=(g4a-a-bob) NOPASSWD: ${WRAP}/g4a-agent-exec`]);
     assert.match(rules, /env_reset/); assert.equal(sh('sudo -n visudo -cf /etc/sudoers.d/g4a-agents').status, 0);
+    // narrowed operator sudo: one rule, only the root-owned g4a-admin; it binds the caller as operator
+    const adm = sh('sudo -n cat /etc/sudoers.d/g4a-admin').stdout;
+    assert.deepEqual(adm.split('\n').filter((x) => x && !x.startsWith('#') && !x.startsWith('Defaults')), [`${me} ALL=(root) NOPASSWD: ${WRAP}/g4a-admin`]);
+    assert.equal(sh(`stat -c '%U %a' ${WRAP}/g4a-admin`).stdout.trim(), 'root 755');
+    assert.match(sh(`sudo -n ${WRAP}/g4a-admin add carol x mallory`).stdout, /usage: add NAME REPOID/, 'operator arg cannot be injected');
+    assert.match(sh(`sudo -n ${WRAP}/g4a-admin purge`).stdout, /add\|remove\|policy\|key only/);
+    assert.notEqual(sh(`${WRAP}/g4a-admin remove alice`).status, 0, 'not via sudo');
 
     // the launcher runs the command as the agent user, in its own clone, with the shim first on PATH
     const who = run('alice', 'id -un; pwd; command -v git; echo "$G4A_HOME"');
     assert.equal(who.status, 0, who.stderr);
     assert.deepEqual(who.stdout.trim().split('\n'), ['g4a-a-alice', `${H('alice')}/repo`, `${H('alice')}/.g4a/bin/git`, `${H('alice')}/.g4a`]);
     // ... and cannot escalate: no sudo to root/the operator/another agent, no launcher for bob
-    for (const s of ['sudo -n true', 'sudo -n -u root id', `sudo -n -u ${me} id`, `sudo -n -u g4a-a-bob ${WRAP}/g4a-agent-exec id`, `sudo -n -u g4a-authority ${WRAP}/g4a-authority 0000000000000000 init-root e30=`]) {
+    for (const s of ['sudo -n true', 'sudo -n -u root id', `sudo -n -u ${me} id`, `sudo -n -u g4a-a-bob ${WRAP}/g4a-agent-exec id`, `sudo -n -u g4a-authority ${WRAP}/g4a-authority 0000000000000000 init-root e30=`, `sudo -n ${WRAP}/g4a-admin remove bob`]) {
       const r = run('alice', `${s} >/dev/null 2>&1; echo rc=$?`);
       assert.match(r.stdout, /rc=(?!0)\d+/, `alice: ${s}`);
     }

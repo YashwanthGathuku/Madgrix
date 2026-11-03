@@ -14,6 +14,7 @@ import { CRED_USER, CRED_HOME } from './cred-proxy.mjs';
 
 const USER = 'g4a-authority', HOME = '/var/lib/g4a-authority', REPOS = `${HOME}/repos`, PUB = '/var/lib/g4a-authority-pub';
 const LIB = '/usr/local/lib/g4a', BIN = `${LIB}/bin`, MAP = '/etc/g4a/authority.json', SUDOERS = '/etc/sudoers.d/g4a-authority';
+export const ADMIN_SUDOERS = '/etc/sudoers.d/g4a-admin';
 export const AGENTS_HOME = '/var/lib/g4a-agents', AGENTS_MAP = '/etc/g4a/agents.json', AGENTS_SUDOERS = '/etc/sudoers.d/g4a-agents';
 export { USER as AUTH_USER, REPOS, PUB, LIB, BIN, MAP };
 const SRC_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
@@ -105,6 +106,19 @@ set -eu
 [ "$(id -un)" = ${CRED_USER} ] || { echo "g4a: refused: g4a-credproxy runs only as ${CRED_USER}" >&2; exit 2; }
 exec env -i PATH=${BIN}:/usr/bin:/bin HOME=${CRED_HOME} LANG=C.UTF-8 ${BIN}/node --no-warnings ${LIB}/packages/g4a/src/cred-proxy.mjs ensure
 `,
+    // operator admin: the ONLY root entry the operator needs after install (g4a agent add/remove/
+    // policy/key). Root-owned code, fixed env, fixed subcommands; 'add' binds the caller as operator.
+    'g4a-admin': `#!/bin/sh
+set -eu
+op="\${SUDO_USER:-}"
+case "$op" in ''|*[!a-z0-9_.-]*) echo '{"ok":false,"error":"g4a-admin: run via sudo as the operator"}'; exit 2 ;; esac
+case "\${1:-}" in
+  add) [ "$#" -eq 3 ] || { echo '{"ok":false,"error":"usage: add NAME REPOID"}'; exit 2; }; set -- add "$2" "$3" "$op" ;;
+  remove|policy|key) ;;
+  *) echo '{"ok":false,"error":"g4a-admin: add|remove|policy|key only"}'; exit 2 ;;
+esac
+exec env -i PATH=${BIN}:/usr/bin:/bin:/usr/sbin:/sbin HOME=/root LANG=C.UTF-8 SUDO_USER="$op" ${BIN}/node --no-warnings ${LIB}/packages/g4a/src/agent-users.mjs "$@"
+`,
     // the g4a CLI from the root-owned copy (agent users run this one, never the operator's tree)
     'g4a': `#!/bin/sh
 exec ${BIN}/node --no-warnings ${LIB}/packages/g4a/bin/g4a.mjs "$@"
@@ -171,6 +185,14 @@ exec "$@"
   fs.writeFileSync(`${SUDOERS}.tmp`, rule, { mode: 0o440 });
   if (spawnSync('visudo', ['-cf', `${SUDOERS}.tmp`]).status !== 0) { fs.rmSync(`${SUDOERS}.tmp`); throw new Error('sudoers rule failed visudo -c'); }
   fs.renameSync(`${SUDOERS}.tmp`, SUDOERS);
+  // narrowed operator sudo: the installing operator may run only g4a-admin as root (their own
+  // broader sudo, if any, is host config g4a cannot remove; see SECURITY.md "Operator sudo")
+  const op = process.env.SUDO_USER;
+  if (op && /^[a-z_][a-z0-9_.-]{0,31}$/.test(op) && op !== 'root') {
+    fs.writeFileSync(`${ADMIN_SUDOERS}.tmp`, `# g4a: operator ${op} may run ONLY the root-owned g4a-admin as root\nDefaults!${BIN}/g4a-admin env_reset\n${op} ALL=(root) NOPASSWD: ${BIN}/g4a-admin\n`, { mode: 0o440 });
+    if (spawnSync('visudo', ['-cf', `${ADMIN_SUDOERS}.tmp`]).status !== 0) { fs.rmSync(`${ADMIN_SUDOERS}.tmp`); throw new Error('admin sudoers rule failed visudo -c'); }
+    fs.renameSync(`${ADMIN_SUDOERS}.tmp`, ADMIN_SUDOERS);
+  }
   // seed: a bundle of main, readable by the authority user, cloned authority-side
   const id = createHash('sha256').update(repoId).digest('hex').slice(0, 16);
   const uid = Number(sh('id', ['-u', USER]).trim()), gid = Number(sh('id', ['-g', USER]).trim());
@@ -211,7 +233,7 @@ export async function uninstall({ repoId, purge = false }) {
   }
   const left = Object.keys(map).length;
   if (left) { fs.writeFileSync(`${MAP}.tmp`, JSON.stringify(map, null, 2) + '\n', { mode: 0o644 }); fs.renameSync(`${MAP}.tmp`, MAP); return { ok: true, removed, remaining: left }; }
-  for (const f of [SUDOERS, AGENTS_SUDOERS, AGENTS_HOME, LIB, path.dirname(MAP), HOME, PUB]) fs.rmSync(f, { recursive: true, force: true });
+  for (const f of [SUDOERS, ADMIN_SUDOERS, AGENTS_SUDOERS, AGENTS_HOME, LIB, path.dirname(MAP), HOME, PUB]) fs.rmSync(f, { recursive: true, force: true });
   if (spawnSync('id', ['-u', USER]).status === 0) spawnSync('userdel', [USER]);
   spawnSync('pkill', ['-u', CRED_USER]); fs.rmSync(CRED_HOME, { recursive: true, force: true });
   if (spawnSync('id', ['-u', CRED_USER]).status === 0) spawnSync('userdel', [CRED_USER]);

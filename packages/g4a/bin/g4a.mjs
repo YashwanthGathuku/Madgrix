@@ -53,41 +53,57 @@ exec "$G4A_REAL_GIT" "$@"
 
 function rcSnippet() { return `${BEGIN}\nexport PATH=${shq(binDir)}:"$PATH"\n${END}\n`; }
 
+// rc.json: [{ rc, addNl, created }] for every file g4a wrote its PATH block to (idempotent;
+// uninstall removes exactly that block from each and deletes files g4a itself created when empty)
+const readRcMeta = () => { try { const m = JSON.parse(fs.readFileSync(path.join(home, 'rc.json'), 'utf8')); return Array.isArray(m) ? m : m?.rc ? [m] : []; } catch { return []; } };
+// --login: the login-shell profiles that reset PATH (/etc/profile): ~/.profile always; ~/.bash_profile
+// and ~/.zprofile only if they exist (creating ~/.bash_profile would stop bash reading ~/.profile)
+function rcTargets(args) {
+  const out = [];
+  for (let i = 0; i < args.length; i++) if (args[i] === '--rc' && args[i + 1]) out.push(path.resolve(args[++i]));
+  if (args.includes('--login')) {
+    const h = process.env.HOME || os.homedir();
+    out.push(path.join(h, '.profile'));
+    for (const f of ['.bash_profile', '.zprofile']) if (fs.existsSync(path.join(h, f))) out.push(path.join(h, f));
+  }
+  return [...new Set(out)];
+}
 function install(args) {
-  const rcIdx = args.indexOf('--rc');
-  const rc = rcIdx >= 0 ? args[rcIdx + 1] : null;
   const real = resolveRealGit();
   if (!real) { console.error('g4a: no real git found on PATH'); process.exit(1); }
   fs.mkdirSync(binDir, { recursive: true });
   fs.writeFileSync(shimPath, shimScript(real), { mode: 0o755 });
   fs.writeFileSync(path.join(home, 'env.sh'), rcSnippet());
   console.log(`g4a: shim written to ${shimPath} (real git: ${real})`);
-  if (rc) {
-    const cur = fs.existsSync(rc) ? fs.readFileSync(rc, 'utf8') : '';
+  const targets = rcTargets(args);
+  const meta = readRcMeta();
+  for (const rc of targets) {
+    const existed = fs.existsSync(rc);
+    const cur = existed ? fs.readFileSync(rc, 'utf8') : '';
     if (!cur.includes(BEGIN)) {
       const addNl = cur.length > 0 && !cur.endsWith('\n');
       fs.writeFileSync(rc, cur + (addNl ? '\n' : '') + rcSnippet());
-      fs.writeFileSync(path.join(home, 'rc.json'), JSON.stringify({ rc: path.resolve(rc), addNl }));
+      if (!meta.some((m) => m.rc === rc)) meta.push({ rc, addNl, created: !existed });
     }
-    console.log(`g4a: PATH snippet added to ${rc}; open a new shell or: . ${path.join(home, 'env.sh')}`);
-  } else {
-    console.log(`g4a: to activate, add this to your shell rc (or rerun with --rc ~/.bashrc):\n${rcSnippet()}`);
+    console.log(`g4a: PATH snippet in ${rc}`);
   }
+  if (targets.length) { fs.writeFileSync(path.join(home, 'rc.json'), JSON.stringify(meta)); console.log(`g4a: open a new shell or: . ${path.join(home, 'env.sh')}`); }
+  else console.log(`g4a: to activate, add this to your shell rc (or rerun with --rc ~/.bashrc and/or --login for ~/.profile etc.):\n${rcSnippet()}`);
 }
 
 function uninstall(args) {
-  const rcIdx = args.indexOf('--rc');
-  const rc = rcIdx >= 0 ? args[rcIdx + 1] : null;
-  let meta = {};
-  try { meta = JSON.parse(fs.readFileSync(path.join(home, 'rc.json'), 'utf8')); } catch {}
-  if (rc && fs.existsSync(rc)) {
+  const meta = readRcMeta();
+  const targets = new Set([...meta.map((m) => m.rc), ...rcTargets(args)]);
+  const snip = rcSnippet();
+  for (const rc of targets) {
+    if (!fs.existsSync(rc)) continue;
+    const m = meta.find((x) => x.rc === rc);
     const cur = fs.readFileSync(rc, 'utf8');
-    const snip = rcSnippet();
     const i = cur.indexOf(snip);
-    if (i >= 0) {
-      const start = meta.rc === path.resolve(rc) && meta.addNl && i > 0 && cur[i - 1] === '\n' ? i - 1 : i;
-      fs.writeFileSync(rc, cur.slice(0, start) + cur.slice(i + snip.length));
-    }
+    if (i < 0) continue;
+    const start = m?.addNl && i > 0 && cur[i - 1] === '\n' ? i - 1 : i;
+    const next = cur.slice(0, start) + cur.slice(i + snip.length);
+    if (m?.created && next === '') fs.rmSync(rc); else fs.writeFileSync(rc, next);
   }
   fs.rmSync(path.join(home, 'rc.json'), { force: true });
   for (const f of [shimPath, path.join(home, 'env.sh')]) fs.rmSync(f, { force: true });
@@ -115,11 +131,16 @@ function doctor() {
     const r = spawnSync(argv[0], argv.slice(1), { encoding: 'utf8', timeout: 10000 });
     const g = (r.stdout || '').trim().split('\n').pop() || '(none)';
     const shimmed = g !== '(none)' && path.resolve(g) === path.resolve(shimPath);
-    console.log(`${shimmed ? 'ok  ' : 'WARN'} ${label} resolves git to ${g}${shimmed ? '' : ' (bypasses the shim; add the g4a PATH block to ~/.profile or ~/.bash_profile too; only the claim-scope ref hook covers this path)'}`);
+    console.log(`${shimmed ? 'ok  ' : 'WARN'} ${label} resolves git to ${g}${shimmed ? '' : ' (bypasses the shim; run `g4a install --login` to add the PATH block to ~/.profile (and ~/.bash_profile/~/.zprofile if present); only the claim-scope ref hook covers this path)'}`);
   }
   console.log(`info agent marker in this env: ${agentMarker() ?? 'none'}; stdout TTY: ${process.stdout.isTTY ? 'yes' : 'no'}`);
   console.log('info shim not on path for: absolute-path git, login shells/env -i (see WARN above), IDE SCM with git.path set; the ref hook still blocks out-of-claim commits from any git CLI');
   console.log('info not covered locally (hooks skipped): libgit2/pygit2, go-git, JGit, isomorphic-git, GitPython index.commit, direct .git writes; refused at promote/push, flagged by verify/audit; use --system to prevent authority writes');
+  // system mode is the recommended authority wherever it can be installed (root + useradd)
+  const sysAuth = fs.existsSync('/etc/g4a/authority.json');
+  const canSystem = spawnSync('sudo', ['-n', 'true'], { stdio: 'ignore' }).status === 0 && spawnSync('sh', ['-c', 'command -v useradd'], { stdio: 'ignore' }).status === 0;
+  console.log(sysAuth ? 'ok   system authority installed (/etc/g4a): authority writes are prevented, not just detected'
+    : `${canSystem ? 'WARN' : 'info'} no system authority: same-user mode is detect-only (land-time + daemon tamper audit); ${canSystem ? 'recommended: `g4a authority init --system`' : 'system mode needs root/sudo and useradd'}`);
   process.exitCode = ok ? 0 : 1;
 }
 
@@ -294,12 +315,14 @@ async function authorityCmd(args) {
   const sub = o._[0];
   if (sub === 'init') {
     const top = A.repoTop(o.repo), id = A.repoId(o.repo);
-    if (args.includes('--system')) {
+    // default: system mode where it can be installed (passwordless sudo + useradd); DIR = same-user fallback
+    const canSystem = () => spawnSync('sudo', ['-n', 'true'], { stdio: 'ignore' }).status === 0 && spawnSync('sh', ['-c', 'command -v useradd'], { stdio: 'ignore' }).status === 0;
+    if (args.includes('--system') || (!o._[1] && canSystem())) {
       const r = execFileSync('sudo', ['-n', process.execPath, '--no-warnings', path.join(PKG, 'src', 'system-install.mjs'), id, top], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'inherit'] });
       return out({ ...JSON.parse(r.trim().split('\n').pop()), ref_guard: (await import('../src/refguard.mjs')).installRefGuard(top) });
     }
     const dir = o._[1];
-    if (!dir) { console.error('usage: g4a authority init --system [--repo R] | init DIR [--repo R]'); process.exitCode = 2; return; }
+    if (!dir) { console.error('g4a: system mode is unavailable here (needs passwordless sudo + useradd).\nusage: g4a authority init [--system] [--repo R]   (default; prevents authority writes)\n       g4a authority init DIR [--repo R]          (same-user fallback; detect-only)'); process.exitCode = 2; return; }
     const { initRoot } = await import('../src/authority-service.mjs');
     const r = initRoot({ root: path.resolve(dir), seed: top, clientRepo: id, mode: 'user' });
     safeGit(top, ['config', 'g4a.authority', path.resolve(dir)]);
@@ -345,7 +368,11 @@ const AGENT_NAME_RE = /^[a-z0-9][a-z0-9-]{0,23}$/;
 const AGENTS_MAP = process.env.G4A_AGENTS_MAP_TEST || '/etc/g4a/agents.json';
 const readAgentsMap = () => { try { return JSON.parse(fs.readFileSync(AGENTS_MAP, 'utf8')); } catch { return { agents: {}, policy: {} }; } };
 function rootHelper(args, input) {
-  const r = spawnSync('sudo', ['-n', process.execPath, '--no-warnings', path.join(PKG, 'src', 'agent-users.mjs'), ...args], { encoding: 'utf8', stdio: [input === undefined ? 'ignore' : 'pipe', 'pipe', 'inherit'], ...(input === undefined ? {} : { input }) });
+  // prefer the narrowed root entry (only g4a-admin as root); fall back to full sudo
+  const admin = '/usr/local/lib/g4a/bin/g4a-admin';
+  const useAdmin = fs.existsSync(admin) && spawnSync('sudo', ['-n', '-l', admin], { stdio: 'ignore' }).status === 0;
+  if (useAdmin && args[0] === 'add') args = args.slice(0, 3);
+  const r = spawnSync('sudo', useAdmin ? ['-n', admin, ...args] : ['-n', process.execPath, '--no-warnings', path.join(PKG, 'src', 'agent-users.mjs'), ...args], { encoding: 'utf8', stdio: [input === undefined ? 'ignore' : 'pipe', 'pipe', 'inherit'], ...(input === undefined ? {} : { input }) });
   try { return JSON.parse(r.stdout.trim().split('\n').pop()); } catch { return { ok: false, error: `agent helper failed (exit ${r.status}; needs sudo)` }; }
 }
 async function agentCmd(args) {
