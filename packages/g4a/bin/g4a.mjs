@@ -108,8 +108,18 @@ function doctor() {
     const v = execFileSync(real, ['--version'], { encoding: 'utf8', env: { ...process.env, G4A_ACTIVE: '1' } }).trim();
     line(true, v);
   }
+  // un-shimmed paths coding tools really use: login shells (/etc/profile resets PATH; Codex-style
+  // `bash -lc`) and scrubbed envs (`env -i`). These bypass the shim; the reference-transaction
+  // claim-scope guard (authority init) still blocks out-of-claim commits made through them.
+  for (const [label, argv] of [['login shell (bash -lc)', ['bash', '-lc', 'command -v git']], ['scrubbed env (env -i sh)', ['env', '-i', 'sh', '-c', 'command -v git']]]) {
+    const r = spawnSync(argv[0], argv.slice(1), { encoding: 'utf8', timeout: 10000 });
+    const g = (r.stdout || '').trim().split('\n').pop() || '(none)';
+    const shimmed = g !== '(none)' && path.resolve(g) === path.resolve(shimPath);
+    console.log(`${shimmed ? 'ok  ' : 'WARN'} ${label} resolves git to ${g}${shimmed ? '' : ' (bypasses the shim; add the g4a PATH block to ~/.profile or ~/.bash_profile too; only the claim-scope ref hook covers this path)'}`);
+  }
   console.log(`info agent marker in this env: ${agentMarker() ?? 'none'}; stdout TTY: ${process.stdout.isTTY ? 'yes' : 'no'}`);
-  console.log('info not covered: absolute-path git, git libraries (libgit2/go-git/JGit/isomorphic-git/GitPython object reads), IDE SCM with git.path set to real git, cloud agents');
+  console.log('info shim not on path for: absolute-path git, login shells/env -i (see WARN above), IDE SCM with git.path set; the ref hook still blocks out-of-claim commits from any git CLI');
+  console.log('info not covered locally (hooks skipped): libgit2/pygit2, go-git, JGit, isomorphic-git, GitPython index.commit, direct .git writes; refused at promote/push, flagged by verify/audit; use --system to prevent authority writes');
   process.exitCode = ok ? 0 : 1;
 }
 

@@ -16,10 +16,12 @@ import { witnessSignerFromKey } from '../../../scripts/lib/admission.mjs';
 
 // SQLite access goes through src/sqlite-driver.mjs (node:sqlite or better-sqlite3).
 import { driver, openSqlite, NODE_SQLITE } from './sqlite-driver.mjs';
+import { writeScope, clearScope } from './scopecheck.mjs';
 export const SQLITE = { ok: true, get driver() { return driver().name; }, node: NODE_SQLITE.ok };
 export function requireSqlite() { return driver(); }
 
 export { globMatchesPath };
+const commonDir = (top) => path.resolve(top, safeGit(top, ['rev-parse', '--git-common-dir']).stdout.trim());
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);
@@ -354,6 +356,7 @@ export class Authority {
       const exists = safeGit(top, ['rev-parse', '--verify', '--quiet', `refs/heads/${branch}`], { allowFailure: true }).status === 0;
       if (exists) throw new Error(`branch ${branch} already exists; release and delete it first`);
       safeGit(top, ['worktree', 'add', '--quiet', '-b', branch, worktree, baseline]);
+      writeScope(commonDir(top), agent, { baseline, paths }); // read by the reference-transaction hook
       const id = `c_${randomHex(8)}`;
       const secret = randomHex(32);
       writePrivate(path.join(ensurePrivateDir(path.join(this.home, 'secrets')), id), secret);
@@ -370,6 +373,7 @@ export class Authority {
       const c = this.activeClaims(repo).find((x) => x.agent === agent);
       if (!c) return { ok: false, error: `no active claim for ${agent}` };
       this.db.prepare("UPDATE claims SET status = 'released' WHERE id = ?").run(c.id);
+      try { clearScope(commonDir(repoTop(repoPath)), agent); } catch {}
       if (removeWorktree) safeGit(repoTop(repoPath), ['worktree', 'remove', '--force', c.worktree], { allowFailure: true });
       await this.appendLedger(repo, 'release', { id: c.id, agent });
       return { ok: true, id: c.id };

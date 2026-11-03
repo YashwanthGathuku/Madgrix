@@ -91,6 +91,34 @@ Savings depend on the workload. They shrink as a share of an agent's total token
   Use `G4A_RAW=1` or `G4A_AGENT=0` to opt out.
 - POSIX only (sh shim). Not tested on Windows or macOS.
 
+### Real-world interception matrix (local, Nov 2026)
+Same-user authority, one claim on `c.txt` per row; each row commits `c.txt` plus an out-of-claim
+`out.txt`, then pushes HEAD to the authority's main. Shim = the PATH shim saw the call; local =
+the out-of-claim commit was refused locally; push = the authority's main did not move.
+Claude Code, Codex and Gemini CLIs are installed but need a login/API key, so their git patterns
+were simulated (Claude/Gemini Bash tool = `sh -c`, Codex = `bash -lc`, aider = GitPython).
+
+| path | shim | local (before → after scope hook) | push |
+|---|---|---|---|
+| PATH `git` via `sh -c` (Claude Code / Gemini) | yes | yes → yes | yes |
+| absolute `/usr/bin/git` | no | no → **yes** | yes |
+| login shell `bash -lc` (Codex; /etc/profile resets PATH) | no | no → **yes** | yes |
+| interactive `bash -ic` | yes | yes → yes | yes |
+| `env -i sh` | no | no → **yes** | yes |
+| node `child_process`, `npx`, Python `subprocess`, GitPython `repo.git.*` | yes | yes → yes | yes |
+| VS Code-style `/usr/bin/git` + `GIT_DIR`/`GIT_WORK_TREE` | no | no → **yes** | yes |
+| GitPython `index.commit` (pure Python) | partly | no → no | yes |
+| pygit2 / libgit2 | no | no → no | yes (libgit2 can't push to a non-bare repo) |
+| isomorphic-git (writes refs files directly) | no | n/a | **no in same-user mode** (detected by `authority audit`; prevented only by `--system`) |
+
+The scope hook: `claim` writes `.git/g4a-scope/<agent>.json` (baseline and paths) and `release`
+removes it. The `reference-transaction` hook then refuses moving `refs/heads/g4a/<agent>` to a commit
+whose diff from the baseline leaves the claim. Git runs hooks for every CLI binary, so this covers
+the paths that skip the shim. It does not cover tools that skip hooks (libgit2, isomorphic-git,
+JGit, GitPython `index.commit`, Cursor SCM's `core.hooksPath=/dev/null`). Out-of-claim work from
+those is refused at promote/push and flagged by `verify`/`audit`. `g4a doctor` now WARNs when a
+login shell or `env -i` resolves `git` past the shim.
+
 ## Phase 1: local coordination daemon (no Cloudflare)
 
 Phase 1 replaces the Cloudflare control plane with local pieces: the Durable Object becomes

@@ -139,7 +139,9 @@ test('items 3,5,6: pre-receive refuses unpermitted pushes, anchors are append-on
     assert.equal(push('-o', `permit=${pm}`, url, 'HEAD:refs/heads/agents/a1').status, 0, 'permitted push');
     commitIn(w, 'a.txt', 'y\n');
     assert.notEqual(push('-o', `permit=${pm}`, url, 'HEAD:refs/heads/agents/a1').status, 0, 'replay');
-    commitIn(w, 'b.txt', 'out of scope\n');
+    fs.writeFileSync(path.join(w, 'b.txt'), 'out of scope\n'); git(w, 'add', 'b.txt');
+    assert.throws(() => git(w, 'commit', '-qm', 'oob'), /paths outside claim/, 'local ref hook refuses the out-of-claim commit');
+    git(w, '-c', 'core.hooksPath=/dev/null', 'commit', '-qm', 'oob (hook-skipping tool, e.g. libgit2)');
     assert.notEqual(push('-o', `permit=${call(loc, 'permit', { agent: 'a1', credential }).permit}`, url, 'HEAD:refs/heads/agents/a1').status, 0, 'out-of-claim');
     assert.notEqual(push('-o', `permit=${call(loc, 'permit', { agent: 'a1', credential }).permit}`, url, ':refs/heads/agents/a1').status, 0, 'delete');
     assert.equal(accepted(root).length, 1, 'only the one permitted push is logged');
