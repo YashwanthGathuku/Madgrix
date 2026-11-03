@@ -3,6 +3,8 @@
 // checkpoint-sized commit (1-3 files x 1 KB) on its own branch/claim and landing it.
 //   node bench/race.mjs plain <remote-url|path> [N] [secs]   -> git commit + git push <own branch>
 //   node bench/race.mjs g4a [N] [secs] [--system]            -> g4a claim + commit + promote + release (authority)
+//   node bench/race.mjs g4a-push [N] [secs] [--system]       -> raw branch push: one claim per agent, then
+//        commit + one-time permit + push to the authority's agents/<id> through the scope check (no landing)
 // Prints JSON: ops, ops/s, p50/p95/p99/max ms, errors. Latency = one full op, client side.
 import fs from 'node:fs';
 import os from 'node:os';
@@ -44,16 +46,33 @@ if (mode === 'plain') {
   if (!r.ok && r.ok !== undefined) throw new Error('authority init failed');
 }
 
+// raw push mode talks to the authority client in-process (same env as the CLI)
+Object.assign(process.env, env);
+const AC = mode === 'g4a-push' ? await import('../src/authority-client.mjs') : null;
 const lat = []; let errors = 0, syncRetries = 0; const errSamples = [];
 const deadline = Date.now() + SECS * 1000;
 async function agent(i) {
   const id = `a${i}`; let seq = 0;
   let wt;
+  let loc, cred, ag;
+  if (mode === 'g4a-push') {
+    ag = id; loc = AC.locate(repo);
+    const cl = json((await g4a(['claim', '--repo', repo, '--agent', ag, '--paths', `agents/${id}/**`, '--witness', 'true', '--session-credential'])).stdout);
+    if (!cl.ok) { errors++; errSamples.push(JSON.stringify({ ...cl, agent_credential: undefined }).slice(0, 300)); return; }
+    cred = cl.agent_credential; wt = cl.worktree;
+  }
   if (mode === 'plain') { wt = path.join(W, id); execFileSync('git', ['clone', '-q', remote, wt], { env }); execFileSync('git', ['checkout', '-q', '-b', `agent/${id}`], { cwd: wt, env }); }
   while (Date.now() < deadline) {
     const t0 = process.hrtime.bigint(); let ok = false, why = '';
     seq++;
-    if (mode === 'plain') {
+    if (mode === 'g4a-push') {
+      const d = path.join(wt, 'agents', id); fs.mkdirSync(d, { recursive: true }); files(d);
+      const c = await run('git', ['-C', wt, 'add', '-A']).then(() => run('git', ['-C', wt, 'commit', '-qm', `${id} ${seq}`]));
+      const sha = c.code ? null : (await run('git', ['-C', wt, 'rev-parse', 'HEAD'])).stdout.trim();
+      const t = Date.now(); const p = sha ? await AC.pushAgentAsync(loc, wt, ag, sha, cred) : { ok: false, error: c.stderr };
+      (steps.push ??= []).push(Date.now() - t);
+      ok = p.ok; why = p.error || '';
+    } else if (mode === 'plain') {
       const d = path.join(wt, id); fs.mkdirSync(d, { recursive: true }); files(d);
       const c = await run('git', ['-C', wt, 'add', '-A']).then(() => run('git', ['-C', wt, 'commit', '-qm', `${id} ${seq}`]));
       const p = c.code ? c : await run('git', ['-C', wt, 'push', '-q', 'origin', `agent/${id}`]);
