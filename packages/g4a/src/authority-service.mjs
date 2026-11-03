@@ -8,6 +8,7 @@
 // (append-only), keys/ (0700), state/ (Authority DB), nonces/, accepted.jsonl, authority.json;
 // public dir P (readable by clients): permit/witness/operator *.pub.hex, overrides/, seed.
 import fs from 'node:fs';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { redact } from './privacy.mjs';
 import os from 'node:os';
 import path from 'node:path';
@@ -99,7 +100,9 @@ function fileLock(L, fn, name) {
   const release = () => fs.rmSync(lock, { recursive: true, force: true });
   return Promise.resolve().then(fn).finally(release);
 }
-export const callerUid = () => { const v = process.env.G4A_CALLER_UID; return /^[0-9]+$/.test(v ?? '') ? Number(v) : process.getuid(); };
+// system-mode authority server: per-request kernel peer uid (SO_PEERCRED via peer-gate.py)
+export const peerCtx = new AsyncLocalStorage();
+export const callerUid = () => { const s = peerCtx.getStore(); if (s) return s.uid; const v = process.env.G4A_CALLER_UID; return /^[0-9]+$/.test(v ?? '') ? Number(v) : process.getuid(); };
 // state/agents.json: { "<agent>": <uid> }. Bound on first claim; root (uid 0) may act for any agent.
 // state/agents.json: { "<agent>": { uid, cred } }. cred = sha256 of a per-agent credential the
 // authority issues on the binding claim (returned ONCE, never stored in clear authority-side).

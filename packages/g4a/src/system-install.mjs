@@ -77,6 +77,9 @@ id="$1"; cmd="$2"; arg="\${3:-}"
 case "$id" in *[!0-9a-f]*|'') echo '{"ok":false,"error":"bad id"}'; exit 2;; esac
 [ \${#id} -eq 16 ] || { echo '{"ok":false,"error":"bad id"}'; exit 2; }
 case "$cmd" in claim|permit|land|release|status|ledger|audit|pubinfo) ;;
+  serve) [ -z "$arg" ] || exit 2
+    # long-running server for this repo (kernel peer-uid gate, see peer-gate.py); detached by the client
+    exec ${ENV} ${BIN}/node --no-warnings ${LIB}/packages/g4a/src/authority-server.mjs --system --root ${REPOS}/"$id" --pub ${PUB}/"$id" ;;
   init-root) [ -z "\${SUDO_USER:-}" ] || { echo '{"ok":false,"error":"init-root is root-only"}'; exit 2; } ;;
   *) echo '{"ok":false,"error":"bad command"}'; exit 2;; esac
 case "$arg" in *[!A-Za-z0-9+/=]*) echo '{"ok":false,"error":"bad arg"}'; exit 2;; esac
@@ -234,6 +237,7 @@ export async function uninstall({ repoId, purge = false }) {
   const left = Object.keys(map).length;
   if (left) { fs.writeFileSync(`${MAP}.tmp`, JSON.stringify(map, null, 2) + '\n', { mode: 0o644 }); fs.renameSync(`${MAP}.tmp`, MAP); return { ok: true, removed, remaining: left }; }
   for (const f of [SUDOERS, ADMIN_SUDOERS, AGENTS_SUDOERS, AGENTS_HOME, LIB, path.dirname(MAP), HOME, PUB]) fs.rmSync(f, { recursive: true, force: true });
+  spawnSync('pkill', ['-u', USER]);
   if (spawnSync('id', ['-u', USER]).status === 0) spawnSync('userdel', [USER]);
   spawnSync('pkill', ['-u', CRED_USER]); fs.rmSync(CRED_HOME, { recursive: true, force: true });
   if (spawnSync('id', ['-u', CRED_USER]).status === 0) spawnSync('userdel', [CRED_USER]);

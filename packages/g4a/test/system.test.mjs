@@ -277,7 +277,7 @@ test('agent users: separate uids, scoped launcher, no impersonation, full cleanu
 
     // cleanup leaves nothing: user, group, home, processes, tmp files, sudoers, maps, binding
     run('alice', 'sleep 300 >/dev/null 2>&1 & echo x > /tmp/g4a-au-left-alice; true');
-    for (const n of ['alice', 'bob']) assert.equal(J(g4a(['agent', 'remove', n])).ok, true);
+    for (const n of ['alice', 'bob']) { const r = g4a(['agent', 'remove', n]); assert.equal(J(r).ok, true, n + ': ' + r.stdout + r.stderr); }
     for (const n of ['alice', 'bob']) {
       assert.notEqual(sh(`id g4a-a-${n}`).status, 0); assert.notEqual(sh(`getent group g4a-a-${n}`).status, 0);
       assert.equal(fs.existsSync(H(n)), false); assert.notEqual(sh(`pgrep -u ${uids[n]}`).status, 0);
@@ -296,6 +296,105 @@ test('agent users: separate uids, scoped launcher, no impersonation, full cleanu
     g4a(['stop']);
     for (const n of ['alice', 'bob']) if (sh(`id g4a-a-${n}`).status === 0) g4a(['agent', 'remove', n]);
     if (repoIdStr) assert.match(g4a(['authority', 'uninstall', '--system', '--repo-id', repoIdStr], { cwd: '/tmp' }).stdout, /"ok":\s*true/);
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ---- system-mode authority server red team (kernel SO_PEERCRED peer uid via peer-gate.py) ----
+// raw client as user u: send lines, print each reply line (python: no node needed by the agent)
+const PY = `import socket,sys,json
+s=socket.socket(socket.AF_UNIX);s.connect(sys.argv[1]);s.sendall(sys.stdin.buffer.read())
+b=b''
+while True:
+  d=s.recv(65536)
+  if not d: break
+  b+=d
+print(b.decode().strip())`;
+const raw = (u, sock, payload) => spawnSync('sudo', ['-n', '-u', u, 'python3', '-c', PY, sock], { input: payload, encoding: 'utf8', cwd: '/tmp' });
+const rq = (u, sock, obj) => { const r = raw(u, sock, JSON.stringify(obj) + '\n'); try { return JSON.parse(r.stdout); } catch { return { rawOut: r.stdout, err: r.stderr }; } };
+const hex = (n) => [...crypto.getRandomValues(new Uint8Array(n))].map((b) => b.toString(16).padStart(2, '0')).join('');
+
+test('system authority server: kernel peer uid identity, attacks refused', { skip: !canSudo && 'needs passwordless sudo' }, async () => {
+  const created = [];
+  for (const u of ['g4a-agent', 'g4a-agent2']) if (sh(`id ${u}`).status !== 0) { assert.equal(sh(`sudo -n useradd --system --create-home --shell /bin/bash ${u}`).status, 0); created.push(u); }
+  let repoIdStr = null;
+  const env0 = { ...process.env };
+  const dir = fs.mkdtempSync('/tmp/g4a-ss-'); fs.chmodSync(dir, 0o755);
+  try {
+    const repo = path.join(dir, 'repo');
+    const g = 'git -c user.name=t -c user.email=t@t';
+    assert.equal(sh(`mkdir ${repo} && cd ${repo} && git init -q -b main && echo a > a.txt && echo b > b.txt && ${g} add -A && ${g} commit -qm base && git checkout -q --detach`).status, 0);
+    repoIdStr = fs.realpathSync(path.join(repo, '.git'));
+    const env = { ...process.env, G4A_HOME: path.join(dir, 'home'), G4A_KEY_DIR: path.join(dir, 'keys') };
+    const init = spawnSync(process.execPath, ['--no-warnings', CLI, 'authority', 'init', '--system', '--repo', repo], { encoding: 'utf8', env });
+    assert.equal(init.status, 0, init.stderr);
+    const info = JSON.parse(init.stdout);
+    const sock = `${info.pub}/run/s.sock`;
+    // start through the sanctioned wrapper, as an unprivileged agent (any uid may, like the per-call wrapper)
+    spawnSync('bash', ['-c', `sudo -n -u g4a-agent sudo -n -u g4a-authority ${WRAP}/g4a-authority ${info.id} serve >/dev/null 2>&1 &`]);
+    for (let i = 0; i < 100 && !fs.existsSync(sock); i++) await new Promise((r) => setTimeout(r, 100));
+    assert.ok(fs.existsSync(sock), 'server socket up');
+    // a second start is a no-op (single server per repo)
+    assert.equal(sh(`sudo -n -u g4a-authority ${WRAP}/g4a-authority ${info.id} serve; echo rc=$?`).stdout.match(/rc=0/) !== null, true);
+    // the wrapper refuses an argument to serve (no injection of --root/--pub etc.)
+    assert.match(sh(`sudo -n -u g4a-agent sudo -n -u g4a-authority ${WRAP}/g4a-authority ${info.id} serve eA== 2>&1; echo rc=$?`).stdout, /rc=(?!0)\d+/);
+    const st = fs.lstatSync(sock), d = fs.lstatSync(path.dirname(sock));
+    assert.equal(d.mode & 0o777, 0o755); assert.ok(st.isSocket());
+    // A1: the agent cannot plant / replace the socket (run dir is the authority's, 0755)
+    assert.match(sh(`sudo -n -u g4a-agent bash -c 'rm -f ${sock} 2>&1; touch ${path.dirname(sock)}/x 2>&1; echo rc=$?'`).stdout, /denied[\s\S]*rc=1/);
+
+    // happy path: claim as g4a-agent over the socket; identity = kernel uid
+    const c1 = rq('g4a-agent', sock, { id: hex(16), cmd: 'claim', p: { agent: 's1', paths: ['a.txt'] } });
+    assert.equal(c1.r?.ok, true, JSON.stringify(c1));
+    const cred = c1.r.agent_credential;
+    // A2: uid spoofing in the request is ignored: agent2 using s1's name + stolen credential, with uid fields
+    for (const extra of [{ uid: Number(sh('id -u g4a-agent').stdout) }, { uid: 0 }]) {
+      const r = rq('g4a-agent2', sock, { id: hex(16), cmd: 'permit', ...extra, p: { agent: 's1', credential: cred, ...extra } });
+      assert.equal(r.r?.ok, false, JSON.stringify(r)); assert.match(r.r.error, /bound to uid/);
+    }
+    // A3: replayed id (same uid) refused; privileged / unknown commands not served
+    const id = hex(16);
+    assert.equal(rq('g4a-agent', sock, { id, cmd: 'status', p: {} }).r?.ok, true);
+    assert.match(rq('g4a-agent', sock, { id, cmd: 'status', p: {} }).error, /replayed/);
+    for (const cmd of ['init-root', 'operator-init', 'override', 'rebind', 'unbind', 'policy', '__proto__', 'constructor']) assert.match(rq('g4a-agent2', sock, { id: hex(16), cmd, p: { agent: 's1', uid: Number(sh('id -u g4a-agent2').stdout) } }).error ?? '', /not served/, cmd);
+    // A4: malformed: bad json, array, missing id, bad p, oversized line
+    assert.match(raw('g4a-agent2', sock, 'not json\n').stdout, /bad json/);
+    assert.match(rq('g4a-agent2', sock, [1]).error, /bad request/);
+    assert.match(rq('g4a-agent2', sock, { cmd: 'status' }).error, /bad request id/);
+    assert.match(rq('g4a-agent2', sock, { id: hex(16), cmd: 'status', p: [] }).error, /bad params/);
+    assert.match(raw('g4a-agent2', sock, 'x'.repeat((1 << 20) + 10) + '\n').stdout, /too large/);
+    // A5: agent-name injection through the server
+    for (const agent of ['..', '../../etc', '-rf', 'a;id', '$(id)']) assert.equal(rq('g4a-agent2', sock, { id: hex(16), cmd: 'claim', p: { agent, paths: ['b.txt'] } }).r?.ok, false, agent);
+    // A6: credential mismatch from the right uid refused; release with the real credential works
+    assert.equal(rq('g4a-agent', sock, { id: hex(16), cmd: 'release', p: { agent: 's1', credential: 'x'.repeat(43) } }).r?.ok, false);
+    // A8: slowloris from agent2 (100 idle connections) does not starve agent1
+    const slow = path.join(dir, 'slow.py'); fs.writeFileSync(slow, `import socket,time\nss=[socket.socket(socket.AF_UNIX) for _ in range(100)]\n[x.connect("${sock}") for x in ss]\ntime.sleep(4)\n`, { mode: 0o644 });
+    spawnSync('bash', ['-c', `sudo -n -u g4a-agent2 python3 ${slow} >/dev/null 2>&1 &`]);
+    await new Promise((r) => setTimeout(r, 800));
+    await new Promise((r) => setTimeout(r, 700));
+    const busy = raw('g4a-agent2', sock, JSON.stringify({ id: hex(16), cmd: 'status', p: {} }) + '\n');
+    assert.match(busy.stdout + busy.stderr, /busy|reset|Broken pipe/, busy.stdout + busy.stderr);
+    assert.equal(rq('g4a-agent', sock, { id: hex(16), cmd: 'status', p: {} }).r?.ok, true, 'agent1 still served');
+    // A7: the box-side client refuses a socket not owned by the pub owner (planted / own socket)
+    const { request } = await import('../src/authority-server.mjs');
+    const fake = fs.mkdtempSync(path.join(os.tmpdir(), 'g4a-fakepub-')); fs.mkdirSync(path.join(fake, 'run'));
+    const net = await import('node:net'); const srv = net.createServer(); await new Promise((r) => srv.listen(path.join(fake, 'run', 's.sock'), r));
+    assert.equal(await request(null, 'status', {}, { system: true, pub: fake }), null);
+    srv.close(); fs.rmSync(fake, { recursive: true, force: true });
+    // and the real one works from this (non-authority) uid via the client
+    const viaClient = await request(null, 'status', {}, { system: true, pub: info.pub });
+    assert.equal(viaClient?.ok, true, JSON.stringify(viaClient));
+    assert.equal(rq('g4a-agent', sock, { id: hex(16), cmd: 'release', p: { agent: 's1', credential: cred } }).r?.ok, true);
+    // ledger chain still verifies after server-side traffic (per-call path)
+    const au = JSON.parse(spawnSync('sudo', ['-n', '-u', 'g4a-authority', `${WRAP}/g4a-authority`, info.id, 'audit', Buffer.from('{}').toString('base64')], { encoding: 'utf8', cwd: '/tmp' }).stdout);
+    assert.equal(au.ok, true, JSON.stringify(au));
+  } finally {
+    spawnSync('sudo', ['-n', 'pkill', '-u', 'g4a-authority', '-f', 'authority-server.mjs']);
+    if (repoIdStr) {
+      const u = spawnSync(process.execPath, ['--no-warnings', CLI, 'authority', 'uninstall', '--system', '--repo-id', repoIdStr], { encoding: 'utf8', env: env0 });
+      assert.match(u.stdout, /"ok":\s*true/, u.stdout + u.stderr);
+    }
+    for (const u of created) { sh(`sudo -n pkill -KILL -u ${u}; sleep 0.3; sudo -n userdel -r ${u} 2>/dev/null`); }
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });

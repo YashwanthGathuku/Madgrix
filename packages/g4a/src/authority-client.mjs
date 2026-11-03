@@ -64,13 +64,14 @@ const started = new Set();
 const SERVER = path.join(path.dirname(fileURLToPath(import.meta.url)), 'authority-server.mjs');
 function startServer(loc) {
   if (started.has(loc.root)) return; started.add(loc.root);
-  try { spawn(process.execPath, ['--no-warnings', SERVER, '--root', loc.root], { detached: true, stdio: 'ignore' }).unref(); } catch {}
+  const [bin, args] = loc.mode === 'system' ? ['sudo', ['-n', '-u', SYSTEM_USER, WRAP('g4a-authority'), loc.id, 'serve']] : [process.execPath, ['--no-warnings', SERVER, '--root', loc.root]];
+  try { const ch = spawn(bin, args, { detached: true, stdio: 'ignore' }); ch.on('error', () => {}); ch.unref(); } catch {}
 }
 export async function callAsync(loc, cmd, params = {}) {
-  if (loc.mode === 'user' && process.env.G4A_AUTHORITY_SERVER !== '0') {
+  if (process.env.G4A_AUTHORITY_SERVER !== '0') {
     const { SERVE_CMDS, request } = await import('./authority-server.mjs');
     if (SERVE_CMDS.has(cmd)) {
-      const r = await request(loc.root, cmd, params);
+      const r = await request(loc.root, cmd, params, { system: loc.mode === 'system', pub: loc.pub });
       if (r !== null) return r;
       startServer(loc);
     }

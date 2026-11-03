@@ -1,24 +1,32 @@
-// Long-running same-user authority server (opt-out: G4A_AUTHORITY_SERVER=0).
+// Long-running authority server (opt-out: G4A_AUTHORITY_SERVER=0).
 // Same commands and checks as one `authority-service.mjs` process per call (signed one-time permits,
 // exact reviewed SHA, ledger chain + anchors, claim scope, agent credentials), minus the per-call
-// node boot, key load and anchor re-check. Access: R/run/ is 0700 and the socket 0600 (only the
-// authority uid can connect); each request carries a 256-bit server token (R/run/token, 0600,
-// rotated on every start) and a fresh 128-bit request id (replays refused). Only the agent-facing
-// commands are served; operator, OS-identity and init commands stay on the per-call path.
-// System mode is refused: Node has no SO_PEERCRED, so the server could not learn the caller uid
-// that identity binding needs; the sudo wrappers keep that path.
+// node boot, key load and anchor re-check. Only the agent-facing commands are served; operator,
+// OS-identity and init commands stay on the per-call path.
+// Same-user mode: R/run/ is 0700 and the socket 0600 (only the authority uid can connect); each
+// request carries a 256-bit server token (R/run/token, 0600, rotated on every start) and a fresh
+// 128-bit request id (replays refused).
+// System mode (runs as g4a-authority, started via the root-owned `g4a-authority <id> serve`
+// wrapper): the socket PUB/<id>/run/s.sock is owned by peer-gate.py, a stdlib-only Python helper
+// that reads each connection's kernel peer uid (SO_PEERCRED) and hands it to this process over a
+// private pipe. That uid replaces SUDO_UID as the caller identity (uid binding + agent credential
+// checks unchanged); nothing in the request can set it. No token: any local uid may connect, as any
+// uid may run the sudo wrapper, and is then identified by the kernel.
 import fs from 'node:fs';
 import net from 'node:net';
 import path from 'node:path';
 import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
-import { layout, run, shareAuthority } from './authority-service.mjs';
+import { spawn } from 'node:child_process';
+import { layout, run, shareAuthority, peerCtx } from './authority-service.mjs';
 import { redact } from './privacy.mjs';
 
 export const SERVE_CMDS = new Set(['pubinfo', 'claim', 'permit', 'land', 'release', 'status', 'ledger', 'audit']);
 export const MAX_LINE = 1 << 20;
 const ID_RE = /^[0-9a-f]{32}$/;
 export const runDir = (root) => path.join(path.resolve(root), 'run');
+export const sysSock = (pub) => path.join(path.resolve(pub), 'run', 's.sock');
+const GATE = path.join(path.dirname(fileURLToPath(import.meta.url)), 'peer-gate.py');
 
 function privateRunDir(dir) {
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
@@ -28,11 +36,12 @@ function privateRunDir(dir) {
   if (st.mode & 0o077) fs.chmodSync(dir, 0o700);
 }
 
-export async function serve(root, { idleMs = Number(process.env.G4A_SERVE_IDLE_MS) || 300_000 } = {}) {
-  let L = layout(root);
+export async function serve(root, { idleMs = Number(process.env.G4A_SERVE_IDLE_MS) || 300_000, system = false, pub } = {}) {
+  let L = layout(root, pub);
   const conf = JSON.parse(fs.readFileSync(L.conf, 'utf8'));
-  L = layout(root, conf.pub);
-  if (conf.mode === 'system') throw new Error('authority server is same-user only (system mode keeps the sudo path: no peer credentials in Node)');
+  if (!system) L = layout(root, conf.pub);
+  if ((conf.mode === 'system') !== system) throw new Error(system ? 'not a system-mode authority' : 'system-mode authority: use the g4a-authority serve wrapper');
+  if (system) return serveSystem(L, idleMs);
   const dir = runDir(L.root), sock = path.join(dir, 'a.sock'), tokFile = path.join(dir, 'token');
   privateRunDir(dir);
   if (fs.existsSync(sock)) {
@@ -64,23 +73,8 @@ export async function serve(root, { idleMs = Number(process.env.G4A_SERVE_IDLE_M
     conn.on('error', () => {});
   });
   async function handle(line) {
-    bump();
-    let req;
-    try { req = JSON.parse(line); } catch { return { error: 'bad json' }; }
-    if (!req || typeof req !== 'object' || Array.isArray(req)) return { error: 'bad request' };
-    const id = typeof req.id === 'string' && ID_RE.test(req.id) ? req.id : null;
-    const t = typeof req.token === 'string' && /^[0-9a-f]{64}$/.test(req.token) ? Buffer.from(req.token, 'hex') : null;
-    if (!t || !timingSafeEqual(t, token)) return { id, error: 'unauthorized' };
-    if (!id) return { error: 'bad request id' };
-    if (seen.has(id)) return { id, error: 'replayed request id' };
-    seen.add(id); if (seen.size > 200_000) seen.delete(seen.values().next().value);
-    if (typeof req.cmd !== 'string' || !SERVE_CMDS.has(req.cmd)) return { id, error: 'command not served' };
-    const p = req.p ?? {};
-    if (typeof p !== 'object' || Array.isArray(p) || p === null) return { id, error: 'bad params' };
-    inflight++;
-    try { return { id, r: await run(L, req.cmd, { ...p }) }; }
-    catch (e) { return { id, r: { ok: false, error: redact(String(e.message || e)) } }; }
-    finally { inflight--; bump(); }
+    bump(); inflight++;
+    try { return await dispatch(L, line, { token, seen }); } finally { inflight--; bump(); }
   }
   function stop() {
     if (inflight) return bump();
@@ -99,22 +93,107 @@ export async function serve(root, { idleMs = Number(process.env.G4A_SERVE_IDLE_M
   return { ok: true, sock, pid: process.pid };
 }
 
+// one request line -> reply. token: same-user mode (256-bit, constant-time compare); uid: system mode
+// (kernel peer uid from peer-gate.py, runs the command with it as the caller identity).
+async function dispatch(L, line, { token = null, uid = null, seen }) {
+  let req;
+  try { req = JSON.parse(line); } catch { return { error: 'bad json' }; }
+  if (!req || typeof req !== 'object' || Array.isArray(req)) return { error: 'bad request' };
+  const id = typeof req.id === 'string' && ID_RE.test(req.id) ? req.id : null;
+  if (token) {
+    const t = typeof req.token === 'string' && /^[0-9a-f]{64}$/.test(req.token) ? Buffer.from(req.token, 'hex') : null;
+    if (!t || !timingSafeEqual(t, token)) return { id, error: 'unauthorized' };
+  } else if (!Number.isInteger(uid) || uid < 0) return { id, error: 'unauthorized' };
+  if (!id) return { error: 'bad request id' };
+  const key = token ? id : `${uid}:${id}`;
+  if (seen.has(key)) return { id, error: 'replayed request id' };
+  seen.add(key); if (seen.size > 200_000) seen.delete(seen.values().next().value);
+  if (typeof req.cmd !== 'string' || !SERVE_CMDS.has(req.cmd)) return { id, error: 'command not served' };
+  const p = req.p ?? {};
+  if (typeof p !== 'object' || Array.isArray(p) || p === null) return { id, error: 'bad params' };
+  const exec = () => run(L, req.cmd, { ...p });
+  try { return { id, r: await (token ? exec() : peerCtx.run({ uid }, exec)) }; }
+  catch (e) { return { id, r: { ok: false, error: redact(String(e.message || e)) } }; }
+}
+
+async function serveSystem(L, idleMs) {
+  if (process.getuid() === 0) throw new Error('system authority server must run as the authority user, not root');
+  const sock = sysSock(L.pub), dir = path.dirname(sock);
+  fs.mkdirSync(dir, { recursive: true, mode: 0o755 });
+  const st = fs.lstatSync(dir);
+  if (!st.isDirectory() || st.isSymbolicLink() || st.uid !== process.getuid()) throw new Error(`${dir}: not an authority-owned directory`);
+  fs.chmodSync(dir, 0o755);
+  const lockDir = path.join(dir, 'serve.d');
+  try { fs.mkdirSync(lockDir, { mode: 0o700 }); } catch {
+    // another server holds it unless its pid is gone
+    let pid = 0; try { pid = Number(fs.readFileSync(path.join(lockDir, 'pid'), 'utf8')); } catch {}
+    let alive = false; try { if (pid) { process.kill(pid, 0); alive = true; } } catch {}
+    if (alive) return { ok: true, already: true, sock };
+    fs.rmSync(lockDir, { recursive: true, force: true }); fs.mkdirSync(lockDir, { mode: 0o700 });
+  }
+  fs.writeFileSync(path.join(lockDir, 'pid'), String(process.pid));
+  fs.rmSync(sock, { force: true });
+  shareAuthority(L);
+  // the scrubbed env from the wrapper; -I -S: isolated, no site / user dirs / PYTHON* env
+  const gate = spawn('/usr/bin/python3', ['-I', '-S', GATE, sock], { stdio: ['pipe', 'pipe', 'ignore'], env: { PATH: '/usr/bin:/bin', LANG: 'C.UTF-8' } });
+  const seen = new Set();
+  let inflight = 0, idle = null, buf = '';
+  const stop = () => {
+    if (inflight) return bump();
+    try { gate.kill(); } catch {}
+    fs.rmSync(sock, { force: true }); fs.rmSync(lockDir, { recursive: true, force: true });
+    process.exit(0);
+  };
+  const bump = () => { clearTimeout(idle); idle = setTimeout(stop, idleMs); };
+  const ready = new Promise((res, rej) => { gate.on('exit', (c) => rej(new Error(`peer gate exited (${c})`))); gate.stdout.once('data', () => res()); });
+  gate.stdout.setEncoding('utf8');
+  gate.stdout.on('data', (d) => {
+    buf += d; let i;
+    while ((i = buf.indexOf('\n')) >= 0) {
+      const raw = buf.slice(0, i); buf = buf.slice(i + 1);
+      let m; try { m = JSON.parse(raw); } catch { continue; }
+      if (m.ready || !Number.isInteger(m.c)) continue;
+      bump(); inflight++;
+      dispatch(L, String(m.line ?? ''), { uid: m.uid, seen }).then((reply) => {
+        inflight--; bump();
+        gate.stdin.write(JSON.stringify({ c: m.c, reply: JSON.stringify(reply) }) + '\n');
+      });
+    }
+  });
+  gate.stdin.on('error', () => {});
+  gate.on('exit', () => { fs.rmSync(lockDir, { recursive: true, force: true }); process.exit(1); });
+  await ready;
+  setInterval(() => { if (!fs.existsSync(L.conf)) { inflight = 0; stop(); } }, 2000).unref();
+  for (const sg of ['SIGINT', 'SIGTERM']) process.on(sg, () => { inflight = 0; stop(); });
+  bump();
+  return { ok: true, sock, pid: process.pid, system: true };
+}
+
 // client: one request over the socket; null when no server is reachable (caller falls back)
-export function request(root, cmd, p, { timeoutMs = 900_000 } = {}) {
-  const dir = runDir(root);
-  let token;
+// system: { pub } of a system-mode authority (socket PUB/<id>/run/s.sock, kernel peer uid, no token)
+export function request(root, cmd, p, { timeoutMs = 900_000, system = false, pub } = {}) {
+  let token, sockPath;
   try {
-    const st = fs.lstatSync(dir);
-    if (!st.isDirectory() || st.uid !== process.getuid() || (st.mode & 0o077)) return Promise.resolve(null);
-    token = fs.readFileSync(path.join(dir, 'token'), 'utf8').trim();
+    if (system) {
+      sockPath = sysSock(pub);
+      const owner = fs.statSync(pub).uid, d = fs.lstatSync(path.dirname(sockPath)), s = fs.lstatSync(sockPath);
+      // the socket must be the authority user's (an attacker-planted socket would collect permits/credentials)
+      if (!d.isDirectory() || d.uid !== owner || (d.mode & 0o022) || !s.isSocket() || s.uid !== owner || owner === process.getuid()) return Promise.resolve(null);
+    } else {
+      const dir = runDir(root);
+      const st = fs.lstatSync(dir);
+      if (!st.isDirectory() || st.uid !== process.getuid() || (st.mode & 0o077)) return Promise.resolve(null);
+      token = fs.readFileSync(path.join(dir, 'token'), 'utf8').trim();
+      sockPath = path.join(dir, 'a.sock');
+    }
   } catch { return Promise.resolve(null); }
   const id = randomBytes(16).toString('hex');
   return new Promise((resolve) => {
-    const c = net.connect(path.join(dir, 'a.sock'));
+    const c = net.connect(sockPath);
     let buf = '', sent = false;
     const t = setTimeout(() => { c.destroy(); resolve({ ok: false, error: 'authority server timed out' }); }, timeoutMs);
     c.setEncoding('utf8');
-    c.on('connect', () => { sent = true; c.write(JSON.stringify({ id, token, cmd, p }) + '\n'); });
+    c.on('connect', () => { sent = true; c.write(JSON.stringify(token ? { id, token, cmd, p } : { id, cmd, p }) + '\n'); });
     c.on('data', (d) => {
       buf += d; const i = buf.indexOf('\n'); if (i < 0) return;
       clearTimeout(t); c.end();
@@ -128,7 +207,17 @@ export function request(root, cmd, p, { timeoutMs = 900_000 } = {}) {
 }
 
 if (process.argv[1] && fs.realpathSync(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  const i = process.argv.indexOf('--root');
-  serve(process.argv[i + 1]).then((r) => { if (r.already) process.exit(0); if (process.send) process.send(r); else process.stdout.write(JSON.stringify(r) + '\n'); },
+  const arg = (k) => { const i = process.argv.indexOf(k); return i > 0 ? process.argv[i + 1] : undefined; };
+  const system = process.argv.includes('--system');
+  if (system && !process.argv.includes('--fg')) {
+    // detach from the caller's sudo session (whose monitor keeps the caller uid alive, which would
+    // block that agent user's removal): re-exec in a new session, wait until the socket is up, exit
+    const ch = spawn(process.execPath, ['--no-warnings', fileURLToPath(import.meta.url), ...process.argv.slice(2), '--fg'], { detached: true, stdio: 'ignore', cwd: '/' });
+    ch.unref();
+    const sock = sysSock(arg('--pub'));
+    const t0 = Date.now();
+    const wait = () => (fs.existsSync(sock) || Date.now() - t0 > 5000 ? process.exit(0) : setTimeout(wait, 50));
+    wait();
+  } else serve(arg('--root'), { system, pub: arg('--pub') }).then((r) => { if (r.already) process.exit(0); if (process.send) process.send(r); else process.stdout.write(JSON.stringify(r) + '\n'); },
     (e) => { process.stdout.write(JSON.stringify({ ok: false, error: redact(String(e.message || e)) }) + '\n'); process.exit(1); });
 }

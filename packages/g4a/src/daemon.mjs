@@ -150,8 +150,16 @@ export async function startDaemon(home = g4aHome(), { hooks = {}, keyDir } = {})
       const loc = locate(p.repo);
       if (!loc) return auth.claim(p);
       // the authority decides first (overlap / witness-path guards on ITS claims); local mirrors
-      const local = safeGit(p.repo, ['rev-parse', '--verify', '--quiet', 'refs/heads/main'], { allowFailure: true }).stdout.trim();
+      let local = safeGit(p.repo, ['rev-parse', '--verify', '--quiet', 'refs/heads/main'], { allowFailure: true }).stdout.trim();
       const amain = await fetchMainScratch(loc, p.repo);
+      // auto-sync (G4A_AUTOSYNC=0 disables): when the authority's main is a fast-forward of the local
+      // mirror (another agent landed), move the mirror forward (compare-and-swap) instead of refusing.
+      // Never rewinds or replaces diverged local history: that stays main_out_of_sync.
+      // (only while main is not checked out here, so no working tree is left behind)
+      if (local !== amain && amain && local && process.env.G4A_AUTOSYNC !== '0'
+        && safeGit(p.repo, ['symbolic-ref', '-q', 'HEAD'], { allowFailure: true }).stdout.trim() !== 'refs/heads/main'
+        && safeGit(p.repo, ['merge-base', '--is-ancestor', local, amain], { allowFailure: true }).status === 0
+        && safeGit(p.repo, ['update-ref', '-m', 'g4a: auto-sync to authority main', 'refs/heads/main', amain, local], { allowFailure: true }).status === 0) local = amain;
       if (local !== amain) return { ok: false, refused: 'main_out_of_sync', local, authority: amain };
       const a = await callAsync(loc, 'claim', { agent: p.agent, paths: p.paths, witnesses: p.witnesses, witnessPaths: p.witnessPaths, allowOverlap: p.allowOverlap, credential: credOf(p) });
       if (!a.ok) return { ...a, via: `authority:${loc.mode}` };
