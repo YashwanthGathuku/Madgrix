@@ -338,7 +338,7 @@ export class Authority {
   }
   claim({ repo: repoPath, agent, paths, witnesses = [], witnessPaths = [], allowOverlap = false, expectBaseline = null }) {
     return this.serial(async () => {
-      if (!/^[A-Za-z0-9._-]{1,64}$/.test(agent || '')) throw new Error('agent must match [A-Za-z0-9._-]{1,64}');
+      if (!/^(?!.*\.\.)[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(agent || '')) throw new Error('agent must start with a letter or digit and match [A-Za-z0-9._-]{1,64} (no ..)');
       if (!Array.isArray(paths) || paths.length === 0) throw new Error('claim needs at least one path');
       if (!Array.isArray(witnessPaths)) throw new Error('witnessPaths must be an array');
       paths = normalizeClaimPaths(paths); witnessPaths = normalizeClaimPaths(witnessPaths);

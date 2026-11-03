@@ -73,7 +73,17 @@ export function initRoot({ root, pub, seed, clientRepo, mode }) {
 }
 
 // ---- service commands ----
+// In-process queue in front of the cross-process mkdir lock: in the long-running authority server,
+// concurrent requests wait here asynchronously instead of spinning on a lock this process holds.
+const inproc = new Map();
 function withLock(L, fn, name = 'lock.d') {
+  const key = path.join(L.root, name);
+  const p = (inproc.get(key) ?? Promise.resolve()).then(() => fileLock(L, fn, name));
+  const tail = p.catch(() => {}); inproc.set(key, tail);
+  tail.then(() => { if (inproc.get(key) === tail) inproc.delete(key); });
+  return p;
+}
+function fileLock(L, fn, name) {
   const lock = path.join(L.root, name);
   const t0 = Date.now(); let spins = 0;
   for (;;) {
@@ -101,7 +111,7 @@ const readAgents = (L) => { try { return JSON.parse(fs.readFileSync(agentsFile(L
 const writeAgents = (L, m) => { fs.writeFileSync(agentsFile(L) + '.tmp', JSON.stringify(m, null, 2), { mode: 0o600 }); fs.renameSync(agentsFile(L) + '.tmp', agentsFile(L)); };
 // operator actions carry an Ed25519 signature by the operator key over the canonical record
 const identityLog = (L, e, key) => { const r = { ...e, at: new Date().toISOString() }; if (key) r.operator_sig = sign(null, Buffer.from(canonicalJson(r)), key).toString('hex'); fs.appendFileSync(path.join(L.state, 'identity.jsonl'), JSON.stringify(r) + '\n', { mode: 0o600 }); };
-export const AGENT_RE = /^[A-Za-z0-9._-]{1,64}$/;
+export const AGENT_RE = /^(?!.*\.\.)[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 export function bindAgent(L, agent, uid, mayBind, credential) {
   if (!AGENT_RE.test(String(agent ?? ''))) return { ok: false, error: 'bad agent name' };
   const m = readAgents(L);
@@ -308,7 +318,18 @@ export async function run(L, cmd, p = {}) {
 
 // ---- batched landing ----
 const JOB_RE = /^[A-Za-z0-9_-]{1,80}$/;
-const openAuth = (L) => new Authority(L.state, { keyDir: L.keys, anchorRemote: { url: L.anchors, ref: AUTH_ANCHOR_REF }, deferAnchors: 'manual' });
+// The long-running server keeps one Authority (key loaded, anchors checked once at start); every
+// request still runs assertNotRolledBack before each append. close() on the shared handle is a no-op.
+let SHARED = null;
+export function shareAuthority(L) {
+  const a = new Authority(L.state, { keyDir: L.keys, anchorRemote: { url: L.anchors, ref: AUTH_ANCHOR_REF }, deferAnchors: 'manual' });
+  const db = a.db;
+  const view = new Proxy(db, { get: (t, k) => (k === 'close' ? () => {} : typeof t[k] === 'function' ? t[k].bind(t) : t[k]) });
+  SHARED = { root: L.root, auth: a, view: Object.create(a, { db: { value: view } }) };
+  return a;
+}
+const openAuth = (L) => (SHARED && SHARED.root === L.root ? SHARED.view : newAuth(L));
+const newAuth = (L) => new Authority(L.state, { keyDir: L.keys, anchorRemote: { url: L.anchors, ref: AUTH_ANCHOR_REF }, deferAnchors: 'manual' });
 const revq = (L, r) => safeGit(L.repo, ['rev-parse', '--verify', '--quiet', r], { allowFailure: true }).stdout.trim();
 function setResult(auth, repo, job, r) {
   const head = auth.db.prepare('SELECT seq, entry_hash FROM ledger WHERE repo = ? ORDER BY seq DESC LIMIT 1').get(repo);

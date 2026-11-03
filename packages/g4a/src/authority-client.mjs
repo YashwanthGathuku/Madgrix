@@ -58,7 +58,26 @@ export function call(loc, cmd, params = {}, { interactive = false } = {}) {
 // Same as call() without blocking the caller's event loop: the daemon uses it so concurrent
 // promote jobs reach the authority together (where `land` batches them).
 const MAX_REPLY = 256 << 20;
-export function callAsync(loc, cmd, params = {}) {
+// Same-user mode: requests go to the long-running authority server (src/authority-server.mjs) when
+// one is reachable; the first call starts it in the background and itself takes the per-call path.
+const started = new Set();
+const SERVER = path.join(path.dirname(fileURLToPath(import.meta.url)), 'authority-server.mjs');
+function startServer(loc) {
+  if (started.has(loc.root)) return; started.add(loc.root);
+  try { spawn(process.execPath, ['--no-warnings', SERVER, '--root', loc.root], { detached: true, stdio: 'ignore' }).unref(); } catch {}
+}
+export async function callAsync(loc, cmd, params = {}) {
+  if (loc.mode === 'user' && process.env.G4A_AUTHORITY_SERVER !== '0') {
+    const { SERVE_CMDS, request } = await import('./authority-server.mjs');
+    if (SERVE_CMDS.has(cmd)) {
+      const r = await request(loc.root, cmd, params);
+      if (r !== null) return r;
+      startServer(loc);
+    }
+  }
+  return callSpawn(loc, cmd, params);
+}
+function callSpawn(loc, cmd, params) {
   const { argv, credential } = callArgv(loc, cmd, params);
   return new Promise((resolve) => {
     const ch = spawn(argv[0], argv[1], { stdio: [credential ? 'pipe' : 'ignore', 'pipe', 'pipe'] });
