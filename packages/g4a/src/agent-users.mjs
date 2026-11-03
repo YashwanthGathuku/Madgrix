@@ -13,6 +13,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { randomBytes, createHash } from 'node:crypto';
+import { CRED_USER, CRED_HOME, PROVIDERS } from './cred-proxy.mjs';
 import { AGENTS_HOME, AGENTS_MAP, AGENTS_SUDOERS, AUTH_USER, REPOS, PUB, LIB, BIN, MAP } from './system-install.mjs';
 
 export const NAME_RE = /^[a-z0-9][a-z0-9-]{0,23}$/;
@@ -106,6 +108,7 @@ export function removeAgent({ name, force = false }) {
   const user = userOf(name), m = readAgentsMap(), a = m.agents[name];
   if (!a && !force) throw new Error(`no agent ${name}`);
   const done = [];
+  if (fs.existsSync(`${CRED_HOME}/agents/${name}`)) { fs.rmSync(`${CRED_HOME}/agents/${name}`, { recursive: true, force: true }); done.push('proxied keys'); }
   const uid = exists(user) ? Number(sh('id', ['-u', user]).trim()) : a?.uid;
   if (exists(user)) {
     for (let i = 0; i < 50 && spawnSync('pgrep', ['-u', user], { stdio: 'ignore' }).status === 0; i++) { spawnSync('pkill', ['-KILL', '-u', user]); Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100); }
@@ -135,9 +138,33 @@ export function setKey({ name, variable, remove = false, value }) {
   const caller = process.env.SUDO_USER;
   if (!caller || caller !== a.operator) throw new Error(`only ${name}'s operator may change its keys`);
   const dir = `${a.home}/.g4a/keys`, f = `${dir}/${variable}`;
-  if (remove) { must(asAgent(name, ['rm', '-f', '--', f]), 'remove key'); return { ok: true, agent: name, variable, removed: true }; }
+  const proxied = Object.hasOwn(PROVIDERS, variable) && exists(CRED_USER);
+  const cdir = `${CRED_HOME}/agents/${name}`;
+  if (remove) {
+    must(asAgent(name, ['rm', '-f', '--', f, `${a.home}/.g4a/proxied/${variable}`]), 'remove key');
+    fs.rmSync(`${cdir}/${variable}`, { force: true });
+    return { ok: true, agent: name, variable, removed: true };
+  }
   const v = String(value ?? '').replace(/\r?\n$/, '');
   if (!v || v.length > 8192 || /[\0\n\r]/.test(v)) throw new Error('key value must be one non-empty line (<= 8 KiB) on stdin');
+  if (proxied) {
+    // the value goes ONLY to the credential proxy's store (g4a-cred, 0700/0600); the agent gets a
+    // per-agent proxy token and a marker, never the key (programs it starts cannot read it)
+    const cu = Number(sh('id', ['-u', CRED_USER]).trim()), cg = Number(sh('id', ['-g', CRED_USER]).trim());
+    const old = process.umask(0o077);
+    try {
+      fs.mkdirSync(cdir, { recursive: true, mode: 0o700 }); fs.chownSync(cdir, cu, cg);
+      const kf = `${cdir}/${variable}`;
+      fs.writeFileSync(`${kf}.tmp`, v + '\n', { mode: 0o600 }); fs.chownSync(`${kf}.tmp`, cu, cg); fs.renameSync(`${kf}.tmp`, kf);
+      if (!fs.existsSync(`${cdir}/token.sha256`)) {
+        const tok = randomBytes(32).toString('hex');
+        must(asAgent(name, ['sh', '-c', 'umask 077 && mkdir -p "$1" && cat > "$1/proxy-token.tmp" && mv "$1/proxy-token.tmp" "$1/proxy-token"', 'sh', `${a.home}/.g4a`], { input: tok + '\n' }), 'write proxy token');
+        fs.writeFileSync(`${cdir}/token.sha256`, createHash('sha256').update(tok).digest('hex') + '\n', { mode: 0o600 }); fs.chownSync(`${cdir}/token.sha256`, cu, cg);
+      }
+    } finally { process.umask(old); }
+    must(asAgent(name, ['sh', '-c', 'umask 077 && mkdir -p "$1" && : > "$1/$2" && rm -f -- "$3"', 'sh', `${a.home}/.g4a/proxied`, variable, f]), 'mark proxied key');
+    return { ok: true, agent: name, variable, stored: true, proxied: true };
+  }
   must(asAgent(name, ['sh', '-c', 'umask 077 && mkdir -p "$1" && chmod 700 "$1" && cat > "$2.tmp" && chmod 600 "$2.tmp" && mv "$2.tmp" "$2"', 'sh', dir, f], { input: v }), 'write key');
   return { ok: true, agent: name, variable, stored: true }; // never echo the value
 }

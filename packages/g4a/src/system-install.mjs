@@ -10,6 +10,7 @@ import path from 'node:path';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
+import { CRED_USER, CRED_HOME } from './cred-proxy.mjs';
 
 const USER = 'g4a-authority', HOME = '/var/lib/g4a-authority', REPOS = `${HOME}/repos`, PUB = '/var/lib/g4a-authority-pub';
 const LIB = '/usr/local/lib/g4a', BIN = `${LIB}/bin`, MAP = '/etc/g4a/authority.json', SUDOERS = '/etc/sudoers.d/g4a-authority';
@@ -42,6 +43,9 @@ export function seedBundle(seedRepo, { uid = process.getuid(), gid = process.get
 export function install({ repoId, seedRepo, mergiraf }) {
   if (process.getuid() !== 0) throw new Error('system install must run as root');
   if (spawnSync('id', ['-u', USER]).status !== 0) sh('useradd', ['--system', '--home-dir', HOME, '--shell', '/usr/sbin/nologin', '--user-group', USER]);
+  // credential proxy user: holds proxied agent API keys; no agent or operator can read them
+  if (spawnSync('id', ['-u', CRED_USER]).status !== 0) sh('useradd', ['--system', '--home-dir', CRED_HOME, '--shell', '/usr/sbin/nologin', '--user-group', CRED_USER]);
+  for (const d of [CRED_HOME, `${CRED_HOME}/agents`]) { fs.mkdirSync(d, { recursive: true }); sh('chown', [`${CRED_USER}:${CRED_USER}`, d]); fs.chmodSync(d, 0o700); }
   for (const [d, m] of [[HOME, 0o700], [REPOS, 0o700], [PUB, 0o755]]) { fs.mkdirSync(d, { recursive: true }); sh('chown', [`${USER}:${USER}`, d]); fs.chmodSync(d, m); }
   // root-owned code copy (agents cannot swap the code the authority runs)
   fs.rmSync(`${LIB}.new`, { recursive: true, force: true });
@@ -95,6 +99,12 @@ case "$p" in ${REPOS}/????????????????/repo|${REPOS}/????????????????/anchors.gi
 case "$p" in *..*) exit 2;; esac
 exec ${ENV} git upload-pack "$p"
 `,
+    // credential proxy (runs as ${CRED_USER} only; no arguments, so nothing to inject)
+    'g4a-credproxy': `#!/bin/sh
+set -eu
+[ "$(id -un)" = ${CRED_USER} ] || { echo "g4a: refused: g4a-credproxy runs only as ${CRED_USER}" >&2; exit 2; }
+exec env -i PATH=${BIN}:/usr/bin:/bin HOME=${CRED_HOME} LANG=C.UTF-8 ${BIN}/node --no-warnings ${LIB}/packages/g4a/src/cred-proxy.mjs ensure
+`,
     // the g4a CLI from the root-owned copy (agent users run this one, never the operator's tree)
     'g4a': `#!/bin/sh
 exec ${BIN}/node --no-warnings ${LIB}/packages/g4a/bin/g4a.mjs "$@"
@@ -126,6 +136,27 @@ if [ -d "$h/.g4a/keys" ]; then
     export "$n=$v"
   done
 fi
+# proxied keys: the real value lives with ${CRED_USER}; the agent gets a dummy and a local base URL,
+# only if the proxy user (not a squatting agent) owns the listening port
+if [ -d "$h/.g4a/proxied" ] && [ -r "$h/.g4a/proxy-token" ]; then
+  sudo -n -u ${CRED_USER} ${BIN}/g4a-credproxy >/dev/null 2>&1 || true
+  cu=$(id -u ${CRED_USER} 2>/dev/null || echo x)
+  if ${BIN}/node --no-warnings ${LIB}/packages/g4a/src/cred-proxy.mjs check "$cu"; then
+    port=$(${BIN}/node --no-warnings ${LIB}/packages/g4a/src/cred-proxy.mjs port)
+    tok=$(head -n 1 "$h/.g4a/proxy-token")
+    case "$tok" in *[!0-9a-f]*|'') tok=;; esac
+    for f in "$h/.g4a/proxied"/*; do
+      [ -n "$tok" ] && [ -f "$f" ] || continue
+      case "\${f##*/}" in
+        ANTHROPIC_API_KEY) export ANTHROPIC_API_KEY=g4a-proxied ANTHROPIC_BASE_URL="http://127.0.0.1:$port/g4a/$name/$tok/ANTHROPIC_API_KEY";;
+        OPENAI_API_KEY) export OPENAI_API_KEY=g4a-proxied OPENAI_BASE_URL="http://127.0.0.1:$port/g4a/$name/$tok/OPENAI_API_KEY/v1";;
+        GEMINI_API_KEY) export GEMINI_API_KEY=g4a-proxied GOOGLE_GEMINI_BASE_URL="http://127.0.0.1:$port/g4a/$name/$tok/GEMINI_API_KEY";;
+      esac
+    done
+  else
+    echo "g4a: warning: credential proxy not available (port not owned by ${CRED_USER}); proxied keys withheld" >&2
+  fi
+fi
 cd "$h/repo"
 ${BIN}/g4a daemon --detach >/dev/null 2>&1 || true
 ${BIN}/g4a authority sync --repo "$h/repo" >/dev/null 2>&1 || true
@@ -136,7 +167,7 @@ exec "$@"
   sh('chown', ['-R', 'root:root', `${LIB}.new`]); sh('chmod', ['-R', 'go-w,a+rX', `${LIB}.new`]); for (const n of [...Object.keys(w), 'node', 'mergiraf']) if (fs.existsSync(`${LIB}.new/bin/${n}`)) fs.chmodSync(`${LIB}.new/bin/${n}`, 0o755);
   fs.chmodSync(`${LIB}.new/node/bin/node`, 0o755);
   fs.rmSync(LIB, { recursive: true, force: true }); fs.renameSync(`${LIB}.new`, LIB);
-  const rule = `# g4a: any user may run ONLY these root-owned wrappers as ${USER}\nDefaults!${BIN}/g4a-authority,${BIN}/g4a-receive-pack,${BIN}/g4a-upload-pack env_reset\nALL ALL=(${USER}) NOPASSWD: ${BIN}/g4a-authority, ${BIN}/g4a-receive-pack, ${BIN}/g4a-upload-pack\n`;
+  const rule = `# g4a: any user may run ONLY these root-owned wrappers as ${USER}\nDefaults!${BIN}/g4a-authority,${BIN}/g4a-receive-pack,${BIN}/g4a-upload-pack,${BIN}/g4a-credproxy env_reset\nALL ALL=(${USER}) NOPASSWD: ${BIN}/g4a-authority, ${BIN}/g4a-receive-pack, ${BIN}/g4a-upload-pack\nALL ALL=(${CRED_USER}) NOPASSWD: ${BIN}/g4a-credproxy\n`;
   fs.writeFileSync(`${SUDOERS}.tmp`, rule, { mode: 0o440 });
   if (spawnSync('visudo', ['-cf', `${SUDOERS}.tmp`]).status !== 0) { fs.rmSync(`${SUDOERS}.tmp`); throw new Error('sudoers rule failed visudo -c'); }
   fs.renameSync(`${SUDOERS}.tmp`, SUDOERS);
@@ -182,6 +213,8 @@ export async function uninstall({ repoId, purge = false }) {
   if (left) { fs.writeFileSync(`${MAP}.tmp`, JSON.stringify(map, null, 2) + '\n', { mode: 0o644 }); fs.renameSync(`${MAP}.tmp`, MAP); return { ok: true, removed, remaining: left }; }
   for (const f of [SUDOERS, AGENTS_SUDOERS, AGENTS_HOME, LIB, path.dirname(MAP), HOME, PUB]) fs.rmSync(f, { recursive: true, force: true });
   if (spawnSync('id', ['-u', USER]).status === 0) spawnSync('userdel', [USER]);
+  spawnSync('pkill', ['-u', CRED_USER]); fs.rmSync(CRED_HOME, { recursive: true, force: true });
+  if (spawnSync('id', ['-u', CRED_USER]).status === 0) spawnSync('userdel', [CRED_USER]);
   return { ok: true, removed, remaining: 0, purged: true };
 }
 

@@ -116,7 +116,7 @@ test('system authority: agent user is prevented from bypassing the authority', {
 
 // One OS user per agent (g4a agent add / g4a run / g4a agent remove). Runs after the test above in
 // the same file (node --test runs a file's tests in order), so the two never race on the install.
-test('agent users: separate uids, scoped launcher, no impersonation, full cleanup', { skip: !canSudo && 'needs passwordless sudo' }, () => {
+test('agent users: separate uids, scoped launcher, no impersonation, full cleanup', { skip: !canSudo && 'needs passwordless sudo' }, async () => {
   const env = Object.fromEntries(Object.entries(process.env).filter(([k]) => !/^(CODEX_|CLAUDECODE|GEMINI_CLI|G4A_)/.test(k)));
   const dir = fs.mkdtempSync('/tmp/g4a-au-'); fs.chmodSync(dir, 0o755);
   Object.assign(env, { G4A_HOME: path.join(dir, 'home'), G4A_KEY_DIR: path.join(dir, 'keys') });
@@ -180,8 +180,39 @@ test('agent users: separate uids, scoped launcher, no impersonation, full cleanu
     assert.doesNotMatch(grant.stdout, /k-alice/, 'key value never echoed');
     for (const bad of ['LD_PRELOAD', 'PATH', 'G4A_RAW_KEY', 'GIT_SSH_KEY', 'x_api_key', 'NODE_OPTIONS'])
       assert.equal(J(spawnSync(process.execPath, ['--no-warnings', CLI, 'agent', 'key', 'alice', bad], { encoding: 'utf8', cwd: repo, env, input: 'v\n' })).ok, false, `key name ${bad}`);
-    assert.equal(run('alice', 'echo "${ANTHROPIC_API_KEY:-none}"').stdout.trim(), 'k-alice');
+    // ANTHROPIC_API_KEY is a proxied provider: alice gets a dummy + local base URL, never the key
+    assert.equal(run('alice', 'echo "${ANTHROPIC_API_KEY:-none}"').stdout.trim(), 'g4a-proxied');
+    assert.match(run('alice', 'echo "$ANTHROPIC_BASE_URL"').stdout.trim(), /^http:\/\/127\.0\.0\.1:\d+\/g4a\/alice\/[0-9a-f]{64}\/ANTHROPIC_API_KEY$/);
+    assert.doesNotMatch(run('alice', `env; cat $HOME/.g4a/keys/* 2>/dev/null; grep -r "k-al[i]ce" $HOME 2>/dev/null; cat /var/lib/g4a-cred/agents/alice/ANTHROPIC_API_KEY 2>&1`).stdout, /k-alice/, 'key not readable by the agent');
     assert.equal(run('bob', 'echo "${ANTHROPIC_API_KEY:-none}"').stdout.trim(), 'none', 'bob does not get alice\'s key');
+    {
+      // the proxy injects the key upstream; the fake upstream runs in a child (spawnSync blocks us)
+      // and records only a hash of the key it received
+      const { createHash } = await import('node:crypto');
+      const rec = path.join(dir, 'up.json'); fs.writeFileSync(rec, ''); fs.chmodSync(rec, 0o666);
+      const upSrc = `const fs=require('fs'),c=require('crypto');require('http').createServer((q,s)=>{fs.appendFileSync(${JSON.stringify(rec)},JSON.stringify({url:q.url,k:c.createHash('sha256').update(String(q.headers['x-api-key'])).digest('hex'),auth:q.headers.authorization??null})+'\\n');s.end('ok')}).listen(7352,'127.0.0.1')`;
+      const { spawn } = await import('node:child_process');
+      const up = spawn(process.execPath, ['-e', upSrc], { stdio: 'ignore' });
+      let squat = null;
+      try {
+        await new Promise((r) => setTimeout(r, 300));
+        spawnSync('sudo', ['-n', 'pkill', '-u', 'g4a-cred']);
+        assert.equal(sh(`echo '{"port":7351,"origins":{"ANTHROPIC_API_KEY":"http://127.0.0.1:7352"}}' | sudo -n tee /etc/g4a/credproxy.json >/dev/null && sudo -n chmod 644 /etc/g4a/credproxy.json`).status, 0);
+        const call = run('alice', 'curl -s -H "x-api-key: stolen" -H "authorization: Bearer x" "$ANTHROPIC_BASE_URL/v1/messages?key=zz" ; echo; curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:7351/g4a/alice/$(printf %064d 0)/ANTHROPIC_API_KEY/v1/messages"; echo; curl -s -o /dev/null -w "%{http_code}" "$(echo $ANTHROPIC_BASE_URL | sed s/alice/bob/)/v1/x"; echo; curl -s -o /dev/null -w "%{http_code}" "$ANTHROPIC_BASE_URL/..%2f..%2fx"');
+        assert.deepEqual(call.stdout.trim().split('\n'), ['ok', '401', '401', '400'], call.stdout + call.stderr);
+        const seen = fs.readFileSync(rec, 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l));
+        assert.equal(seen.length, 1, JSON.stringify(seen));
+        assert.equal(seen[0].k, createHash('sha256').update('k-alice').digest('hex'), 'real key injected upstream');
+        assert.equal(seen[0].auth, null, 'agent auth headers stripped'); assert.equal(seen[0].url, '/v1/messages');
+        // a squatter (bob) on the proxy port: the launcher withholds proxied keys from alice
+        spawnSync('sudo', ['-n', 'pkill', '-u', 'g4a-cred']);
+        squat = spawn(process.execPath, ['--no-warnings', CLI, 'run', '--agent', 'bob', '--', 'node', '-e', 'require("http").createServer((q,s)=>s.end("x")).listen(7351,"127.0.0.1")'], { stdio: 'ignore', env, cwd: repo });
+        await new Promise((r) => setTimeout(r, 2500));
+        const sq = run('alice', 'echo "${ANTHROPIC_API_KEY:-none} ${ANTHROPIC_BASE_URL:-none}"');
+        assert.equal(sq.stdout.trim(), 'none none', sq.stdout);
+        assert.match(sq.stderr, /credential proxy not available/);
+      } finally { up.kill(); spawnSync('sudo', ['-n', 'pkill', '-u', 'g4a-a-bob', '-f', 'listen\\(7351']); squat?.kill(); spawnSync('sudo', ['-n', 'pkill', '-u', 'g4a-cred']); }
+    }
     // a key file the agent itself plants under a dangerous name is ignored by the launcher
     run('alice', 'printf /tmp/evil.so > $HOME/.g4a/keys/LD_PRELOAD');
     assert.equal(run('alice', 'echo "${LD_PRELOAD:-none}"').stdout.trim(), 'none');
