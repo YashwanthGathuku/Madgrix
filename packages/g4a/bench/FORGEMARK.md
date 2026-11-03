@@ -150,3 +150,14 @@ node bench/race.mjs g4a 16 60 --system
 forgemark -remote http://127.0.0.1:8099 -repos fm.git -strategy branch -concurrency 16 \
   -duration 60s -warmup 0s -files-min 1 -files-max 3 -file-size 1024 -token-file <dummy> -object-format sha1
 ```
+
+## Update, Nov 3 2026 (16 agents, 0 errors, local, offline-capable)
+| mode | ops/s | p50 | notes |
+|---|---|---|---|
+| g4a governed landing, user mode, before | 1.73 | n/a | 24 sync retries |
+| g4a governed landing, user mode, after auto-sync + server + cache/adaptive batch | 2.86 | 5.4 s | 0–3 retries, verify ok |
+| g4a governed landing, system mode (SO_PEERCRED server) | 2.66–2.71 | 5.7 s | verify ok |
+| g4a-push raw branch push, user | 16.48 | 691 ms | permit + scope-checked push, no landing; push step median 146 ms |
+| g4a-push raw branch push, system | 16.79 | 651 ms | push step median 143 ms |
+
+Entire's 418/s counts local checkpoint commits with no authority, scope check or witness, so the numbers are not comparable, and g4a does not reach it with governance on. What limits g4a now is the serialized authority lock and CLI boot: claim takes about 1.9 s at 16 agents. Reproduce with `node bench/race.mjs g4a|g4a-push 16 20 [--system]`.
