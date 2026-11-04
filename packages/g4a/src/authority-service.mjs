@@ -16,7 +16,7 @@ import { fileURLToPath } from 'node:url';
 import { createPrivateKey, createPublicKey, generateKeyPairSync, randomBytes, sign, createHash, timingSafeEqual } from 'node:crypto';
 import { safeGit } from '../../../scripts/lib/safe-git.mjs';
 import { canonicalJson } from '../../../src/lib/canonical.ts';
-import { Authority, rowClaim, bundleFromDb, repoId } from './authority.mjs';
+import { Authority, rowClaim, bundleFromDb, repoId, openDb } from './authority.mjs';
 import { planBatch, runBatchWitnesses, commitBatch } from './promote.mjs';
 import { signOverride, overrideName, OPT_OUT_VARS } from './override.mjs';
 
@@ -84,21 +84,31 @@ function withLock(L, fn, name = 'lock.d') {
   tail.then(() => { if (inproc.get(key) === tail) inproc.delete(key); });
   return p;
 }
-function fileLock(L, fn, name) {
+// Per-agent-ref lock (locks/agent-<id>.d). Lock order, everywhere: land.d -> agent-<id>.d -> lock.d.
+// Nothing holding lock.d ever takes an agent lock, and no path holds two agent locks, so no cycle.
+export const agentLockName = (agent) => { if (!AGENT_RE.test(String(agent ?? ''))) throw new Error('bad agent name'); return path.join('locks', `agent-${agent}.d`); };
+async function fileLock(L, fn, name) {
   const lock = path.join(L.root, name);
+  if (name.startsWith('locks' + path.sep)) fs.mkdirSync(path.dirname(lock), { recursive: true, mode: 0o700 });
   const t0 = Date.now(); let spins = 0;
   for (;;) {
     try { fs.mkdirSync(lock); fs.writeFileSync(path.join(lock, 'pid'), String(process.pid)); break; } catch {
+      let st = null; try { st = fs.lstatSync(lock); } catch { continue; }
+      // a planted symlink/file at the lock path is not a lock: remove it (lock dirs live in the 0700 root)
+      if (!st.isDirectory()) { fs.rmSync(lock, { force: true }); continue; }
       let pid = 0; try { pid = Number(fs.readFileSync(path.join(lock, 'pid'), 'utf8')); } catch {}
+      // a pid-less dir older than 30 s is a crash between mkdir and the pid write
+      if (!pid && Date.now() - st.mtimeMs > 30_000) { fs.rmSync(lock, { recursive: true, force: true }); continue; }
       let alive = false; try { if (pid) { process.kill(pid, 0); alive = true; } } catch {}
       if (pid && !alive) { fs.rmSync(lock, { recursive: true, force: true }); continue; }
       if (Date.now() - t0 > 900_000) throw new Error('authority lock timeout');
       // short, growing, jittered waits (2 ms .. 25 ms): a waiter takes the lock soon after release
-      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Math.min(25, 2 + (spins++) * 2) + Math.random() * 3);
+      // async sleep: the long-running server keeps serving other agent refs while this one waits
+      await new Promise((r) => setTimeout(r, Math.min(25, 2 + (spins++) * 2) + Math.random() * 3));
     }
   }
   const release = () => fs.rmSync(lock, { recursive: true, force: true });
-  return Promise.resolve().then(fn).finally(release);
+  try { return await fn(); } finally { release(); }
 }
 // system-mode authority server: per-request kernel peer uid (SO_PEERCRED via peer-gate.py)
 export const peerCtx = new AsyncLocalStorage();
@@ -176,9 +186,11 @@ export function osBind(L, agent, uid) {
 const claimRow = (auth, repo, agent) => { const r = auth.db.prepare("SELECT * FROM claims WHERE repo = ? AND agent = ? AND status = 'active'").get(repo, agent); return r && rowClaim(r); };
 const strip = ({ secret_sha256, secretFile, ...c }) => c;
 
+const permitKeys = new Map();
+const permitKey = (L) => { const f = permitKeyFile(L); let k = permitKeys.get(f); if (!k) { k = createPrivateKey(fs.readFileSync(f, 'utf8')); permitKeys.set(f, k); } return k; };
 function signPermit(L, fields, ttlMs = 120_000) {
   const permit = { version: 'g4a-permit/v1', ...fields, nonce: randomBytes(16).toString('hex'), exp: new Date(Date.now() + ttlMs).toISOString() };
-  const signature = sign(null, Buffer.from(canonicalJson(permit)), createPrivateKey(fs.readFileSync(permitKeyFile(L), 'utf8'))).toString('base64');
+  const signature = sign(null, Buffer.from(canonicalJson(permit)), permitKey(L)).toString('base64');
   return Buffer.from(JSON.stringify({ permit, signature })).toString('base64');
 }
 
@@ -255,7 +267,26 @@ export async function run(L, cmd, p = {}) {
       } finally { auth.db.close(); }
     });
   }
-  const r = await withLock(L, async () => {
+  const agentCmd = ['claim', 'permit', 'land', 'release'].includes(cmd);
+  if (agentCmd && !AGENT_RE.test(String(p.agent ?? ''))) return { ok: false, status: 'refused', reason: 'agent_identity', error: 'bad agent name' };
+  // permit: per-agent lock only. Read-only: no ledger append, no anchor, no Authority construction.
+  // One-time use stays enforced at receive (atomic O_EXCL nonce file), so parallel refs cannot share a permit.
+  if (cmd === 'permit') return withLock(L, () => {
+    const pol = osPolicyCheck(L, p.agent, callerUid());
+    if (!pol.ok) return { ok: false, status: 'refused', reason: 'agent_identity', error: pol.error };
+    const id = bindAgent(L, p.agent, callerUid(), false, p.credential);
+    if (!id.ok) return { ok: false, status: 'refused', reason: 'agent_identity', error: id.error };
+    // server: its own cached read-only connection (never the writer's, which may be mid-transaction)
+    const shared = SHARED && SHARED.root === L.root;
+    const db = shared ? (SHARED.ro ??= openDb(L.state, { readOnly: true })) : openDb(L.state, { readOnly: true });
+    try {
+      const r = db.prepare("SELECT * FROM claims WHERE repo = ? AND agent = ? AND status = 'active'").get(repoId(L.repo), p.agent);
+      const c = r && rowClaim(r);
+      if (!c) return { ok: false, error: `no active authority claim for ${p.agent}` };
+      return { ok: true, claim: c.id, permit: signPermit(L, { kind: 'agent', uid: callerUid(), agent: c.agent, claim: c.id, ref: `refs/heads/agents/${c.agent}`, paths: c.paths, baseline: c.baseline }) };
+    } finally { if (!shared) db.close(); }
+  }, agentLockName(p.agent));
+  const inner = () => withLock(L, async () => {
     const auth = openAuth(L);
     const repo = repoId(L.repo);
     try {
@@ -315,6 +346,7 @@ export async function run(L, cmd, p = {}) {
       }
     } finally { try { auth.flushAnchors(); } finally { auth.db.close(); } }
   });
+  const r = agentCmd ? await withLock(L, inner, agentLockName(p.agent)) : await inner();
   if (r && r.__land) return landWait(L, r.job);
   return r;
 }
