@@ -53,41 +53,57 @@ exec "$G4A_REAL_GIT" "$@"
 
 function rcSnippet() { return `${BEGIN}\nexport PATH=${shq(binDir)}:"$PATH"\n${END}\n`; }
 
+// rc.json: [{ rc, addNl, created }] for every file g4a wrote its PATH block to (idempotent;
+// uninstall removes exactly that block from each and deletes files g4a itself created when empty)
+const readRcMeta = () => { try { const m = JSON.parse(fs.readFileSync(path.join(home, 'rc.json'), 'utf8')); return Array.isArray(m) ? m : m?.rc ? [m] : []; } catch { return []; } };
+// --login: the login-shell profiles that reset PATH (/etc/profile): ~/.profile always; ~/.bash_profile
+// and ~/.zprofile only if they exist (creating ~/.bash_profile would stop bash reading ~/.profile)
+function rcTargets(args) {
+  const out = [];
+  for (let i = 0; i < args.length; i++) if (args[i] === '--rc' && args[i + 1]) out.push(path.resolve(args[++i]));
+  if (args.includes('--login')) {
+    const h = process.env.HOME || os.homedir();
+    out.push(path.join(h, '.profile'));
+    for (const f of ['.bash_profile', '.zprofile']) if (fs.existsSync(path.join(h, f))) out.push(path.join(h, f));
+  }
+  return [...new Set(out)];
+}
 function install(args) {
-  const rcIdx = args.indexOf('--rc');
-  const rc = rcIdx >= 0 ? args[rcIdx + 1] : null;
   const real = resolveRealGit();
   if (!real) { console.error('g4a: no real git found on PATH'); process.exit(1); }
   fs.mkdirSync(binDir, { recursive: true });
   fs.writeFileSync(shimPath, shimScript(real), { mode: 0o755 });
   fs.writeFileSync(path.join(home, 'env.sh'), rcSnippet());
   console.log(`g4a: shim written to ${shimPath} (real git: ${real})`);
-  if (rc) {
-    const cur = fs.existsSync(rc) ? fs.readFileSync(rc, 'utf8') : '';
+  const targets = rcTargets(args);
+  const meta = readRcMeta();
+  for (const rc of targets) {
+    const existed = fs.existsSync(rc);
+    const cur = existed ? fs.readFileSync(rc, 'utf8') : '';
     if (!cur.includes(BEGIN)) {
       const addNl = cur.length > 0 && !cur.endsWith('\n');
       fs.writeFileSync(rc, cur + (addNl ? '\n' : '') + rcSnippet());
-      fs.writeFileSync(path.join(home, 'rc.json'), JSON.stringify({ rc: path.resolve(rc), addNl }));
+      if (!meta.some((m) => m.rc === rc)) meta.push({ rc, addNl, created: !existed });
     }
-    console.log(`g4a: PATH snippet added to ${rc}; open a new shell or: . ${path.join(home, 'env.sh')}`);
-  } else {
-    console.log(`g4a: to activate, add this to your shell rc (or rerun with --rc ~/.bashrc):\n${rcSnippet()}`);
+    console.log(`g4a: PATH snippet in ${rc}`);
   }
+  if (targets.length) { fs.writeFileSync(path.join(home, 'rc.json'), JSON.stringify(meta)); console.log(`g4a: open a new shell or: . ${path.join(home, 'env.sh')}`); }
+  else console.log(`g4a: to activate, add this to your shell rc (or rerun with --rc ~/.bashrc and/or --login for ~/.profile etc.):\n${rcSnippet()}`);
 }
 
 function uninstall(args) {
-  const rcIdx = args.indexOf('--rc');
-  const rc = rcIdx >= 0 ? args[rcIdx + 1] : null;
-  let meta = {};
-  try { meta = JSON.parse(fs.readFileSync(path.join(home, 'rc.json'), 'utf8')); } catch {}
-  if (rc && fs.existsSync(rc)) {
+  const meta = readRcMeta();
+  const targets = new Set([...meta.map((m) => m.rc), ...rcTargets(args)]);
+  const snip = rcSnippet();
+  for (const rc of targets) {
+    if (!fs.existsSync(rc)) continue;
+    const m = meta.find((x) => x.rc === rc);
     const cur = fs.readFileSync(rc, 'utf8');
-    const snip = rcSnippet();
     const i = cur.indexOf(snip);
-    if (i >= 0) {
-      const start = meta.rc === path.resolve(rc) && meta.addNl && i > 0 && cur[i - 1] === '\n' ? i - 1 : i;
-      fs.writeFileSync(rc, cur.slice(0, start) + cur.slice(i + snip.length));
-    }
+    if (i < 0) continue;
+    const start = m?.addNl && i > 0 && cur[i - 1] === '\n' ? i - 1 : i;
+    const next = cur.slice(0, start) + cur.slice(i + snip.length);
+    if (m?.created && next === '') fs.rmSync(rc); else fs.writeFileSync(rc, next);
   }
   fs.rmSync(path.join(home, 'rc.json'), { force: true });
   for (const f of [shimPath, path.join(home, 'env.sh')]) fs.rmSync(f, { force: true });
@@ -108,8 +124,23 @@ function doctor() {
     const v = execFileSync(real, ['--version'], { encoding: 'utf8', env: { ...process.env, G4A_ACTIVE: '1' } }).trim();
     line(true, v);
   }
+  // un-shimmed paths coding tools really use: login shells (/etc/profile resets PATH; Codex-style
+  // `bash -lc`) and scrubbed envs (`env -i`). These bypass the shim; the reference-transaction
+  // claim-scope guard (authority init) still blocks out-of-claim commits made through them.
+  for (const [label, argv] of [['login shell (bash -lc)', ['bash', '-lc', 'command -v git']], ['scrubbed env (env -i sh)', ['env', '-i', 'sh', '-c', 'command -v git']]]) {
+    const r = spawnSync(argv[0], argv.slice(1), { encoding: 'utf8', timeout: 10000 });
+    const g = (r.stdout || '').trim().split('\n').pop() || '(none)';
+    const shimmed = g !== '(none)' && path.resolve(g) === path.resolve(shimPath);
+    console.log(`${shimmed ? 'ok  ' : 'WARN'} ${label} resolves git to ${g}${shimmed ? '' : ' (bypasses the shim; run `g4a install --login` to add the PATH block to ~/.profile (and ~/.bash_profile/~/.zprofile if present); only the claim-scope ref hook covers this path)'}`);
+  }
   console.log(`info agent marker in this env: ${agentMarker() ?? 'none'}; stdout TTY: ${process.stdout.isTTY ? 'yes' : 'no'}`);
-  console.log('info not covered: absolute-path git, git libraries (libgit2/go-git/JGit/isomorphic-git/GitPython object reads), IDE SCM with git.path set to real git, cloud agents');
+  console.log('info shim not on path for: absolute-path git, login shells/env -i (see WARN above), IDE SCM with git.path set; the ref hook still blocks out-of-claim commits from any git CLI');
+  console.log('info not covered locally (hooks skipped): libgit2/pygit2, go-git, JGit, isomorphic-git, GitPython index.commit, direct .git writes; refused at promote/push, flagged by verify/audit; use --system to prevent authority writes');
+  // system mode is the recommended authority wherever it can be installed (root + useradd)
+  const sysAuth = fs.existsSync('/etc/g4a/authority.json');
+  const canSystem = spawnSync('sudo', ['-n', 'true'], { stdio: 'ignore' }).status === 0 && spawnSync('sh', ['-c', 'command -v useradd'], { stdio: 'ignore' }).status === 0;
+  console.log(sysAuth ? 'ok   system authority installed (/etc/g4a): authority writes are prevented, not just detected'
+    : `${canSystem ? 'WARN' : 'info'} no system authority: same-user mode is detect-only (land-time + daemon tamper audit); ${canSystem ? 'recommended: `g4a authority init --system`' : 'system mode needs root/sudo and useradd'}`);
   process.exitCode = ok ? 0 : 1;
 }
 
@@ -152,7 +183,7 @@ function opts(args) {
     const a = args[i];
     if (!a.startsWith('--')) { o._.push(a); continue; }
     const k = a.slice(2);
-    if (['allow-overlap', 'system', 'detach', 'remove-worktree', 'no-wait', 'json', 'purge', 'session-credential', 'credential-stdin', 'all', 'logs', 'tee', 'credentials'].includes(k)) { o[k] = true; continue; }
+    if (['allow-overlap', 'system', 'detach', 'remove', 'remove-worktree', 'no-wait', 'json', 'purge', 'session-credential', 'credential-stdin', 'all', 'logs', 'tee', 'credentials', 'stop', 'status', 'fg'].includes(k)) { o[k] = true; continue; }
     const v = args[++i];
     if (k === 'witness' || k === 'witness-path' || k === 'var') (o[k] ||= []).push(v); else o[k] = v;
   }
@@ -180,7 +211,10 @@ async function daemon(args) {
 const credArg = (o) => { const c = o['credential-stdin'] ? fs.readFileSync(0, 'utf8').trim() : process.env.G4A_AGENT_CREDENTIAL; return c ? { credential: c } : {}; };
 async function claimCmd(args) {
   const o = opts(args);
-  out(await (await client())('claim', { repo: o.repo, agent: o.agent, paths: (o.paths || '').split(',').filter(Boolean), witnesses: o.witness || [], witnessPaths: o['witness-path'] || [], allowOverlap: !!o['allow-overlap'], ...credArg(o), ...(o['session-credential'] ? { credentialStore: 'session' } : {}) }));
+  const r = await (await client())('claim', { repo: o.repo, agent: o.agent, paths: (o.paths || '').split(',').filter(Boolean), witnesses: o.witness || [], witnessPaths: o['witness-path'] || [], allowOverlap: !!o['allow-overlap'], ...credArg(o), ...(o['session-credential'] ? { credentialStore: 'session' } : {}) });
+  const G = await import('../src/gap6.mjs');
+  G.capture(o.repo, o.agent, 'claim', { intent: o.intent, paths: o.paths, ok: r.ok, reason: r.reason });
+  out(r);
 }
 async function releaseCmd(args) { const o = opts(args); out(await (await client())('release', { repo: o.repo, agent: o.agent, removeWorktree: !!o['remove-worktree'], ...credArg(o) })); }
 async function statusCmd(args) { const o = opts(args); out(await (await client())('status', { repo: o.repo })); }
@@ -191,8 +225,15 @@ async function promoteCmd(args) {
   const c = st.claims.find((x) => x.agent === o.agent);
   if (!c) { out({ ok: false, error: `no active claim for ${o.agent}` }); return; }
   const secret = fs.readFileSync(path.join(home, 'secrets', c.id), 'utf8'); // never printed
-  out(await rpc('promote', { repo: o.repo, agent: o.agent, secret, wait: !o['no-wait'], ...credArg(o) }));
+  const r = await rpc('promote', { repo: o.repo, agent: o.agent, secret, wait: !o['no-wait'], ...credArg(o) });
+  const G = await import('../src/gap6.mjs');
+  const ev = r && r.ok && r.status !== 'queued' ? G.evalHook(r) : undefined; // advisory only: never changes ok/status
+  if (ev) r.advisory_eval = ev;
+  G.capture(o.repo, o.agent, 'promote', { intent: o.intent, ok: r.ok, status: r.status, reason: r.reason, sha: r.sha ?? r.main_after, eval_exit: ev?.exit });
+  out(r);
 }
+async function searchCmd(args) { const o = opts(args); const G = await import('../src/gap6.mjs'); out(G.search(o.repo || '.', o._.join(' '))); }
+async function reviewCmd(args) { const o = opts(args); const G = await import('../src/gap6.mjs'); out({ ok: true, wrote: G.writeReview(o.repo || '.', o.out) }); }
 async function ledgerCmd(args) {
   const o = opts(args);
   const b = await (await client())('export', { repo: o.repo });
@@ -272,7 +313,13 @@ async function overrideCmd(args) {
   const { repoId } = await import('../src/authority.mjs');
   out({ ...(await import('../src/override.mjs')).grantOverride({ repo: repoId(o.repo), minutes, reason: o.reason, ...(o.var ? { vars: o.var } : {}), passphrase: passOf(o) }), mode: 'same-user (detect-only)' });
 }
-async function stopCmd() { try { out(await (await client())('shutdown')); } catch (e) { out({ ok: false, error: e.message }); } }
+async function stopCmd(args = []) {
+  // stops the daemon and, when this repo has an authority, its long-running server
+  let daemon; try { daemon = await (await client())('shutdown'); } catch (e) { daemon = { ok: false, error: e.message }; }
+  let server = null;
+  try { const C = await import('../src/authority-client.mjs'); const loc = C.locate(opts(args).repo); if (loc) server = await C.serverCtl(loc, 'stop'); } catch (e) { server = { ok: false, error: e.message }; }
+  out(server ? { ...daemon, server } : daemon);
+}
 
 const [cmd, ...rest] = process.argv.slice(2);
 // Phase 2 authority. `init --system`: separate OS user (enforced). `init DIR`: same uid (detect-only).
@@ -284,12 +331,14 @@ async function authorityCmd(args) {
   const sub = o._[0];
   if (sub === 'init') {
     const top = A.repoTop(o.repo), id = A.repoId(o.repo);
-    if (args.includes('--system')) {
+    // default: system mode where it can be installed (passwordless sudo + useradd); DIR = same-user fallback
+    const canSystem = () => spawnSync('sudo', ['-n', 'true'], { stdio: 'ignore' }).status === 0 && spawnSync('sh', ['-c', 'command -v useradd'], { stdio: 'ignore' }).status === 0;
+    if (args.includes('--system') || (!o._[1] && canSystem())) {
       const r = execFileSync('sudo', ['-n', process.execPath, '--no-warnings', path.join(PKG, 'src', 'system-install.mjs'), id, top], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'inherit'] });
       return out({ ...JSON.parse(r.trim().split('\n').pop()), ref_guard: (await import('../src/refguard.mjs')).installRefGuard(top) });
     }
     const dir = o._[1];
-    if (!dir) { console.error('usage: g4a authority init --system [--repo R] | init DIR [--repo R]'); process.exitCode = 2; return; }
+    if (!dir) { console.error('g4a: system mode is unavailable here (needs passwordless sudo + useradd).\nusage: g4a authority init [--system] [--repo R]   (default; prevents authority writes)\n       g4a authority init DIR [--repo R]          (same-user fallback; detect-only)'); process.exitCode = 2; return; }
     const { initRoot } = await import('../src/authority-service.mjs');
     const r = initRoot({ root: path.resolve(dir), seed: top, clientRepo: id, mode: 'user' });
     safeGit(top, ['config', 'g4a.authority', path.resolve(dir)]);
@@ -304,6 +353,12 @@ async function authorityCmd(args) {
   const loc = C.locate(o.repo);
   if (!loc) { out({ ok: false, error: 'no authority for this repo (g4a authority init --system)' }); return; }
   if (['audit', 'status', 'ledger'].includes(sub)) return out(C.call(loc, sub));
+  if (sub === 'serve') {
+    // long-running authority server: start (default, background), --fg, --stop, --status
+    const act = args.includes('--stop') ? 'stop' : args.includes('--status') ? 'status' : args.includes('--fg') ? 'fg' : 'start';
+    const r = await C.serverCtl(loc, act);
+    out(r); if (!r.ok) process.exitCode = 1; return;
+  }
   if (sub === 'sync') {
     // fast-forward local main to authority main (no merge; refuses a diverged local main)
     const top = A.repoTop(o.repo);
@@ -334,8 +389,12 @@ async function authorityCmd(args) {
 const AGENT_NAME_RE = /^[a-z0-9][a-z0-9-]{0,23}$/;
 const AGENTS_MAP = process.env.G4A_AGENTS_MAP_TEST || '/etc/g4a/agents.json';
 const readAgentsMap = () => { try { return JSON.parse(fs.readFileSync(AGENTS_MAP, 'utf8')); } catch { return { agents: {}, policy: {} }; } };
-function rootHelper(args) {
-  const r = spawnSync('sudo', ['-n', process.execPath, '--no-warnings', path.join(PKG, 'src', 'agent-users.mjs'), ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'inherit'] });
+function rootHelper(args, input) {
+  // prefer the narrowed root entry (only g4a-admin as root); fall back to full sudo
+  const admin = '/usr/local/lib/g4a/bin/g4a-admin';
+  const useAdmin = fs.existsSync(admin) && spawnSync('sudo', ['-n', '-l', admin], { stdio: 'ignore' }).status === 0;
+  if (useAdmin && args[0] === 'add') args = args.slice(0, 3);
+  const r = spawnSync('sudo', useAdmin ? ['-n', admin, ...args] : ['-n', process.execPath, '--no-warnings', path.join(PKG, 'src', 'agent-users.mjs'), ...args], { encoding: 'utf8', stdio: [input === undefined ? 'ignore' : 'pipe', 'pipe', 'inherit'], ...(input === undefined ? {} : { input }) });
   try { return JSON.parse(r.stdout.trim().split('\n').pop()); } catch { return { ok: false, error: `agent helper failed (exit ${r.status}; needs sudo)` }; }
 }
 async function agentCmd(args) {
@@ -350,13 +409,21 @@ async function agentCmd(args) {
     const r = sub === 'add' ? rootHelper(['add', name, repoId(o.repo), me]) : rootHelper(['remove', name]);
     out(r); if (!r.ok) process.exitCode = 1; return;
   }
+  if (sub === 'key') {
+    // g4a agent key NAME VAR  (value read from stdin, never argv)  |  g4a agent key NAME VAR --remove
+    if (!AGENT_NAME_RE.test(String(name ?? ''))) { out({ ok: false, error: 'bad agent name' }); process.exitCode = 2; return; }
+    const variable = o._[2];
+    if (!/^[A-Z][A-Z0-9_]{0,62}_(API_KEY|KEY|TOKEN)$/.test(String(variable ?? ''))) { out({ ok: false, error: 'usage: g4a agent key NAME VAR_API_KEY [--remove]  (value on stdin)' }); process.exitCode = 2; return; }
+    const r = o.remove ? rootHelper(['key', name, variable, 'remove']) : rootHelper(['key', name, variable], fs.readFileSync(0, 'utf8'));
+    out(r); if (!r.ok) process.exitCode = 1; return;
+  }
   if (sub === 'policy') {
     const v = o['allow-operator'];
     if (v !== 'on' && v !== 'off') { console.error('usage: g4a agent policy --allow-operator on|off [--repo R]'); process.exitCode = 2; return; }
     const { repoId } = await import('../src/authority.mjs');
     const r = rootHelper(['policy', repoId(o.repo), v]); out(r); if (!r.ok) process.exitCode = 1; return;
   }
-  console.error('usage: g4a agent add NAME [--repo R] | remove NAME | list | policy --allow-operator on|off [--repo R]'); process.exitCode = 2;
+  console.error('usage: g4a agent add NAME [--repo R] | remove NAME | list | policy --allow-operator on|off [--repo R] | key NAME VAR_API_KEY [--remove] (value on stdin)'); process.exitCode = 2;
 }
 function runCmd(args) {
   const dd = args.indexOf('--');
@@ -401,7 +468,7 @@ function purgeCmd(args) {
 }
 
 async function mcpCmd() { await (await import('../src/mcp.mjs')).serve(); }
-({ mcp: mcpCmd, authority: authorityCmd, install, uninstall, doctor, stats: showStats, hook, hooks, daemon, claim: claimCmd, release: releaseCmd, status: statusCmd, promote: promoteCmd, ledger: ledgerCmd, verify: verifyCmd, stop: stopCmd, privacy: privacyCmd, purge: purgeCmd, operator: operatorCmd, override: overrideCmd, agent: agentCmd, run: runCmd }[cmd] ?? (() => {
-  console.log('usage: g4a install [--rc FILE] | uninstall [--rc FILE] | doctor | stats | hooks claude|codex|gemini | hook <agent> | privacy | purge [--logs|--tee|--credentials|--all]\n       g4a daemon [--detach] | stop | claim --agent A --paths p1,p2 --witness CMD [--allow-overlap] [--repo R]\n       g4a release --agent A [--remove-worktree] | status | promote --agent A [--no-wait] | ledger [--out F] | verify [BUNDLE] [--pin SPKIHEX] [--anchor-remote R]\n       g4a operator init [--passphrase-file F] | override --repo R --minutes N --reason TEXT [--var G4A_ENFORCE|G4A_RAW|G4A_AGENT]  (human-only)\n       g4a authority init --system | init DIR (same-user, detect-only) | audit | status | ledger | sync  [--repo R]\n       g4a agent add NAME | remove NAME | list | policy --allow-operator on|off  (system mode: one OS user per agent)\n       g4a run --agent NAME -- COMMAND [ARGS...]   (run an agent CLI as its own OS user g4a-a-NAME)\n       g4a mcp   (stdio MCP server: g4a_claim/status/promote/verify/release/authority_status)');
+({ mcp: mcpCmd, authority: authorityCmd, install, uninstall, doctor, stats: showStats, hook, hooks, daemon, claim: claimCmd, release: releaseCmd, status: statusCmd, promote: promoteCmd, ledger: ledgerCmd, verify: verifyCmd, stop: stopCmd, privacy: privacyCmd, purge: purgeCmd, operator: operatorCmd, override: overrideCmd, agent: agentCmd, run: runCmd, search: searchCmd, review: reviewCmd }[cmd] ?? (() => {
+  console.log('usage: g4a install [--rc FILE] | uninstall [--rc FILE] | doctor | stats | hooks claude|codex|gemini | hook <agent> | privacy | purge [--logs|--tee|--credentials|--all]\n       g4a daemon [--detach] | stop | claim --agent A --paths p1,p2 --witness CMD [--allow-overlap] [--repo R]\n       g4a release --agent A [--remove-worktree] | status | promote --agent A [--no-wait] | ledger [--out F] | verify [BUNDLE] [--pin SPKIHEX] [--anchor-remote R]\n       g4a operator init [--passphrase-file F] | override --repo R --minutes N --reason TEXT [--var G4A_ENFORCE|G4A_RAW|G4A_AGENT]  (human-only)\n       g4a authority init --system | init DIR (same-user, detect-only) | audit | status | ledger | sync | serve [--fg|--stop|--status]  [--repo R]\n       g4a agent add NAME | remove NAME | list | policy --allow-operator on|off | key NAME VAR (stdin)  (system mode: one OS user per agent)\n       g4a run --agent NAME -- COMMAND [ARGS...]   (run an agent CLI as its own OS user g4a-a-NAME)\n       g4a search QUERY [--repo R] | review [--out F.html] [--repo R]   (local only; capture with G4A_CAPTURE=1, claim/promote --intent TEXT; G4A_EVAL_HOOK=CMD is advisory)\n       g4a mcp   (stdio MCP server: g4a_claim/status/promote/verify/release/authority_status)');
   process.exitCode = cmd ? 2 : 0;
 }))(rest)?.catch?.((e) => { console.error(`g4a: ${redact(String(e?.message ?? e))}`); if (process.env.G4A_DEBUG === '1') console.error(redact(String(e?.stack ?? ''))); process.exitCode = 1; });

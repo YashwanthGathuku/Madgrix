@@ -10,9 +10,11 @@ import path from 'node:path';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
+import { CRED_USER, CRED_HOME } from './cred-proxy.mjs';
 
 const USER = 'g4a-authority', HOME = '/var/lib/g4a-authority', REPOS = `${HOME}/repos`, PUB = '/var/lib/g4a-authority-pub';
 const LIB = '/usr/local/lib/g4a', BIN = `${LIB}/bin`, MAP = '/etc/g4a/authority.json', SUDOERS = '/etc/sudoers.d/g4a-authority';
+export const ADMIN_SUDOERS = '/etc/sudoers.d/g4a-admin';
 export const AGENTS_HOME = '/var/lib/g4a-agents', AGENTS_MAP = '/etc/g4a/agents.json', AGENTS_SUDOERS = '/etc/sudoers.d/g4a-agents';
 export { USER as AUTH_USER, REPOS, PUB, LIB, BIN, MAP };
 const SRC_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
@@ -42,6 +44,9 @@ export function seedBundle(seedRepo, { uid = process.getuid(), gid = process.get
 export function install({ repoId, seedRepo, mergiraf }) {
   if (process.getuid() !== 0) throw new Error('system install must run as root');
   if (spawnSync('id', ['-u', USER]).status !== 0) sh('useradd', ['--system', '--home-dir', HOME, '--shell', '/usr/sbin/nologin', '--user-group', USER]);
+  // credential proxy user: holds proxied agent API keys; no agent or operator can read them
+  if (spawnSync('id', ['-u', CRED_USER]).status !== 0) sh('useradd', ['--system', '--home-dir', CRED_HOME, '--shell', '/usr/sbin/nologin', '--user-group', CRED_USER]);
+  for (const d of [CRED_HOME, `${CRED_HOME}/agents`]) { fs.mkdirSync(d, { recursive: true }); sh('chown', [`${CRED_USER}:${CRED_USER}`, d]); fs.chmodSync(d, 0o700); }
   for (const [d, m] of [[HOME, 0o700], [REPOS, 0o700], [PUB, 0o755]]) { fs.mkdirSync(d, { recursive: true }); sh('chown', [`${USER}:${USER}`, d]); fs.chmodSync(d, m); }
   // root-owned code copy (agents cannot swap the code the authority runs)
   fs.rmSync(`${LIB}.new`, { recursive: true, force: true });
@@ -72,6 +77,12 @@ id="$1"; cmd="$2"; arg="\${3:-}"
 case "$id" in *[!0-9a-f]*|'') echo '{"ok":false,"error":"bad id"}'; exit 2;; esac
 [ \${#id} -eq 16 ] || { echo '{"ok":false,"error":"bad id"}'; exit 2; }
 case "$cmd" in claim|permit|land|release|status|ledger|audit|pubinfo) ;;
+  serve) [ -z "$arg" ] || exit 2
+    # long-running server for this repo (kernel peer-uid gate, see peer-gate.py); detached by the client
+    exec ${ENV} ${BIN}/node --no-warnings ${LIB}/packages/g4a/src/authority-server.mjs --system --root ${REPOS}/"$id" --pub ${PUB}/"$id" ;;
+  serve-stop|serve-status) [ -z "$arg" ] || exit 2
+    # any local uid may stop it (it is restarted on demand; calls fall back to the per-call path)
+    exec ${ENV} ${BIN}/node --no-warnings ${LIB}/packages/g4a/src/authority-server.mjs --system --\${cmd#serve-} --root ${REPOS}/"$id" --pub ${PUB}/"$id" ;;
   init-root) [ -z "\${SUDO_USER:-}" ] || { echo '{"ok":false,"error":"init-root is root-only"}'; exit 2; } ;;
   *) echo '{"ok":false,"error":"bad command"}'; exit 2;; esac
 case "$arg" in *[!A-Za-z0-9+/=]*) echo '{"ok":false,"error":"bad arg"}'; exit 2;; esac
@@ -95,6 +106,25 @@ case "$p" in ${REPOS}/????????????????/repo|${REPOS}/????????????????/anchors.gi
 case "$p" in *..*) exit 2;; esac
 exec ${ENV} git upload-pack "$p"
 `,
+    // credential proxy (runs as ${CRED_USER} only; no arguments, so nothing to inject)
+    'g4a-credproxy': `#!/bin/sh
+set -eu
+[ "$(id -un)" = ${CRED_USER} ] || { echo "g4a: refused: g4a-credproxy runs only as ${CRED_USER}" >&2; exit 2; }
+exec env -i PATH=${BIN}:/usr/bin:/bin HOME=${CRED_HOME} LANG=C.UTF-8 ${BIN}/node --no-warnings ${LIB}/packages/g4a/src/cred-proxy.mjs ensure
+`,
+    // operator admin: the ONLY root entry the operator needs after install (g4a agent add/remove/
+    // policy/key). Root-owned code, fixed env, fixed subcommands; 'add' binds the caller as operator.
+    'g4a-admin': `#!/bin/sh
+set -eu
+op="\${SUDO_USER:-}"
+case "$op" in ''|*[!a-z0-9_.-]*) echo '{"ok":false,"error":"g4a-admin: run via sudo as the operator"}'; exit 2 ;; esac
+case "\${1:-}" in
+  add) [ "$#" -eq 3 ] || { echo '{"ok":false,"error":"usage: add NAME REPOID"}'; exit 2; }; set -- add "$2" "$3" "$op" ;;
+  remove|policy|key) ;;
+  *) echo '{"ok":false,"error":"g4a-admin: add|remove|policy|key only"}'; exit 2 ;;
+esac
+exec env -i PATH=${BIN}:/usr/bin:/bin:/usr/sbin:/sbin HOME=/root LANG=C.UTF-8 SUDO_USER="$op" ${BIN}/node --no-warnings ${LIB}/packages/g4a/src/agent-users.mjs "$@"
+`,
     // the g4a CLI from the root-owned copy (agent users run this one, never the operator's tree)
     'g4a': `#!/bin/sh
 exec ${BIN}/node --no-warnings ${LIB}/packages/g4a/bin/g4a.mjs "$@"
@@ -114,6 +144,39 @@ h=${AGENTS_HOME}/"$name"
 [ "$#" -gt 0 ] || { echo "usage: g4a run --agent <name> -- <command> [args]" >&2; exit 2; }
 export HOME="$h" USER="$me" LOGNAME="$me" G4A_HOME="$h/.g4a" G4A_AGENT=1 G4A_AGENT_NAME="$name"
 export PATH="$h/.g4a/bin:${BIN}:${LIB}/node/bin:/usr/local/bin:/usr/bin:/bin"
+# keys granted to THIS agent only (g4a agent key NAME VAR); names re-checked here
+if [ -d "$h/.g4a/keys" ]; then
+  for f in "$h/.g4a/keys"/*; do
+    [ -f "$f" ] || continue
+    n=\${f##*/}
+    case "$n" in *[!A-Z0-9_]*|''|[!A-Z]*) continue;; esac
+    case "$n" in G4A_*|GIT_*|LD_*|NODE_*|DYLD_*|SSH_*|GPG_*|SUDO_*|BASH_*|PYTHON*|NPM_CONFIG_*) continue;; esac
+    case "$n" in *_API_KEY|*_KEY|*_TOKEN) ;; *) continue;; esac
+    v=$(head -n 1 "$f")
+    export "$n=$v"
+  done
+fi
+# proxied keys: the real value lives with ${CRED_USER}; the agent gets a dummy and a local base URL,
+# only if the proxy user (not a squatting agent) owns the listening port
+if [ -d "$h/.g4a/proxied" ] && [ -r "$h/.g4a/proxy-token" ]; then
+  sudo -n -u ${CRED_USER} ${BIN}/g4a-credproxy >/dev/null 2>&1 || true
+  cu=$(id -u ${CRED_USER} 2>/dev/null || echo x)
+  if ${BIN}/node --no-warnings ${LIB}/packages/g4a/src/cred-proxy.mjs check "$cu"; then
+    port=$(${BIN}/node --no-warnings ${LIB}/packages/g4a/src/cred-proxy.mjs port)
+    tok=$(head -n 1 "$h/.g4a/proxy-token")
+    case "$tok" in *[!0-9a-f]*|'') tok=;; esac
+    for f in "$h/.g4a/proxied"/*; do
+      [ -n "$tok" ] && [ -f "$f" ] || continue
+      case "\${f##*/}" in
+        ANTHROPIC_API_KEY) export ANTHROPIC_API_KEY=g4a-proxied ANTHROPIC_BASE_URL="http://127.0.0.1:$port/g4a/$name/$tok/ANTHROPIC_API_KEY";;
+        OPENAI_API_KEY) export OPENAI_API_KEY=g4a-proxied OPENAI_BASE_URL="http://127.0.0.1:$port/g4a/$name/$tok/OPENAI_API_KEY/v1";;
+        GEMINI_API_KEY) export GEMINI_API_KEY=g4a-proxied GOOGLE_GEMINI_BASE_URL="http://127.0.0.1:$port/g4a/$name/$tok/GEMINI_API_KEY";;
+      esac
+    done
+  else
+    echo "g4a: warning: credential proxy not available (port not owned by ${CRED_USER}); proxied keys withheld" >&2
+  fi
+fi
 cd "$h/repo"
 ${BIN}/g4a daemon --detach >/dev/null 2>&1 || true
 ${BIN}/g4a authority sync --repo "$h/repo" >/dev/null 2>&1 || true
@@ -124,10 +187,18 @@ exec "$@"
   sh('chown', ['-R', 'root:root', `${LIB}.new`]); sh('chmod', ['-R', 'go-w,a+rX', `${LIB}.new`]); for (const n of [...Object.keys(w), 'node', 'mergiraf']) if (fs.existsSync(`${LIB}.new/bin/${n}`)) fs.chmodSync(`${LIB}.new/bin/${n}`, 0o755);
   fs.chmodSync(`${LIB}.new/node/bin/node`, 0o755);
   fs.rmSync(LIB, { recursive: true, force: true }); fs.renameSync(`${LIB}.new`, LIB);
-  const rule = `# g4a: any user may run ONLY these root-owned wrappers as ${USER}\nDefaults!${BIN}/g4a-authority,${BIN}/g4a-receive-pack,${BIN}/g4a-upload-pack env_reset\nALL ALL=(${USER}) NOPASSWD: ${BIN}/g4a-authority, ${BIN}/g4a-receive-pack, ${BIN}/g4a-upload-pack\n`;
+  const rule = `# g4a: any user may run ONLY these root-owned wrappers as ${USER}\nDefaults!${BIN}/g4a-authority,${BIN}/g4a-receive-pack,${BIN}/g4a-upload-pack,${BIN}/g4a-credproxy env_reset\nALL ALL=(${USER}) NOPASSWD: ${BIN}/g4a-authority, ${BIN}/g4a-receive-pack, ${BIN}/g4a-upload-pack\nALL ALL=(${CRED_USER}) NOPASSWD: ${BIN}/g4a-credproxy\n`;
   fs.writeFileSync(`${SUDOERS}.tmp`, rule, { mode: 0o440 });
   if (spawnSync('visudo', ['-cf', `${SUDOERS}.tmp`]).status !== 0) { fs.rmSync(`${SUDOERS}.tmp`); throw new Error('sudoers rule failed visudo -c'); }
   fs.renameSync(`${SUDOERS}.tmp`, SUDOERS);
+  // narrowed operator sudo: the installing operator may run only g4a-admin as root (their own
+  // broader sudo, if any, is host config g4a cannot remove; see SECURITY.md "Operator sudo")
+  const op = process.env.SUDO_USER;
+  if (op && /^[a-z_][a-z0-9_.-]{0,31}$/.test(op) && op !== 'root') {
+    fs.writeFileSync(`${ADMIN_SUDOERS}.tmp`, `# g4a: operator ${op} may run ONLY the root-owned g4a-admin as root\nDefaults!${BIN}/g4a-admin env_reset\n${op} ALL=(root) NOPASSWD: ${BIN}/g4a-admin\n`, { mode: 0o440 });
+    if (spawnSync('visudo', ['-cf', `${ADMIN_SUDOERS}.tmp`]).status !== 0) { fs.rmSync(`${ADMIN_SUDOERS}.tmp`); throw new Error('admin sudoers rule failed visudo -c'); }
+    fs.renameSync(`${ADMIN_SUDOERS}.tmp`, ADMIN_SUDOERS);
+  }
   // seed: a bundle of main, readable by the authority user, cloned authority-side
   const id = createHash('sha256').update(repoId).digest('hex').slice(0, 16);
   const uid = Number(sh('id', ['-u', USER]).trim()), gid = Number(sh('id', ['-g', USER]).trim());
@@ -168,8 +239,11 @@ export async function uninstall({ repoId, purge = false }) {
   }
   const left = Object.keys(map).length;
   if (left) { fs.writeFileSync(`${MAP}.tmp`, JSON.stringify(map, null, 2) + '\n', { mode: 0o644 }); fs.renameSync(`${MAP}.tmp`, MAP); return { ok: true, removed, remaining: left }; }
-  for (const f of [SUDOERS, AGENTS_SUDOERS, AGENTS_HOME, LIB, path.dirname(MAP), HOME, PUB]) fs.rmSync(f, { recursive: true, force: true });
+  for (const f of [SUDOERS, ADMIN_SUDOERS, AGENTS_SUDOERS, AGENTS_HOME, LIB, path.dirname(MAP), HOME, PUB]) fs.rmSync(f, { recursive: true, force: true });
+  spawnSync('pkill', ['-u', USER]);
   if (spawnSync('id', ['-u', USER]).status === 0) spawnSync('userdel', [USER]);
+  spawnSync('pkill', ['-u', CRED_USER]); fs.rmSync(CRED_HOME, { recursive: true, force: true });
+  if (spawnSync('id', ['-u', CRED_USER]).status === 0) spawnSync('userdel', [CRED_USER]);
   return { ok: true, removed, remaining: 0, purged: true };
 }
 

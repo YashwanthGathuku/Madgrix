@@ -50,7 +50,7 @@ function validate(t, a) {
   const strs = Object.values(a).flatMap((v) => (Array.isArray(v) ? v : [v])).filter((v) => typeof v === 'string');
   if (strs.some((v) => /[\x00-\x08\x0a-\x1f\x7f]/.test(v))) bad('arguments must not contain NUL, newlines or other control characters');
   for (const k of t.inputSchema.required || []) if (a[k] === undefined) bad(`missing ${k}`);
-  if (a.agent !== undefined && !/^[A-Za-z0-9._-]{1,64}$/.test(a.agent)) bad('agent must match [A-Za-z0-9._-]{1,64}');
+  if (a.agent !== undefined && !/^(?!.*\.\.)[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(a.agent)) bad('agent must start with a letter or digit and match [A-Za-z0-9._-]{1,64} (no ..)');
   if (a.repo !== undefined && (typeof a.repo !== 'string' || !a.repo || a.repo.startsWith('-'))) bad('repo must be a path');
   if (a.paths !== undefined && (!Array.isArray(a.paths) || !a.paths.length || a.paths.some((p) => typeof p !== 'string' || !p || p.startsWith('-') || p.includes(',')))) bad('paths must be non-empty strings without commas or a leading -');
   if (a.witnesses !== undefined && (!Array.isArray(a.witnesses) || a.witnesses.some((w) => typeof w !== 'string' || !w || w.startsWith('-')))) bad('witnesses must be command strings');

@@ -13,12 +13,20 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { randomBytes, createHash } from 'node:crypto';
+import { CRED_USER, CRED_HOME, PROVIDERS } from './cred-proxy.mjs';
 import { AGENTS_HOME, AGENTS_MAP, AGENTS_SUDOERS, AUTH_USER, REPOS, PUB, LIB, BIN, MAP } from './system-install.mjs';
 
 export const NAME_RE = /^[a-z0-9][a-z0-9-]{0,23}$/;
 const OPERATOR_RE = /^[a-z_][a-z0-9_.-]{0,31}$/;
 export const userOf = (name) => `g4a-a-${name}`;
-export const ENV_KEEP = ['TERM', 'COLORTERM', 'LANG', 'LC_ALL', 'NO_COLOR', 'ANTHROPIC_API_KEY', 'OPENAI_API_KEY', 'GEMINI_API_KEY'];
+// API keys are NOT passed through from the operator's shell any more (every agent used to inherit
+// all of them). Each agent gets only the keys granted to it: `g4a agent key NAME VAR` (value on
+// stdin) stores it in the agent's own 0700 home, read by the launcher for that agent alone.
+export const ENV_KEEP = ['TERM', 'COLORTERM', 'LANG', 'LC_ALL', 'NO_COLOR'];
+// a grantable key name: an API key/token variable, never something that changes how code loads/runs
+export const KEY_VAR_RE = /^[A-Z][A-Z0-9_]{0,62}_(API_KEY|KEY|TOKEN)$/;
+const KEY_VAR_DENY = /^(G4A_|GIT_|LD_|NODE_|DYLD_|SSH_|GPG_|SUDO_|BASH_|PYTHON|NPM_CONFIG_)/;
 const sh = (cmd, args, o = {}) => execFileSync(cmd, args, { stdio: ['ignore', 'pipe', 'pipe'], encoding: 'utf8', ...o });
 const exists = (u) => spawnSync('id', ['-u', u], { stdio: 'ignore' }).status === 0;
 const cleanEnv = (extra = {}) => ({ PATH: `${BIN}:${LIB}/node/bin:/usr/bin:/bin`, LANG: 'C.UTF-8', ...extra });
@@ -100,6 +108,7 @@ export function removeAgent({ name, force = false }) {
   const user = userOf(name), m = readAgentsMap(), a = m.agents[name];
   if (!a && !force) throw new Error(`no agent ${name}`);
   const done = [];
+  if (fs.existsSync(`${CRED_HOME}/agents/${name}`)) { fs.rmSync(`${CRED_HOME}/agents/${name}`, { recursive: true, force: true }); done.push('proxied keys'); }
   const uid = exists(user) ? Number(sh('id', ['-u', user]).trim()) : a?.uid;
   if (exists(user)) {
     for (let i = 0; i < 50 && spawnSync('pgrep', ['-u', user], { stdio: 'ignore' }).status === 0; i++) { spawnSync('pkill', ['-KILL', '-u', user]); Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100); }
@@ -117,6 +126,47 @@ export function removeAgent({ name, force = false }) {
   if (Number.isInteger(uid) && uid > 0) for (const d of ['/tmp', '/var/tmp', '/dev/shm']) spawnSync('find', [d, '-xdev', '-uid', String(uid), '-depth', '-delete'], { stdio: 'ignore' });
   try { fs.rmdirSync(AGENTS_HOME); } catch {}
   return { ok: true, agent: name, removed: [...new Set(done)] };
+}
+
+// grant (value on stdin) or revoke one key for one agent; only that agent's operator may
+export function setKey({ name, variable, remove = false, value }) {
+  if (process.getuid() !== 0) throw new Error('g4a agent key must run as root (via sudo)');
+  if (!NAME_RE.test(String(name ?? ''))) throw new Error('bad agent name');
+  if (!KEY_VAR_RE.test(String(variable ?? '')) || KEY_VAR_DENY.test(variable)) throw new Error('key variable must look like NAME_API_KEY, NAME_KEY or NAME_TOKEN (and not G4A_/GIT_/LD_/NODE_/SSH_...)');
+  const a = readAgentsMap().agents[name];
+  if (!a) throw new Error(`no agent user for ${name}`);
+  const caller = process.env.SUDO_USER;
+  if (!caller || caller !== a.operator) throw new Error(`only ${name}'s operator may change its keys`);
+  const dir = `${a.home}/.g4a/keys`, f = `${dir}/${variable}`;
+  const proxied = Object.hasOwn(PROVIDERS, variable) && exists(CRED_USER);
+  const cdir = `${CRED_HOME}/agents/${name}`;
+  if (remove) {
+    must(asAgent(name, ['rm', '-f', '--', f, `${a.home}/.g4a/proxied/${variable}`]), 'remove key');
+    fs.rmSync(`${cdir}/${variable}`, { force: true });
+    return { ok: true, agent: name, variable, removed: true };
+  }
+  const v = String(value ?? '').replace(/\r?\n$/, '');
+  if (!v || v.length > 8192 || /[\0\n\r]/.test(v)) throw new Error('key value must be one non-empty line (<= 8 KiB) on stdin');
+  if (proxied) {
+    // the value goes ONLY to the credential proxy's store (g4a-cred, 0700/0600); the agent gets a
+    // per-agent proxy token and a marker, never the key (programs it starts cannot read it)
+    const cu = Number(sh('id', ['-u', CRED_USER]).trim()), cg = Number(sh('id', ['-g', CRED_USER]).trim());
+    const old = process.umask(0o077);
+    try {
+      fs.mkdirSync(cdir, { recursive: true, mode: 0o700 }); fs.chownSync(cdir, cu, cg);
+      const kf = `${cdir}/${variable}`;
+      fs.writeFileSync(`${kf}.tmp`, v + '\n', { mode: 0o600 }); fs.chownSync(`${kf}.tmp`, cu, cg); fs.renameSync(`${kf}.tmp`, kf);
+      if (!fs.existsSync(`${cdir}/token.sha256`)) {
+        const tok = randomBytes(32).toString('hex');
+        must(asAgent(name, ['sh', '-c', 'umask 077 && mkdir -p "$1" && cat > "$1/proxy-token.tmp" && mv "$1/proxy-token.tmp" "$1/proxy-token"', 'sh', `${a.home}/.g4a`], { input: tok + '\n' }), 'write proxy token');
+        fs.writeFileSync(`${cdir}/token.sha256`, createHash('sha256').update(tok).digest('hex') + '\n', { mode: 0o600 }); fs.chownSync(`${cdir}/token.sha256`, cu, cg);
+      }
+    } finally { process.umask(old); }
+    must(asAgent(name, ['sh', '-c', 'umask 077 && mkdir -p "$1" && : > "$1/$2" && rm -f -- "$3"', 'sh', `${a.home}/.g4a/proxied`, variable, f]), 'mark proxied key');
+    return { ok: true, agent: name, variable, stored: true, proxied: true };
+  }
+  must(asAgent(name, ['sh', '-c', 'umask 077 && mkdir -p "$1" && chmod 700 "$1" && cat > "$2.tmp" && chmod 600 "$2.tmp" && mv "$2.tmp" "$2"', 'sh', dir, f], { input: v }), 'write key');
+  return { ok: true, agent: name, variable, stored: true }; // never echo the value
 }
 
 export function setPolicy({ repoId, allowOperator }) {
@@ -138,7 +188,8 @@ if (process.argv[1] && fs.realpathSync(process.argv[1]) === fileURLToPath(import
     if (cmd === 'add') r = addAgent({ name: a1, repoId: a2, operator: a3 });
     else if (cmd === 'remove') r = removeAgent({ name: a1 });
     else if (cmd === 'policy') r = setPolicy({ repoId: a1, allowOperator: a2 === 'on' });
-    else r = { ok: false, error: 'usage: agent-users.mjs add NAME REPOID OPERATOR | remove NAME | policy REPOID on|off' };
+    else if (cmd === 'key') r = setKey({ name: a1, variable: a2, remove: a3 === 'remove', value: a3 === 'remove' ? undefined : fs.readFileSync(0, 'utf8') });
+    else r = { ok: false, error: 'usage: agent-users.mjs add NAME REPOID OPERATOR | remove NAME | policy REPOID on|off | key NAME VAR [remove]' };
   } catch (e) { r = { ok: false, error: e.message }; }
   process.stdout.write(JSON.stringify(r) + '\n'); if (r.ok === false) process.exitCode = 1;
 }

@@ -35,6 +35,48 @@ Here is how one uncontended g4a op splits up, as the median of 3 runs with N=1:
 | promote | 0.8–1.9 s |
 | release | about 0.75 s |
 
+## After batch landing (grok/g4a-gaps)
+
+Same machine, same workload (16 agents x 60 s, offline network namespace). `land` now enqueues;
+one leader per repo witnesses the combined SHA once and lands every disjoint claim with one
+compare-and-swap; authority-backed promote jobs run concurrently (`G4A_LAND_PARALLEL`, default 16).
+
+| target | before ops/s | after ops/s | before p50 ms | after p50 ms | after p95 ms | errors |
+|---|---|---|---|---|---|---|
+| g4a same-user | 0.21 | **1.28** | 40379 | **10614** | 23106 | 0 |
+| g4a system | 0.23 | **1.29** | 37852 | **9477** | 23644 | 0 |
+
+About 6x the throughput and 4x lower median latency, with the same guarantees (one-time signed
+permits, exact reviewed SHA per claim, a ledger entry per claim plus the batch record). Plain
+git push is still ~95 ops/s: a g4a op is claim + witness + review + release, not one push.
+
+## Entire's published numbers vs. g4a (honest comparison)
+
+Entire's ForgeMark race preset (16 agents, 1-3 files x 1 KB, 60 s, one branch per agent,
+vendor-run on their hardware): Entire 418 pushes/s; GitHub 4.7 (rate-limited); Cursor Origin 65;
+Pierre 15; GitLab 10. Those are raw branch pushes to a hosted forge.
+
+g4a measures something else: every op here is claim -> signed permit -> witness run -> CAS landing
+of the exact reviewed SHA onto `main` -> signed, hash-chained ledger entries -> release, with
+claim-scope checks. g4a does **not** beat 418/s and is not close; a governed landing is not a
+branch push. Plain local `git push` on this box is the comparable ceiling for raw pushes (see
+Results above).
+
+| run (this box, `node bench/race.mjs g4a N S`) | before | after group-committed anchors + lock backoff |
+|---|---|---|
+| N=16, ops/s | 0.74-0.94 | 1.08 (20 s run; p50 12.4 s) |
+| N=1, ops/s | 0.42 | 0.34 (12 s run, 5 ops: within noise) |
+
+Profile (temporary trace, N=1): each authority call is a fresh node process (~80-100 ms boot +
+~40 ms reanchor); each ledger append used to write and push its own anchor (~82 ms push); the
+authority lock is held ~700 ms per op, which caps serial throughput near 1.4 ops/s. The change:
+anchors are written once per locked authority command (and in the daemon within 5 ms / before
+each reply) for the latest head, instead of once per entry. Nothing is skipped: every entry is
+still chained and signed, rollback checks run before every append, anchors only move forward,
+and a crash before a flush is caught up by `reanchorAll()` at next start (test/anchors.test.mjs).
+Next steps that would matter more: a long-lived authority process (removes per-call boot and
+reanchor), and fewer git spawns per anchor.
+
 ## Why ForgeMark can't drive g4a directly
 
 ForgeMark speaks smart-HTTP and pushes plain `refs/forgemark/*` branches with no push options.
@@ -108,3 +150,39 @@ node bench/race.mjs g4a 16 60 --system
 forgemark -remote http://127.0.0.1:8099 -repos fm.git -strategy branch -concurrency 16 \
   -duration 60s -warmup 0s -files-min 1 -files-max 3 -file-size 1024 -token-file <dummy> -object-format sha1
 ```
+
+## Update, Nov 3 2026 (16 agents, 0 errors, local, offline-capable)
+| mode | ops/s | p50 | notes |
+|---|---|---|---|
+| g4a governed landing, user mode, before | 1.73 | n/a | 24 sync retries |
+| g4a governed landing, user mode, after auto-sync + server + cache/adaptive batch | 2.86 | 5.4 s | 0–3 retries, verify ok |
+| g4a governed landing, system mode (SO_PEERCRED server) | 2.66–2.71 | 5.7 s | verify ok |
+| g4a-push raw branch push, user | 16.48 | 691 ms | permit + scope-checked push, no landing; push step median 146 ms |
+| g4a-push raw branch push, system | 16.79 | 651 ms | push step median 143 ms |
+
+Entire's 418/s counts local checkpoint commits with no authority, scope check or witness, so the numbers are not comparable, and g4a does not reach it with governance on. What limits g4a now is the serialized authority lock and CLI boot: claim takes about 1.9 s at 16 agents. Reproduce with `node bench/race.mjs g4a|g4a-push 16 20 [--system]`.
+
+## Per-agent-ref locks (Nov 3 2026, 8 cores, 20 s window, 0 errors in every run)
+
+`permit` now runs under `locks/agent-<id>.d` only (read-only sqlite, no Authority, no ledger write);
+claim/land/release take `agent-<id>.d` then the global `lock.d`. Lock order: `land.d -> agent-<id>.d -> lock.d`.
+`g4a-push` now starts its timed window after every agent's one-time claim (before, 64 serialized
+claims consumed most of the window, so ops/s mostly measured the claim queue).
+
+| Run (claim excluded from window) | before (669b397) | after |
+|---|---|---|
+| g4a-push 16 user | 21.85 ops/s, p50 434 ms | 20.57 ops/s, p50 496 ms |
+| g4a-push 16 system | 21.69 ops/s, p50 457 ms | 20.51 ops/s, p50 510 ms |
+| g4a-push 64 user | 31.31 ops/s, p50 1968 ms | 33.57 ops/s, p50 1857 ms |
+| g4a-push 64 system | 32.97 ops/s, p50 1901 ms | 32.74 ops/s, p50 1885 ms |
+
+| Governed landing (old harness, claim per op) | before | after |
+|---|---|---|
+| g4a 16 user / system | 3.00 / 2.97 ops/s | 2.75 / 2.78 ops/s |
+| g4a 64 user / system | 2.07 / 2.41 ops/s | 1.89 / 2.24 ops/s |
+
+Reading: within run-to-run noise. On this box raw push is CPU-bound (each op spawns git plus
+node hooks); the global lock was not the limiter once `permit` stopped writing. Governed landing is
+bounded by serialized main CAS + ledger append (kept serial on purpose) and by `claim`, which still
+needs `lock.d` because overlap checks and ledger appends must be serial. What changed is isolation:
+a held or slow lock on one agent no longer delays another agent's permit (test/perref.test.mjs).

@@ -16,10 +16,12 @@ import { witnessSignerFromKey } from '../../../scripts/lib/admission.mjs';
 
 // SQLite access goes through src/sqlite-driver.mjs (node:sqlite or better-sqlite3).
 import { driver, openSqlite, NODE_SQLITE } from './sqlite-driver.mjs';
+import { writeScope, clearScope } from './scopecheck.mjs';
 export const SQLITE = { ok: true, get driver() { return driver().name; }, node: NODE_SQLITE.ok };
 export function requireSqlite() { return driver(); }
 
 export { globMatchesPath };
+const commonDir = (top) => path.resolve(top, safeGit(top, ['rev-parse', '--git-common-dir']).stdout.trim());
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);
@@ -37,6 +39,9 @@ CREATE TABLE IF NOT EXISTS intents (
 CREATE TABLE IF NOT EXISTS jobs (
   id TEXT PRIMARY KEY, kind TEXT NOT NULL, payload TEXT NOT NULL, status TEXT NOT NULL,
   attempts INTEGER NOT NULL DEFAULT 0, result TEXT, created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS landq (
+  job TEXT PRIMARY KEY, agent TEXT NOT NULL, claim TEXT NOT NULL, candidate TEXT NOT NULL,
+  created_at TEXT NOT NULL, result TEXT);
 `;
 
 export function openDb(home, { readOnly = false } = {}) {
@@ -47,7 +52,8 @@ export function openDb(home, { readOnly = false } = {}) {
   let db;
   try {
     db = openSqlite(f, { readOnly });
-    if (!readOnly) db.exec('PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA busy_timeout=5000;');
+    if (!readOnly) db.exec('PRAGMA busy_timeout=30000; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;');
+    else db.exec('PRAGMA busy_timeout=30000;');
   } finally { if (um !== null) process.umask(um); }
   if (!readOnly) {
     for (const x of [f, `${f}-wal`, `${f}-shm`]) try { if (fs.statSync(x).mode & 0o077) fs.chmodSync(x, 0o600); } catch {}
@@ -90,6 +96,20 @@ const WITNESS_SECRET = [
 ];
 // overlap is checked case-insensitively too: a case variant would collide on macOS/Windows
 export const claimOverlap = (a, b) => globsOverlap(a, b) || globsOverlap(a.toLowerCase(), b.toLowerCase());
+// Claim globs g4a matches: an exact path, "dir/**", or "**". A trailing slash ("dir/") means the
+// directory and is normalised to "dir/**" (it used to match nothing, so a claim on "src/" landed
+// no file at all). Any other wildcard is refused instead of silently matching only itself.
+export function normalizeClaimPaths(list) {
+  return [...new Set(list.map((p) => {
+    if (typeof p !== 'string') return p; // checkClaimInputs reports it
+    let q = p;
+    if (/\/$/.test(q) && !/\/\/$/.test(q)) q = q.slice(0, -1) + (q === '/' ? '' : '/**');
+    const body = q === '**' ? '' : q.endsWith('/**') ? q.slice(0, -3) : q;
+    if (/[*?[\]{}]/.test(body)) throw new Error(`claim path ${JSON.stringify(p)} uses a wildcard g4a does not match; use an exact path, "dir/" or "dir/**"`);
+    if (q !== '**' && body.split('/').some((seg) => seg === '')) throw new Error(`claim path ${JSON.stringify(p)} has an empty path segment`);
+    return q;
+  }))];
+}
 export function checkClaimInputs(paths, witnesses = [], witnessPaths = []) {
   for (const p of [...paths, ...witnessPaths]) {
     if (typeof p !== 'string' || !p || p.length > 512 || p.includes('\0')) throw new Error('claim path must be a non-empty string (<=512 chars)');
@@ -121,8 +141,14 @@ const ANCHOR_ENV = { GIT_AUTHOR_NAME: 'g4a', GIT_AUTHOR_EMAIL: 'g4a@localhost', 
 export class Authority {
   // anchorRemote: { url, ref = ANCHOR_REF, receivePack?, uploadPack? }; defaults to G4A_ANCHOR_REMOTE.
   // Phase 2 points it at the authority's append-only anchors.git (see authority-client.mjs).
-  constructor(home, { keyDir: kd = keyDir(), anchorRemote } = {}) {
+  // deferAnchors: group commit for the ledger-head anchors. Entries are chained and stored at once;
+  // the anchors (file, ref chain, remote push) are written for the latest head by flushAnchors()
+  // ('manual': the caller flushes before releasing its lock; 'auto': within ~5 ms and before every
+  // daemon reply). A crash in between is the same window as a crash between append and anchor
+  // today: reanchorAll() catches up on the next start, and anchors never move backwards.
+  constructor(home, { keyDir: kd = keyDir(), anchorRemote, deferAnchors = false } = {}) {
     this.home = path.resolve(home);
+    this.deferAnchors = deferAnchors; this.pendingAnchors = new Set(); this.anchorTimer = null;
     this.anchorRemoteSpec = anchorRemote ?? null;
     this.keyDir = path.resolve(kd);
     if (within(this.keyDir, this.home) || within(this.home, this.keyDir)) throw new Error(`key dir ${this.keyDir} must not be inside or contain G4A_HOME ${this.home}`);
@@ -216,6 +242,14 @@ export class Authority {
       this.writeAnchor(repo, h.seq, h.entry_hash); // catches up after a crash between append and anchor
     }
   }
+  flushAnchors() {
+    if (this.anchorTimer) { clearTimeout(this.anchorTimer); this.anchorTimer = null; }
+    for (const repo of [...this.pendingAnchors]) {
+      const h = this.db.prepare('SELECT seq, entry_hash FROM ledger WHERE repo = ? ORDER BY seq DESC LIMIT 1').get(repo);
+      if (h) this.writeAnchor(repo, h.seq, h.entry_hash);
+      this.pendingAnchors.delete(repo);
+    }
+  }
   async signer() { return witnessSignerFromKey(this.privateKey); }
 
   // ---- ledger (hash chain from src/lib/ledger.ts) ----
@@ -226,7 +260,11 @@ export class Authority {
     const entry_hash = await ledgerEntryHash(fields, sha256Hex);
     this.db.prepare('INSERT INTO ledger (repo, seq, ts, kind, payload, payload_hash, prev_hash, entry_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
       .run(repo, fields.seq, fields.ts, kind, canonicalJson(payload), fields.payload_hash, fields.prev_hash, entry_hash);
-    this.writeAnchor(repo, fields.seq, entry_hash);
+    if (!this.deferAnchors) this.writeAnchor(repo, fields.seq, entry_hash);
+    else {
+      this.pendingAnchors.add(repo);
+      if (this.deferAnchors === 'auto' && !this.anchorTimer) this.anchorTimer = setTimeout(() => { try { this.flushAnchors(); } catch {} }, 5);
+    }
     return { ...fields, entry_hash };
   }
 
@@ -300,8 +338,10 @@ export class Authority {
   }
   claim({ repo: repoPath, agent, paths, witnesses = [], witnessPaths = [], allowOverlap = false, expectBaseline = null }) {
     return this.serial(async () => {
-      if (!/^[A-Za-z0-9._-]{1,64}$/.test(agent || '')) throw new Error('agent must match [A-Za-z0-9._-]{1,64}');
+      if (!/^(?!.*\.\.)[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(agent || '')) throw new Error('agent must start with a letter or digit and match [A-Za-z0-9._-]{1,64} (no ..)');
       if (!Array.isArray(paths) || paths.length === 0) throw new Error('claim needs at least one path');
+      if (!Array.isArray(witnessPaths)) throw new Error('witnessPaths must be an array');
+      paths = normalizeClaimPaths(paths); witnessPaths = normalizeClaimPaths(witnessPaths);
       if (paths.includes('**')) throw new Error('unbounded claim "**" refused');
       checkClaimInputs(paths, witnesses, witnessPaths);
       const repo = repoId(repoPath), top = repoTop(repoPath);
@@ -324,7 +364,11 @@ export class Authority {
         await this.appendLedger(repo, 'claim_refused', { agent, paths, reason: 'witness_paths', guarded });
         return { ok: false, refused: 'witness_paths', guarded };
       }
-      const baseline = safeGit(top, ['rev-parse', '--verify', 'refs/heads/main^{commit}']).stdout.trim();
+      let baseline = safeGit(top, ['rev-parse', '--verify', 'refs/heads/main^{commit}']).stdout.trim();
+      // local main raced ahead of the authority's baseline (a peer landed meanwhile): branch from the
+      // authority's exact baseline when it is in local history, so the permit check is unchanged
+      if (expectBaseline && expectBaseline !== baseline && /^[0-9a-f]{40,64}$/.test(expectBaseline)
+        && safeGit(top, ['merge-base', '--is-ancestor', expectBaseline, baseline], { allowFailure: true }).status === 0) baseline = expectBaseline;
       // mirrored claims: the authority already fixed the baseline its permit will check; a local
       // worktree on any other main would carry foreign paths into the push (refused out-of-claim)
       if (expectBaseline && expectBaseline !== baseline) return { ok: false, refused: 'main_out_of_sync', local: baseline, authority: expectBaseline };
@@ -334,6 +378,7 @@ export class Authority {
       const exists = safeGit(top, ['rev-parse', '--verify', '--quiet', `refs/heads/${branch}`], { allowFailure: true }).status === 0;
       if (exists) throw new Error(`branch ${branch} already exists; release and delete it first`);
       safeGit(top, ['worktree', 'add', '--quiet', '-b', branch, worktree, baseline]);
+      writeScope(commonDir(top), agent, { baseline, paths }); // read by the reference-transaction hook
       const id = `c_${randomHex(8)}`;
       const secret = randomHex(32);
       writePrivate(path.join(ensurePrivateDir(path.join(this.home, 'secrets')), id), secret);
@@ -350,6 +395,7 @@ export class Authority {
       const c = this.activeClaims(repo).find((x) => x.agent === agent);
       if (!c) return { ok: false, error: `no active claim for ${agent}` };
       this.db.prepare("UPDATE claims SET status = 'released' WHERE id = ?").run(c.id);
+      try { clearScope(commonDir(repoTop(repoPath)), agent); } catch {}
       if (removeWorktree) safeGit(repoTop(repoPath), ['worktree', 'remove', '--force', c.worktree], { allowFailure: true });
       await this.appendLedger(repo, 'release', { id: c.id, agent });
       return { ok: true, id: c.id };
@@ -566,7 +612,7 @@ export async function verifyBundle(bundle, { pinnedPub, anchors = [], main } = {
   }
   if (main) {
     const lastMain = [...(bundle.entries ?? [])].reverse().find((e) => e.kind === 'promote' || e.kind === 'main_external');
-    const expect = lastMain && (lastMain.payload.main_after ?? lastMain.payload.actual);
+    const expect = lastMain && (lastMain.payload.batch?.main_after ?? lastMain.payload.main_after ?? lastMain.payload.actual);
     if (expect && expect !== main) warnings.push(`main is ${main} but the last recorded main is ${expect}: main moved outside the g4a daemon since then`);
   }
   return { ok: errors.length === 0, head: chain.ok ? chain.head : null, entries: bundle.entries?.length ?? 0, promotions, anchors: checkedAnchors, errors, warnings };

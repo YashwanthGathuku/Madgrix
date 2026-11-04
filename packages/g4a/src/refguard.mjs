@@ -11,9 +11,12 @@
 //    the authority's main; it only makes the local checkout lie, which verify flags.
 import fs from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { safeGit } from '../../../scripts/lib/safe-git.mjs';
 
 const MARK = '# g4a reference-transaction guard v1';
+const SCOPECHECK = fileURLToPath(new URL('./scopecheck.mjs', import.meta.url));
+const q = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`;
 const HOOK = `#!/bin/sh
 ${MARK}
 # refuses (prepared phase) any ref transaction that touches refs/heads/main or refs/g4a/*;
@@ -24,6 +27,11 @@ if [ -x "$dir/reference-transaction.g4a-prev" ]; then
   printf '%s\\n' "$in" | "$dir/reference-transaction.g4a-prev" "$@" || exit $?
 fi
 [ "$1" = prepared ] || exit 0
+# claim scope (v2): agent branches may only move to commits inside the agent's claim
+cd_=$(git rev-parse --git-common-dir 2>/dev/null) && cd_=$(cd "$cd_" && pwd)
+if [ -n "$cd_" ] && [ -d "$cd_/g4a-scope" ]; then
+  printf '%s\\n' "$in" | ${q(process.execPath)} --no-warnings ${q(SCOPECHECK)} "$cd_" || exit 1
+fi
 hit=$(printf '%s\\n' "$in" | awk '$1 != $2 && ($3 == "refs/heads/main" || index($3, "refs/g4a/") == 1) { print $3 }')
 [ -z "$hit" ] && exit 0
 log="$(git rev-parse --git-common-dir 2>/dev/null || echo .git)/g4a-ref-events.log"

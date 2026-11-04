@@ -13,10 +13,18 @@ import { globMatchesPath } from '../../../src/lib/claims.ts';
 
 const [root, pub] = process.argv.slice(2);
 const ZERO = '0'.repeat(40);
-const die = (m) => { process.stderr.write(`[g4a-authority] refused: ${m}\n`); process.exit(1); };
+// every refusal is recorded (bounded, JSON-encoded) for the authority to fold into its signed ledger
+const die = (m) => {
+  try {
+    const rec = { at: new Date().toISOString(), reason: String(m).slice(0, 400), uid: process.env.G4A_CALLER_UID ?? String(process.getuid()), refs: (globalThis.__updates ?? []).slice(0, 4).map((u) => String(u.ref).slice(0, 200)) };
+    fs.appendFileSync(path.join(root, 'state', 'refusals.jsonl'), JSON.stringify(rec) + '\n', { mode: 0o600 });
+  } catch {}
+  process.stderr.write(`[g4a-authority] refused: ${m}\n`); process.exit(1);
+};
 const git = (...a) => spawnSync('git', a, { cwd: path.join(root, 'repo'), encoding: 'utf8', env: { PATH: process.env.PATH, GIT_DIR: path.join(root, 'repo', '.git'), GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null', ...(process.env.GIT_QUARANTINE_PATH ? { GIT_OBJECT_DIRECTORY: process.env.GIT_OBJECT_DIRECTORY, GIT_ALTERNATE_OBJECT_DIRECTORIES: process.env.GIT_ALTERNATE_OBJECT_DIRECTORIES } : {}) } });
 
 const updates = fs.readFileSync(0, 'utf8').split('\n').filter(Boolean).map((l) => { const [old, nu, ref] = l.split(' '); return { old, new: nu, ref }; });
+globalThis.__updates = updates;
 const opts = Array.from({ length: Number(process.env.GIT_PUSH_OPTION_COUNT || 0) }, (_, i) => process.env[`GIT_PUSH_OPTION_${i}`]);
 const raw = opts.find((o) => o?.startsWith('permit='));
 if (updates.some((u) => u.ref === 'refs/heads/main')) die('main only moves through the authority ladder (g4a promote)');

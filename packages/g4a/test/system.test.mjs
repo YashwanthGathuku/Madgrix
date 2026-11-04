@@ -116,7 +116,7 @@ test('system authority: agent user is prevented from bypassing the authority', {
 
 // One OS user per agent (g4a agent add / g4a run / g4a agent remove). Runs after the test above in
 // the same file (node --test runs a file's tests in order), so the two never race on the install.
-test('agent users: separate uids, scoped launcher, no impersonation, full cleanup', { skip: !canSudo && 'needs passwordless sudo' }, () => {
+test('agent users: separate uids, scoped launcher, no impersonation, full cleanup', { skip: !canSudo && 'needs passwordless sudo' }, async () => {
   const env = Object.fromEntries(Object.entries(process.env).filter(([k]) => !/^(CODEX_|CLAUDECODE|GEMINI_CLI|G4A_)/.test(k)));
   const dir = fs.mkdtempSync('/tmp/g4a-au-'); fs.chmodSync(dir, 0o755);
   Object.assign(env, { G4A_HOME: path.join(dir, 'home'), G4A_KEY_DIR: path.join(dir, 'keys') });
@@ -154,13 +154,20 @@ test('agent users: separate uids, scoped launcher, no impersonation, full cleanu
     const me = os.userInfo().username;
     assert.deepEqual(rules.split('\n').filter((x) => x && !x.startsWith('#') && !x.startsWith('Defaults')), [`${me} ALL=(g4a-a-alice) NOPASSWD: ${WRAP}/g4a-agent-exec`, `${me} ALL=(g4a-a-bob) NOPASSWD: ${WRAP}/g4a-agent-exec`]);
     assert.match(rules, /env_reset/); assert.equal(sh('sudo -n visudo -cf /etc/sudoers.d/g4a-agents').status, 0);
+    // narrowed operator sudo: one rule, only the root-owned g4a-admin; it binds the caller as operator
+    const adm = sh('sudo -n cat /etc/sudoers.d/g4a-admin').stdout;
+    assert.deepEqual(adm.split('\n').filter((x) => x && !x.startsWith('#') && !x.startsWith('Defaults')), [`${me} ALL=(root) NOPASSWD: ${WRAP}/g4a-admin`]);
+    assert.equal(sh(`stat -c '%U %a' ${WRAP}/g4a-admin`).stdout.trim(), 'root 755');
+    assert.match(sh(`sudo -n ${WRAP}/g4a-admin add carol x mallory`).stdout, /usage: add NAME REPOID/, 'operator arg cannot be injected');
+    assert.match(sh(`sudo -n ${WRAP}/g4a-admin purge`).stdout, /add\|remove\|policy\|key only/);
+    assert.notEqual(sh(`${WRAP}/g4a-admin remove alice`).status, 0, 'not via sudo');
 
     // the launcher runs the command as the agent user, in its own clone, with the shim first on PATH
     const who = run('alice', 'id -un; pwd; command -v git; echo "$G4A_HOME"');
     assert.equal(who.status, 0, who.stderr);
     assert.deepEqual(who.stdout.trim().split('\n'), ['g4a-a-alice', `${H('alice')}/repo`, `${H('alice')}/.g4a/bin/git`, `${H('alice')}/.g4a`]);
     // ... and cannot escalate: no sudo to root/the operator/another agent, no launcher for bob
-    for (const s of ['sudo -n true', 'sudo -n -u root id', `sudo -n -u ${me} id`, `sudo -n -u g4a-a-bob ${WRAP}/g4a-agent-exec id`, `sudo -n -u g4a-authority ${WRAP}/g4a-authority 0000000000000000 init-root e30=`]) {
+    for (const s of ['sudo -n true', 'sudo -n -u root id', `sudo -n -u ${me} id`, `sudo -n -u g4a-a-bob ${WRAP}/g4a-agent-exec id`, `sudo -n -u g4a-authority ${WRAP}/g4a-authority 0000000000000000 init-root e30=`, `sudo -n ${WRAP}/g4a-admin remove bob`]) {
       const r = run('alice', `${s} >/dev/null 2>&1; echo rc=$?`);
       assert.match(r.stdout, /rc=(?!0)\d+/, `alice: ${s}`);
     }
@@ -173,7 +180,51 @@ test('agent users: separate uids, scoped launcher, no impersonation, full cleanu
     assert.equal(inj.stdout.trim(), '$(id -u); `id` && id');
     // caller-supplied env (other than the allowlist) does not reach the agent
     const ev = spawnSync(process.execPath, ['--no-warnings', CLI, 'run', '--agent', 'alice', '--', 'sh', '-c', 'echo "${LD_PRELOAD:-none} ${G4A_RAW:-none} ${ANTHROPIC_API_KEY:-none}"'], { encoding: 'utf8', cwd: repo, env: { ...env, LD_PRELOAD: '/tmp/x.so', G4A_RAW: '1', ANTHROPIC_API_KEY: 'k-test' } });
-    assert.equal(ev.stdout.trim(), 'none none k-test');
+    assert.equal(ev.stdout.trim(), 'none none none', 'operator API keys no longer pass through to agents');
+    // per-agent key grant: value on stdin, only that agent sees it, bad names refused
+    const grant = spawnSync(process.execPath, ['--no-warnings', CLI, 'agent', 'key', 'alice', 'ANTHROPIC_API_KEY'], { encoding: 'utf8', cwd: repo, env, input: 'k-alice\n' });
+    assert.equal(J(grant).ok, true, grant.stderr);
+    assert.doesNotMatch(grant.stdout, /k-alice/, 'key value never echoed');
+    for (const bad of ['LD_PRELOAD', 'PATH', 'G4A_RAW_KEY', 'GIT_SSH_KEY', 'x_api_key', 'NODE_OPTIONS'])
+      assert.equal(J(spawnSync(process.execPath, ['--no-warnings', CLI, 'agent', 'key', 'alice', bad], { encoding: 'utf8', cwd: repo, env, input: 'v\n' })).ok, false, `key name ${bad}`);
+    // ANTHROPIC_API_KEY is a proxied provider: alice gets a dummy + local base URL, never the key
+    assert.equal(run('alice', 'echo "${ANTHROPIC_API_KEY:-none}"').stdout.trim(), 'g4a-proxied');
+    assert.match(run('alice', 'echo "$ANTHROPIC_BASE_URL"').stdout.trim(), /^http:\/\/127\.0\.0\.1:\d+\/g4a\/alice\/[0-9a-f]{64}\/ANTHROPIC_API_KEY$/);
+    assert.doesNotMatch(run('alice', `env; cat $HOME/.g4a/keys/* 2>/dev/null; grep -r "k-al[i]ce" $HOME 2>/dev/null; cat /var/lib/g4a-cred/agents/alice/ANTHROPIC_API_KEY 2>&1`).stdout, /k-alice/, 'key not readable by the agent');
+    assert.equal(run('bob', 'echo "${ANTHROPIC_API_KEY:-none}"').stdout.trim(), 'none', 'bob does not get alice\'s key');
+    {
+      // the proxy injects the key upstream; the fake upstream runs in a child (spawnSync blocks us)
+      // and records only a hash of the key it received
+      const { createHash } = await import('node:crypto');
+      const rec = path.join(dir, 'up.json'); fs.writeFileSync(rec, ''); fs.chmodSync(rec, 0o666);
+      const upSrc = `const fs=require('fs'),c=require('crypto');require('http').createServer((q,s)=>{fs.appendFileSync(${JSON.stringify(rec)},JSON.stringify({url:q.url,k:c.createHash('sha256').update(String(q.headers['x-api-key'])).digest('hex'),auth:q.headers.authorization??null})+'\\n');s.end('ok')}).listen(7352,'127.0.0.1')`;
+      const { spawn } = await import('node:child_process');
+      const up = spawn(process.execPath, ['-e', upSrc], { stdio: 'ignore' });
+      let squat = null;
+      try {
+        await new Promise((r) => setTimeout(r, 300));
+        spawnSync('sudo', ['-n', 'pkill', '-u', 'g4a-cred']);
+        assert.equal(sh(`echo '{"port":7351,"origins":{"ANTHROPIC_API_KEY":"http://127.0.0.1:7352"}}' | sudo -n tee /etc/g4a/credproxy.json >/dev/null && sudo -n chmod 644 /etc/g4a/credproxy.json`).status, 0);
+        const call = run('alice', 'curl -s -H "x-api-key: stolen" -H "authorization: Bearer x" "$ANTHROPIC_BASE_URL/v1/messages?key=zz" ; echo; curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:7351/g4a/alice/$(printf %064d 0)/ANTHROPIC_API_KEY/v1/messages"; echo; curl -s -o /dev/null -w "%{http_code}" "$(echo $ANTHROPIC_BASE_URL | sed s/alice/bob/)/v1/x"; echo; curl -s -o /dev/null -w "%{http_code}" "$ANTHROPIC_BASE_URL/..%2f..%2fx"');
+        assert.deepEqual(call.stdout.trim().split('\n'), ['ok', '401', '401', '400'], call.stdout + call.stderr);
+        const seen = fs.readFileSync(rec, 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l));
+        assert.equal(seen.length, 1, JSON.stringify(seen));
+        assert.equal(seen[0].k, createHash('sha256').update('k-alice').digest('hex'), 'real key injected upstream');
+        assert.equal(seen[0].auth, null, 'agent auth headers stripped'); assert.equal(seen[0].url, '/v1/messages');
+        // a squatter (bob) on the proxy port: the launcher withholds proxied keys from alice
+        spawnSync('sudo', ['-n', 'pkill', '-u', 'g4a-cred']);
+        squat = spawn(process.execPath, ['--no-warnings', CLI, 'run', '--agent', 'bob', '--', 'node', '-e', 'require("http").createServer((q,s)=>s.end("x")).listen(7351,"127.0.0.1")'], { stdio: 'ignore', env, cwd: repo });
+        await new Promise((r) => setTimeout(r, 2500));
+        const sq = run('alice', 'echo "${ANTHROPIC_API_KEY:-none} ${ANTHROPIC_BASE_URL:-none}"');
+        assert.equal(sq.stdout.trim(), 'none none', sq.stdout);
+        assert.match(sq.stderr, /credential proxy not available/);
+      } finally { up.kill(); spawnSync('sudo', ['-n', 'pkill', '-u', 'g4a-a-bob', '-f', 'listen\\(7351']); squat?.kill(); spawnSync('sudo', ['-n', 'pkill', '-u', 'g4a-cred']); }
+    }
+    // a key file the agent itself plants under a dangerous name is ignored by the launcher
+    run('alice', 'printf /tmp/evil.so > $HOME/.g4a/keys/LD_PRELOAD');
+    assert.equal(run('alice', 'echo "${LD_PRELOAD:-none}"').stdout.trim(), 'none');
+    assert.equal(J(spawnSync(process.execPath, ['--no-warnings', CLI, 'agent', 'key', 'alice', 'ANTHROPIC_API_KEY', '--remove'], { encoding: 'utf8', cwd: repo, env })).ok, true);
+    assert.equal(run('alice', 'echo "${ANTHROPIC_API_KEY:-none}"').stdout.trim(), 'none');
 
     // separation between agents: credential, clone/worktree, impersonation
     const credA = sh(`sudo -n find ${H('alice')}/.g4a/credentials -type f`).stdout.trim();
@@ -226,7 +277,7 @@ test('agent users: separate uids, scoped launcher, no impersonation, full cleanu
 
     // cleanup leaves nothing: user, group, home, processes, tmp files, sudoers, maps, binding
     run('alice', 'sleep 300 >/dev/null 2>&1 & echo x > /tmp/g4a-au-left-alice; true');
-    for (const n of ['alice', 'bob']) assert.equal(J(g4a(['agent', 'remove', n])).ok, true);
+    for (const n of ['alice', 'bob']) { const r = g4a(['agent', 'remove', n]); assert.equal(J(r).ok, true, n + ': ' + r.stdout + r.stderr); }
     for (const n of ['alice', 'bob']) {
       assert.notEqual(sh(`id g4a-a-${n}`).status, 0); assert.notEqual(sh(`getent group g4a-a-${n}`).status, 0);
       assert.equal(fs.existsSync(H(n)), false); assert.notEqual(sh(`pgrep -u ${uids[n]}`).status, 0);
@@ -245,6 +296,115 @@ test('agent users: separate uids, scoped launcher, no impersonation, full cleanu
     g4a(['stop']);
     for (const n of ['alice', 'bob']) if (sh(`id g4a-a-${n}`).status === 0) g4a(['agent', 'remove', n]);
     if (repoIdStr) assert.match(g4a(['authority', 'uninstall', '--system', '--repo-id', repoIdStr], { cwd: '/tmp' }).stdout, /"ok":\s*true/);
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ---- system-mode authority server red team (kernel SO_PEERCRED peer uid via peer-gate.py) ----
+// raw client as user u: send lines, print each reply line (python: no node needed by the agent)
+const PY = `import socket,sys,json
+s=socket.socket(socket.AF_UNIX);s.connect(sys.argv[1]);s.sendall(sys.stdin.buffer.read())
+b=b''
+while True:
+  d=s.recv(65536)
+  if not d: break
+  b+=d
+print(b.decode().strip())`;
+const raw = (u, sock, payload) => spawnSync('sudo', ['-n', '-u', u, 'python3', '-c', PY, sock], { input: payload, encoding: 'utf8', cwd: '/tmp' });
+const rq = (u, sock, obj) => { const r = raw(u, sock, JSON.stringify(obj) + '\n'); try { return JSON.parse(r.stdout); } catch { return { rawOut: r.stdout, err: r.stderr }; } };
+const hex = (n) => [...crypto.getRandomValues(new Uint8Array(n))].map((b) => b.toString(16).padStart(2, '0')).join('');
+
+test('system authority server: kernel peer uid identity, attacks refused', { skip: !canSudo && 'needs passwordless sudo' }, async () => {
+  const created = [];
+  for (const u of ['g4a-agent', 'g4a-agent2']) if (sh(`id ${u}`).status !== 0) { assert.equal(sh(`sudo -n useradd --system --create-home --shell /bin/bash ${u}`).status, 0); created.push(u); }
+  let repoIdStr = null;
+  const env0 = { ...process.env };
+  const dir = fs.mkdtempSync('/tmp/g4a-ss-'); fs.chmodSync(dir, 0o755);
+  try {
+    const repo = path.join(dir, 'repo');
+    const g = 'git -c user.name=t -c user.email=t@t';
+    assert.equal(sh(`mkdir ${repo} && cd ${repo} && git init -q -b main && echo a > a.txt && echo b > b.txt && ${g} add -A && ${g} commit -qm base && git checkout -q --detach`).status, 0);
+    repoIdStr = fs.realpathSync(path.join(repo, '.git'));
+    const env = { ...process.env, G4A_HOME: path.join(dir, 'home'), G4A_KEY_DIR: path.join(dir, 'keys') };
+    const init = spawnSync(process.execPath, ['--no-warnings', CLI, 'authority', 'init', '--system', '--repo', repo], { encoding: 'utf8', env });
+    assert.equal(init.status, 0, init.stderr);
+    const info = JSON.parse(init.stdout);
+    const sock = `${info.pub}/run/s.sock`;
+    // start through the sanctioned wrapper, as an unprivileged agent (any uid may, like the per-call wrapper)
+    spawnSync('bash', ['-c', `sudo -n -u g4a-agent sudo -n -u g4a-authority ${WRAP}/g4a-authority ${info.id} serve >/dev/null 2>&1 &`]);
+    for (let i = 0; i < 100 && !fs.existsSync(sock); i++) await new Promise((r) => setTimeout(r, 100));
+    assert.ok(fs.existsSync(sock), 'server socket up');
+    // a second start is a no-op (single server per repo)
+    assert.equal(sh(`sudo -n -u g4a-authority ${WRAP}/g4a-authority ${info.id} serve; echo rc=$?`).stdout.match(/rc=0/) !== null, true);
+    // the wrapper refuses an argument to serve (no injection of --root/--pub etc.)
+    assert.match(sh(`sudo -n -u g4a-agent sudo -n -u g4a-authority ${WRAP}/g4a-authority ${info.id} serve eA== 2>&1; echo rc=$?`).stdout, /rc=(?!0)\d+/);
+    const st = fs.lstatSync(sock), d = fs.lstatSync(path.dirname(sock));
+    assert.equal(d.mode & 0o777, 0o755); assert.ok(st.isSocket());
+    // A1: the agent cannot plant / replace the socket (run dir is the authority's, 0755)
+    assert.match(sh(`sudo -n -u g4a-agent bash -c 'rm -f ${sock} 2>&1; touch ${path.dirname(sock)}/x 2>&1; echo rc=$?'`).stdout, /denied[\s\S]*rc=1/);
+
+    // happy path: claim as g4a-agent over the socket; identity = kernel uid
+    const c1 = rq('g4a-agent', sock, { id: hex(16), cmd: 'claim', p: { agent: 's1', paths: ['a.txt'] } });
+    assert.equal(c1.r?.ok, true, JSON.stringify(c1));
+    const cred = c1.r.agent_credential;
+    // A2: uid spoofing in the request is ignored: agent2 using s1's name + stolen credential, with uid fields
+    for (const extra of [{ uid: Number(sh('id -u g4a-agent').stdout) }, { uid: 0 }]) {
+      const r = rq('g4a-agent2', sock, { id: hex(16), cmd: 'permit', ...extra, p: { agent: 's1', credential: cred, ...extra } });
+      assert.equal(r.r?.ok, false, JSON.stringify(r)); assert.match(r.r.error, /bound to uid/);
+    }
+    // A3: replayed id (same uid) refused; privileged / unknown commands not served
+    const id = hex(16);
+    assert.equal(rq('g4a-agent', sock, { id, cmd: 'status', p: {} }).r?.ok, true);
+    assert.match(rq('g4a-agent', sock, { id, cmd: 'status', p: {} }).error, /replayed/);
+    for (const cmd of ['init-root', 'operator-init', 'override', 'rebind', 'unbind', 'policy', '__proto__', 'constructor']) assert.match(rq('g4a-agent2', sock, { id: hex(16), cmd, p: { agent: 's1', uid: Number(sh('id -u g4a-agent2').stdout) } }).error ?? '', /not served/, cmd);
+    // A4: malformed: bad json, array, missing id, bad p, oversized line
+    assert.match(raw('g4a-agent2', sock, 'not json\n').stdout, /bad json/);
+    assert.match(rq('g4a-agent2', sock, [1]).error, /bad request/);
+    assert.match(rq('g4a-agent2', sock, { cmd: 'status' }).error, /bad request id/);
+    assert.match(rq('g4a-agent2', sock, { id: hex(16), cmd: 'status', p: [] }).error, /bad params/);
+    assert.match(raw('g4a-agent2', sock, 'x'.repeat((1 << 20) + 10) + '\n').stdout, /too large/);
+    // A5: agent-name injection through the server
+    for (const agent of ['..', '../../etc', '-rf', 'a;id', '$(id)']) assert.equal(rq('g4a-agent2', sock, { id: hex(16), cmd: 'claim', p: { agent, paths: ['b.txt'] } }).r?.ok, false, agent);
+    // A6: credential mismatch from the right uid refused; release with the real credential works
+    assert.equal(rq('g4a-agent', sock, { id: hex(16), cmd: 'release', p: { agent: 's1', credential: 'x'.repeat(43) } }).r?.ok, false);
+    // A8: slowloris from agent2 (100 idle connections) does not starve agent1
+    const slow = path.join(dir, 'slow.py'); fs.writeFileSync(slow, `import socket,time\nss=[socket.socket(socket.AF_UNIX) for _ in range(100)]\n[x.connect("${sock}") for x in ss]\ntime.sleep(4)\n`, { mode: 0o644 });
+    spawnSync('bash', ['-c', `sudo -n -u g4a-agent2 python3 ${slow} >/dev/null 2>&1 &`]);
+    await new Promise((r) => setTimeout(r, 800));
+    await new Promise((r) => setTimeout(r, 700));
+    const busy = raw('g4a-agent2', sock, JSON.stringify({ id: hex(16), cmd: 'status', p: {} }) + '\n');
+    assert.match(busy.stdout + busy.stderr, /busy|reset|Broken pipe/, busy.stdout + busy.stderr);
+    assert.equal(rq('g4a-agent', sock, { id: hex(16), cmd: 'status', p: {} }).r?.ok, true, 'agent1 still served');
+    // A7: the box-side client refuses a socket not owned by the pub owner (planted / own socket)
+    const { request } = await import('../src/authority-server.mjs');
+    const fake = fs.mkdtempSync(path.join(os.tmpdir(), 'g4a-fakepub-')); fs.mkdirSync(path.join(fake, 'run'));
+    const net = await import('node:net'); const srv = net.createServer(); await new Promise((r) => srv.listen(path.join(fake, 'run', 's.sock'), r));
+    assert.equal(await request(null, 'status', {}, { system: true, pub: fake }), null);
+    srv.close(); fs.rmSync(fake, { recursive: true, force: true });
+    // and the real one works from this (non-authority) uid via the client
+    const viaClient = await request(null, 'status', {}, { system: true, pub: info.pub });
+    assert.equal(viaClient?.ok, true, JSON.stringify(viaClient));
+    assert.equal(rq('g4a-agent', sock, { id: hex(16), cmd: 'release', p: { agent: 's1', credential: cred } }).r?.ok, true);
+    // ledger chain still verifies after server-side traffic (per-call path)
+    const au = JSON.parse(spawnSync('sudo', ['-n', '-u', 'g4a-authority', `${WRAP}/g4a-authority`, info.id, 'audit', Buffer.from('{}').toString('base64')], { encoding: 'utf8', cwd: '/tmp' }).stdout);
+    assert.equal(au.ok, true, JSON.stringify(au));
+    // CLI: serve --status / --stop / g4a stop (system mode, via the wrapper's serve-status/serve-stop)
+    const c = (...a) => JSON.parse(spawnSync(process.execPath, ['--no-warnings', CLI, ...a, '--repo', repo], { encoding: 'utf8', env }).stdout);
+    const s0 = c('authority', 'serve', '--status'); assert.equal(s0.running, true, JSON.stringify(s0));
+    assert.ok(c('authority', 'serve', '--stop').stopped > 1);
+    assert.equal(c('authority', 'serve', '--status').running, false);
+    assert.equal(fs.existsSync(sock), false, 'socket removed on stop');
+    assert.equal(c('authority', 'serve').running, true, 'CLI start in system mode');
+    assert.ok(c('stop').server?.stopped > 1, 'g4a stop covers the system server');
+    // serve-stop takes no argument either
+    assert.match(sh(`sudo -n -u g4a-agent sudo -n -u g4a-authority ${WRAP}/g4a-authority ${info.id} serve-stop eA== 2>&1; echo rc=$?`).stdout, /rc=(?!0)\d+/);
+  } finally {
+    spawnSync('sudo', ['-n', 'pkill', '-u', 'g4a-authority', '-f', 'authority-server.mjs']);
+    if (repoIdStr) {
+      const u = spawnSync(process.execPath, ['--no-warnings', CLI, 'authority', 'uninstall', '--system', '--repo-id', repoIdStr], { encoding: 'utf8', env: env0 });
+      assert.match(u.stdout, /"ok":\s*true/, u.stdout + u.stderr);
+    }
+    for (const u of created) { sh(`sudo -n pkill -KILL -u ${u}; sleep 0.3; sudo -n userdel -r ${u} 2>/dev/null`); }
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });

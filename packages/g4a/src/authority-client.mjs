@@ -7,9 +7,9 @@
 import fs from 'node:fs';
 import { redact } from './privacy.mjs';
 import path from 'node:path';
-import { spawnSync } from 'node:child_process';
+import { spawnSync, spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { safeGit } from '../../../scripts/lib/safe-git.mjs';
+import { safeGit, safeGitEnv, SAFE_GIT_CONFIG } from '../../../scripts/lib/safe-git.mjs';
 import { repoId } from './authority.mjs';
 import { CLIENT_ANCHOR_REF, AUTH_ANCHOR_REF } from './authority-service.mjs';
 
@@ -34,7 +34,7 @@ export function locate(repoPath) {
 }
 
 export const ROOT_OPERATOR_CMDS = ['operator-init', 'override'];
-export function call(loc, cmd, params = {}, { interactive = false } = {}) {
+function callArgv(loc, cmd, params) {
   const { credential, ...rest } = params;
   const b64 = Buffer.from(JSON.stringify(credential ? { ...rest, credential_stdin: true } : rest)).toString('base64');
   // operator-init / override are a privileged bootstrap: never via the any-uid sudo wrapper, only
@@ -44,9 +44,87 @@ export function call(loc, cmd, params = {}, { interactive = false } = {}) {
     : loc.mode === 'system'
     ? ['sudo', ['-n', '-u', SYSTEM_USER, WRAP('g4a-authority'), loc.id, cmd, b64]]
     : [process.execPath, ['--no-warnings', SERVICE, '--root', loc.root, cmd, b64]];
+  return { argv, credential };
+}
+const parseReply = (status, stdout, stderr) => {
+  const line = (stdout || '').trim().split('\n').pop();
+  try { return JSON.parse(line); } catch { return { ok: false, error: redact(`authority call failed (exit ${status}): ${(stderr || '').trim().split('\n').slice(-2).join(' ') || line}`) }; }
+};
+export function call(loc, cmd, params = {}, { interactive = false } = {}) {
+  const { argv, credential } = callArgv(loc, cmd, params);
   const r = spawnSync(argv[0], argv[1], { encoding: 'utf8', ...(credential ? { input: credential + '\n' } : {}), stdio: [credential ? 'pipe' : 'ignore', 'pipe', interactive ? 'inherit' : 'pipe'], maxBuffer: 256 << 20 });
-  const line = (r.stdout || '').trim().split('\n').pop();
-  try { return JSON.parse(line); } catch { return { ok: false, error: redact(`authority call failed (exit ${r.status}): ${(r.stderr || '').trim().split('\n').slice(-2).join(' ') || line}`) }; }
+  return parseReply(r.status, r.stdout, r.stderr);
+}
+// Same as call() without blocking the caller's event loop: the daemon uses it so concurrent
+// promote jobs reach the authority together (where `land` batches them).
+const MAX_REPLY = 256 << 20;
+// Same-user mode: requests go to the long-running authority server (src/authority-server.mjs) when
+// one is reachable; the first call starts it in the background and itself takes the per-call path.
+const started = new Set();
+const SERVER = path.join(path.dirname(fileURLToPath(import.meta.url)), 'authority-server.mjs');
+function startServer(loc) {
+  if (started.has(loc.root)) return; started.add(loc.root);
+  const [bin, args] = loc.mode === 'system' ? ['sudo', ['-n', '-u', SYSTEM_USER, WRAP('g4a-authority'), loc.id, 'serve']] : [process.execPath, ['--no-warnings', SERVER, '--root', loc.root]];
+  try { const ch = spawn(bin, args, { detached: true, stdio: 'ignore' }); ch.on('error', () => {}); ch.unref(); } catch {}
+}
+// `g4a authority serve`: start | fg | stop | status for this repo's server
+export async function serverCtl(loc, act) {
+  const sys = loc.mode === 'system';
+  if (sys) {
+    const sub = { start: 'serve', fg: 'serve', stop: 'serve-stop', status: 'serve-status' }[act];
+    const r = spawnSync('sudo', ['-n', '-u', SYSTEM_USER, WRAP('g4a-authority'), loc.id, sub], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+    if (sub !== 'serve') { try { return JSON.parse(r.stdout.trim().split('\n').pop()); } catch { return { ok: false, error: `server ${act} failed (exit ${r.status})` }; } }
+    if (r.status !== 0) return { ok: false, error: `server start failed (exit ${r.status})` };
+  } else {
+    const M = await import('./authority-server.mjs');
+    if (act === 'stop') return M.stopServer(loc.root);
+    if (act === 'status') { const pid = M.serverPid(loc.root); return { ok: true, running: !!pid, pid: pid || null }; }
+    if (act === 'fg') { const r = await M.serve(loc.root); process.stdout.write(JSON.stringify(r) + '\n'); if (r.already) return r; return new Promise(() => {}); }
+    started.delete(loc.root); startServer(loc);
+  }
+  const { request } = await import('./authority-server.mjs');
+  for (let i = 0; i < 50; i++) {
+    const r = await request(loc.root, 'pubinfo', {}, { system: sys, pub: loc.pub, timeoutMs: 5000 });
+    if (r !== null) return { ok: true, running: true, mode: loc.mode };
+    await new Promise((res) => setTimeout(res, 100));
+  }
+  return { ok: false, error: 'server did not come up' };
+}
+export async function callAsync(loc, cmd, params = {}) {
+  if (process.env.G4A_AUTHORITY_SERVER !== '0') {
+    const { SERVE_CMDS, request } = await import('./authority-server.mjs');
+    if (SERVE_CMDS.has(cmd)) {
+      const r = await request(loc.root, cmd, params, { system: loc.mode === 'system', pub: loc.pub });
+      if (r !== null) return r;
+      startServer(loc);
+    }
+  }
+  return callSpawn(loc, cmd, params);
+}
+function callSpawn(loc, cmd, params) {
+  const { argv, credential } = callArgv(loc, cmd, params);
+  return new Promise((resolve) => {
+    const ch = spawn(argv[0], argv[1], { stdio: [credential ? 'pipe' : 'ignore', 'pipe', 'pipe'] });
+    let out = '', err = '', size = 0;
+    ch.stdout.setEncoding('utf8'); ch.stderr.setEncoding('utf8');
+    ch.stdout.on('data', (d) => { size += d.length; if (size > MAX_REPLY) ch.kill('SIGKILL'); else out += d; });
+    ch.stderr.on('data', (d) => { if (err.length < 65536) err += d; });
+    ch.on('error', (e) => resolve({ ok: false, error: redact(`authority call failed to start: ${e.code || e.message}`) }));
+    ch.on('close', (status) => resolve(parseReply(status, out, err)));
+    if (credential) { ch.stdin.on('error', () => {}); ch.stdin.end(credential + '\n'); }
+  });
+}
+// async control-plane git (same hardened config/env as safeGit)
+export function gitAsync(repo, args) {
+  return new Promise((resolve) => {
+    const ch = spawn('git', [...SAFE_GIT_CONFIG, ...args], { cwd: repo, env: safeGitEnv(), stdio: ['ignore', 'pipe', 'pipe'] });
+    let stdout = '', stderr = '';
+    ch.stdout.setEncoding('utf8'); ch.stderr.setEncoding('utf8');
+    ch.stdout.on('data', (d) => { if (stdout.length < 1 << 20) stdout += d; });
+    ch.stderr.on('data', (d) => { if (stderr.length < 65536) stderr += d; });
+    ch.on('error', () => resolve({ status: 1, stdout, stderr: 'git failed to start' }));
+    ch.on('close', (status) => resolve({ status: status ?? 1, stdout, stderr }));
+  });
 }
 
 export const receivePack = (loc) => (loc.mode === 'system' ? `sudo -n -u ${SYSTEM_USER} ${WRAP('g4a-receive-pack')}` : null);
@@ -61,12 +139,26 @@ export function pushAgent(loc, worktree, agent, sha, credential) {
   if (r.status !== 0) return { ok: false, error: redact(`authority refused the push: ${(r.stderr || '').split('\n').filter((l) => /refused|error/.test(l)).join(' ').trim() || `exit ${r.status}`}`) };
   return { ok: true };
 }
+export async function pushAgentAsync(loc, worktree, agent, sha, credential) {
+  const pr = await callAsync(loc, 'permit', { agent, credential });
+  if (!pr.ok) return pr;
+  const r = await gitAsync(worktree, [...PROTO, 'push', '--quiet', '--porcelain', '-o', `permit=${pr.permit}`, ...packArgs(loc, 'r'), loc.url, `${sha}:refs/heads/agents/${agent}`]);
+  if (r.status !== 0) return { ok: false, error: redact(`authority refused the push: ${(r.stderr || '').split('\n').filter((l) => /refused|error/.test(l)).join(' ').trim() || `exit ${r.status}`}`) };
+  return { ok: true };
+}
 
 // fetch authority main into a scratch ref of `repo`; returns its sha
 export function fetchMain(loc, repo) {
   const r = safeGit(repo, [...PROTO, 'fetch', '--quiet', '--no-tags', ...packArgs(loc, 'u'), loc.url, '+refs/heads/main:refs/g4a/authority-main'], { allowFailure: true });
   if (r.status !== 0) throw new Error(`fetch from authority failed: ${r.stderr.trim()}`);
   return safeGit(repo, ['rev-parse', 'refs/g4a/authority-main']).stdout.trim();
+}
+// async fetch into a caller-chosen scratch ref (concurrent jobs must not share one)
+export async function fetchMainAsync(loc, repo, ref = 'refs/g4a/authority-main') {
+  if (!/^refs\/g4a\/[A-Za-z0-9._\/-]{1,128}$/.test(ref) || ref.includes('..')) throw new Error('bad scratch ref');
+  const r = await gitAsync(repo, [...PROTO, 'fetch', '--quiet', '--no-tags', ...packArgs(loc, 'u'), loc.url, `+refs/heads/main:${ref}`]);
+  if (r.status !== 0) throw new Error(`fetch from authority failed: ${r.stderr.trim()}`);
+  return safeGit(repo, ['rev-parse', ref]).stdout.trim();
 }
 
 // an agent OS user (g4a run --agent) anchors its own ledger under its own ref; the anchor hook

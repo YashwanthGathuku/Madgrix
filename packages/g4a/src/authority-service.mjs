@@ -8,6 +8,7 @@
 // (append-only), keys/ (0700), state/ (Authority DB), nonces/, accepted.jsonl, authority.json;
 // public dir P (readable by clients): permit/witness/operator *.pub.hex, overrides/, seed.
 import fs from 'node:fs';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { redact } from './privacy.mjs';
 import os from 'node:os';
 import path from 'node:path';
@@ -15,8 +16,8 @@ import { fileURLToPath } from 'node:url';
 import { createPrivateKey, createPublicKey, generateKeyPairSync, randomBytes, sign, createHash, timingSafeEqual } from 'node:crypto';
 import { safeGit } from '../../../scripts/lib/safe-git.mjs';
 import { canonicalJson } from '../../../src/lib/canonical.ts';
-import { Authority, rowClaim, bundleFromDb, repoId } from './authority.mjs';
-import { promote } from './promote.mjs';
+import { Authority, rowClaim, bundleFromDb, repoId, openDb } from './authority.mjs';
+import { planBatch, runBatchWitnesses, commitBatch } from './promote.mjs';
 import { signOverride, overrideName, OPT_OUT_VARS } from './override.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -73,22 +74,45 @@ export function initRoot({ root, pub, seed, clientRepo, mode }) {
 }
 
 // ---- service commands ----
-function withLock(L, fn) {
-  const lock = path.join(L.root, 'lock.d');
-  const t0 = Date.now();
+// In-process queue in front of the cross-process mkdir lock: in the long-running authority server,
+// concurrent requests wait here asynchronously instead of spinning on a lock this process holds.
+const inproc = new Map();
+function withLock(L, fn, name = 'lock.d') {
+  const key = path.join(L.root, name);
+  const p = (inproc.get(key) ?? Promise.resolve()).then(() => fileLock(L, fn, name));
+  const tail = p.catch(() => {}); inproc.set(key, tail);
+  tail.then(() => { if (inproc.get(key) === tail) inproc.delete(key); });
+  return p;
+}
+// Per-agent-ref lock (locks/agent-<id>.d). Lock order, everywhere: land.d -> agent-<id>.d -> lock.d.
+// Nothing holding lock.d ever takes an agent lock, and no path holds two agent locks, so no cycle.
+export const agentLockName = (agent) => { if (!AGENT_RE.test(String(agent ?? ''))) throw new Error('bad agent name'); return path.join('locks', `agent-${agent}.d`); };
+async function fileLock(L, fn, name) {
+  const lock = path.join(L.root, name);
+  if (name.startsWith('locks' + path.sep)) fs.mkdirSync(path.dirname(lock), { recursive: true, mode: 0o700 });
+  const t0 = Date.now(); let spins = 0;
   for (;;) {
     try { fs.mkdirSync(lock); fs.writeFileSync(path.join(lock, 'pid'), String(process.pid)); break; } catch {
+      let st = null; try { st = fs.lstatSync(lock); } catch { continue; }
+      // a planted symlink/file at the lock path is not a lock: remove it (lock dirs live in the 0700 root)
+      if (!st.isDirectory()) { fs.rmSync(lock, { force: true }); continue; }
       let pid = 0; try { pid = Number(fs.readFileSync(path.join(lock, 'pid'), 'utf8')); } catch {}
+      // a pid-less dir older than 30 s is a crash between mkdir and the pid write
+      if (!pid && Date.now() - st.mtimeMs > 30_000) { fs.rmSync(lock, { recursive: true, force: true }); continue; }
       let alive = false; try { if (pid) { process.kill(pid, 0); alive = true; } } catch {}
       if (pid && !alive) { fs.rmSync(lock, { recursive: true, force: true }); continue; }
       if (Date.now() - t0 > 900_000) throw new Error('authority lock timeout');
-      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
+      // short, growing, jittered waits (2 ms .. 25 ms): a waiter takes the lock soon after release
+      // async sleep: the long-running server keeps serving other agent refs while this one waits
+      await new Promise((r) => setTimeout(r, Math.min(25, 2 + (spins++) * 2) + Math.random() * 3));
     }
   }
   const release = () => fs.rmSync(lock, { recursive: true, force: true });
-  return Promise.resolve().then(fn).finally(release);
+  try { return await fn(); } finally { release(); }
 }
-export const callerUid = () => { const v = process.env.G4A_CALLER_UID; return /^[0-9]+$/.test(v ?? '') ? Number(v) : process.getuid(); };
+// system-mode authority server: per-request kernel peer uid (SO_PEERCRED via peer-gate.py)
+export const peerCtx = new AsyncLocalStorage();
+export const callerUid = () => { const s = peerCtx.getStore(); if (s) return s.uid; const v = process.env.G4A_CALLER_UID; return /^[0-9]+$/.test(v ?? '') ? Number(v) : process.getuid(); };
 // state/agents.json: { "<agent>": <uid> }. Bound on first claim; root (uid 0) may act for any agent.
 // state/agents.json: { "<agent>": { uid, cred } }. cred = sha256 of a per-agent credential the
 // authority issues on the binding claim (returned ONCE, never stored in clear authority-side).
@@ -100,7 +124,7 @@ const readAgents = (L) => { try { return JSON.parse(fs.readFileSync(agentsFile(L
 const writeAgents = (L, m) => { fs.writeFileSync(agentsFile(L) + '.tmp', JSON.stringify(m, null, 2), { mode: 0o600 }); fs.renameSync(agentsFile(L) + '.tmp', agentsFile(L)); };
 // operator actions carry an Ed25519 signature by the operator key over the canonical record
 const identityLog = (L, e, key) => { const r = { ...e, at: new Date().toISOString() }; if (key) r.operator_sig = sign(null, Buffer.from(canonicalJson(r)), key).toString('hex'); fs.appendFileSync(path.join(L.state, 'identity.jsonl'), JSON.stringify(r) + '\n', { mode: 0o600 }); };
-export const AGENT_RE = /^[A-Za-z0-9._-]{1,64}$/;
+export const AGENT_RE = /^(?!.*\.\.)[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 export function bindAgent(L, agent, uid, mayBind, credential) {
   if (!AGENT_RE.test(String(agent ?? ''))) return { ok: false, error: 'bad agent name' };
   const m = readAgents(L);
@@ -162,9 +186,11 @@ export function osBind(L, agent, uid) {
 const claimRow = (auth, repo, agent) => { const r = auth.db.prepare("SELECT * FROM claims WHERE repo = ? AND agent = ? AND status = 'active'").get(repo, agent); return r && rowClaim(r); };
 const strip = ({ secret_sha256, secretFile, ...c }) => c;
 
+const permitKeys = new Map();
+const permitKey = (L) => { const f = permitKeyFile(L); let k = permitKeys.get(f); if (!k) { k = createPrivateKey(fs.readFileSync(f, 'utf8')); permitKeys.set(f, k); } return k; };
 function signPermit(L, fields, ttlMs = 120_000) {
   const permit = { version: 'g4a-permit/v1', ...fields, nonce: randomBytes(16).toString('hex'), exp: new Date(Date.now() + ttlMs).toISOString() };
-  const signature = sign(null, Buffer.from(canonicalJson(permit)), createPrivateKey(fs.readFileSync(permitKeyFile(L), 'utf8'))).toString('base64');
+  const signature = sign(null, Buffer.from(canonicalJson(permit)), permitKey(L)).toString('base64');
   return Buffer.from(JSON.stringify({ permit, signature })).toString('base64');
 }
 
@@ -241,8 +267,27 @@ export async function run(L, cmd, p = {}) {
       } finally { auth.db.close(); }
     });
   }
-  return withLock(L, async () => {
-    const auth = new Authority(L.state, { keyDir: L.keys, anchorRemote: { url: L.anchors, ref: AUTH_ANCHOR_REF } });
+  const agentCmd = ['claim', 'permit', 'land', 'release'].includes(cmd);
+  if (agentCmd && !AGENT_RE.test(String(p.agent ?? ''))) return { ok: false, status: 'refused', reason: 'agent_identity', error: 'bad agent name' };
+  // permit: per-agent lock only. Read-only: no ledger append, no anchor, no Authority construction.
+  // One-time use stays enforced at receive (atomic O_EXCL nonce file), so parallel refs cannot share a permit.
+  if (cmd === 'permit') return withLock(L, () => {
+    const pol = osPolicyCheck(L, p.agent, callerUid());
+    if (!pol.ok) return { ok: false, status: 'refused', reason: 'agent_identity', error: pol.error };
+    const id = bindAgent(L, p.agent, callerUid(), false, p.credential);
+    if (!id.ok) return { ok: false, status: 'refused', reason: 'agent_identity', error: id.error };
+    // server: its own cached read-only connection (never the writer's, which may be mid-transaction)
+    const shared = SHARED && SHARED.root === L.root;
+    const db = shared ? (SHARED.ro ??= openDb(L.state, { readOnly: true })) : openDb(L.state, { readOnly: true });
+    try {
+      const r = db.prepare("SELECT * FROM claims WHERE repo = ? AND agent = ? AND status = 'active'").get(repoId(L.repo), p.agent);
+      const c = r && rowClaim(r);
+      if (!c) return { ok: false, error: `no active authority claim for ${p.agent}` };
+      return { ok: true, claim: c.id, permit: signPermit(L, { kind: 'agent', uid: callerUid(), agent: c.agent, claim: c.id, ref: `refs/heads/agents/${c.agent}`, paths: c.paths, baseline: c.baseline }) };
+    } finally { if (!shared) db.close(); }
+  }, agentLockName(p.agent));
+  const inner = () => withLock(L, async () => {
+    const auth = openAuth(L);
     const repo = repoId(L.repo);
     try {
       // Agent identity: an agent name is bound to the OS uid that first claimed it (system mode:
@@ -265,16 +310,24 @@ export async function run(L, cmd, p = {}) {
           return { ok: true, claim: c.id, permit: signPermit(L, { kind: 'agent', uid: callerUid(), agent: c.agent, claim: c.id, ref: `refs/heads/agents/${c.agent}`, paths: c.paths, baseline: c.baseline }) };
         }
         case 'land': {
+          // Enqueue only (under the authority lock). The caller then waits in landWait(), where
+          // one leader at a time drains the queue in file-disjoint batches.
           const c = claimRow(auth, repo, p.agent);
           if (!c) return { ok: false, status: 'refused', reason: `no active authority claim for ${p.agent}` };
           const ref = safeGit(L.repo, ['rev-parse', '--verify', '--quiet', `refs/heads/agents/${c.agent}`], { allowFailure: true }).stdout.trim();
           if (!ref) return { ok: false, status: 'refused', reason: 'nothing pushed to the authority for this claim' };
           if (p.candidate && p.candidate !== ref) return { ok: false, status: 'refused', reason: 'authority agent ref differs from the client branch', authority: ref, client: p.candidate };
-          safeGit(L.repo, ['update-ref', `refs/heads/${c.branch}`, ref]);
+          if (p.job !== undefined && !JOB_RE.test(String(p.job))) return { ok: false, status: 'refused', reason: 'bad job id' };
           const job = p.job || `j_${randomBytes(6).toString('hex')}`;
-          const r = await promote(auth, c, job);
-          const head = auth.db.prepare('SELECT seq, entry_hash FROM ledger WHERE repo = ? ORDER BY seq DESC LIMIT 1').get(repo);
-          return { ...r, authority_entry: head, job };
+          // a job id belongs to the agent that first used it (ledger or queue): no cross-agent reuse
+          const owner = auth.db.prepare("SELECT json_extract(payload, '$.agent') AS a FROM ledger WHERE repo = ? AND json_extract(payload, '$.job') = ? AND json_extract(payload, '$.agent') IS NOT NULL LIMIT 1").get(repo, job)?.a
+            ?? auth.db.prepare('SELECT agent FROM landq WHERE job = ?').get(job)?.agent;
+          if (owner && owner !== c.agent) return { ok: false, status: 'refused', reason: 'job id belongs to another agent' };
+          const q = auth.db.prepare('SELECT result FROM landq WHERE job = ?').get(job);
+          if (q && q.result === null) return { ok: false, status: 'refused', reason: 'job already queued' };
+          safeGit(L.repo, ['update-ref', `refs/heads/${c.branch}`, ref]);
+          auth.db.prepare('INSERT OR REPLACE INTO landq (job, agent, claim, candidate, created_at, result) VALUES (?, ?, ?, ?, ?, NULL)').run(job, c.agent, c.id, ref, new Date().toISOString());
+          return { ok: true, status: 'queued', job, __land: true };
         }
         case 'release': {
           const c = claimRow(auth, repo, p.agent);
@@ -288,11 +341,124 @@ export async function run(L, cmd, p = {}) {
         }
         case 'status': return { ok: true, mode: conf.mode, main: safeGit(L.repo, ['rev-parse', 'refs/heads/main']).stdout.trim(), ...auth.status({ repo: L.repo }) };
         case 'ledger': return { ok: true, mode: conf.mode, bundle: bundleFromDb(auth.db, repo), witness_pub: auth.publicKeySpkiHex, main: safeGit(L.repo, ['rev-parse', 'refs/heads/main']).stdout.trim() };
-        case 'audit': return audit(L, auth, repo, conf);
+        case 'audit': { await ingestRefusals(L, auth, repo); return audit(L, auth, repo, conf); }
         default: return { ok: false, error: `unknown authority command ${cmd}` };
       }
+    } finally { try { auth.flushAnchors(); } finally { auth.db.close(); } }
+  });
+  const r = agentCmd ? await withLock(L, inner, agentLockName(p.agent)) : await inner();
+  if (r && r.__land) return landWait(L, r.job);
+  return r;
+}
+
+// ---- batched landing ----
+const JOB_RE = /^[A-Za-z0-9_-]{1,80}$/;
+// The long-running server keeps one Authority (key loaded, anchors checked once at start); every
+// request still runs assertNotRolledBack before each append. close() on the shared handle is a no-op.
+let SHARED = null;
+export function shareAuthority(L) {
+  const a = new Authority(L.state, { keyDir: L.keys, anchorRemote: { url: L.anchors, ref: AUTH_ANCHOR_REF }, deferAnchors: 'manual' });
+  const db = a.db;
+  const view = new Proxy(db, { get: (t, k) => (k === 'close' ? () => {} : typeof t[k] === 'function' ? t[k].bind(t) : t[k]) });
+  SHARED = { root: L.root, auth: a, view: Object.create(a, { db: { value: view } }) };
+  return a;
+}
+const openAuth = (L) => (SHARED && SHARED.root === L.root ? SHARED.view : newAuth(L));
+const newAuth = (L) => new Authority(L.state, { keyDir: L.keys, anchorRemote: { url: L.anchors, ref: AUTH_ANCHOR_REF }, deferAnchors: 'manual' });
+const revq = (L, r) => safeGit(L.repo, ['rev-parse', '--verify', '--quiet', r], { allowFailure: true }).stdout.trim();
+function setResult(auth, repo, job, r) {
+  const head = auth.db.prepare('SELECT seq, entry_hash FROM ledger WHERE repo = ? ORDER BY seq DESC LIMIT 1').get(repo);
+  auth.db.prepare('UPDATE landq SET result = ? WHERE job = ?').run(JSON.stringify({ ...r, authority_entry: head, job }), job);
+}
+function takeResult(L, job) {
+  return withLock(L, () => {
+    const auth = openAuth(L);
+    try {
+      const q = auth.db.prepare('SELECT result FROM landq WHERE job = ?').get(job);
+      if (!q) return { ok: false, status: 'error', error: 'land request vanished', job };
+      if (q.result === null) return null;
+      auth.db.prepare('DELETE FROM landq WHERE job = ?').run(job);
+      return JSON.parse(q.result);
     } finally { auth.db.close(); }
   });
+}
+// one leader at a time (land.d lock, taken before lock.d, never the other way round)
+async function landWait(L, job) {
+  for (let round = 0; ; round++) {
+    const r = await withLock(L, async () => (await takeResult(L, job)) ?? (await leadBatch(L), takeResult(L, job)), 'land.d');
+    if (r) return r;
+    if (round > 10_000) return { ok: false, status: 'error', error: 'land queue did not drain', job };
+  }
+}
+// fold pre-receive refusals (appended by the hook) into the signed ledger as push_refused
+export async function ingestRefusals(L, auth, repo) {
+  const f = path.join(L.state, 'refusals.jsonl'), off = path.join(L.state, 'refusals.offset');
+  let st; try { st = fs.statSync(f); } catch { return 0; }
+  let from = 0; try { from = Number(fs.readFileSync(off, 'utf8')) || 0; } catch {}
+  if (from > st.size) from = 0;
+  if (from === st.size) return 0;
+  const fd = fs.openSync(f, 'r'); const buf = Buffer.alloc(Math.min(st.size - from, 1 << 20));
+  try { fs.readSync(fd, buf, 0, buf.length, from); } finally { fs.closeSync(fd); }
+  const text = buf.toString('utf8'), end = text.lastIndexOf('\n') + 1;
+  let n = 0;
+  for (const l of text.slice(0, end).split('\n').filter(Boolean)) {
+    let e; try { e = JSON.parse(l); } catch { continue; }
+    await auth.appendLedger(repo, 'push_refused', { at: String(e.at ?? '').slice(0, 40), reason: String(e.reason ?? '').slice(0, 400), uid: String(e.uid ?? '').slice(0, 12), refs: Array.isArray(e.refs) ? e.refs.slice(0, 4).map((r) => String(r).slice(0, 200)) : [] });
+    n++;
+  }
+  fs.writeFileSync(off, String(from + Buffer.byteLength(text.slice(0, end))));
+  return n;
+}
+// land-time tamper audit: main moved outside the ladder refuses the whole batch; an agent ref that
+// moved without a confirmed push refuses that agent. Each distinct finding is logged once.
+async function tamperCheck(L, auth, repo) {
+  const au = audit(L, auth, repo);
+  if (!au.ok) {
+    const sig = createHash('sha256').update(JSON.stringify(au.external)).digest('hex');
+    const last = auth.db.prepare("SELECT payload FROM ledger WHERE repo = ? AND kind = 'tamper_detected' ORDER BY seq DESC LIMIT 1").get(repo);
+    if (!last || JSON.parse(last.payload).sig !== sig) await auth.appendLedger(repo, 'tamper_detected', { sig, at: 'land', mode: au.mode, external: au.external });
+  }
+  return { main: au.external.some((x) => x.ref === 'refs/heads/main'), agents: new Set(au.external.filter((x) => x.ref.startsWith('refs/heads/agents/')).map((x) => x.ref.slice(18))) };
+}
+async function leadBatch(L) {
+  const auth = openAuth(L);
+  const repo = repoId(L.repo);
+  try {
+    let plan = null;
+    await withLock(L, async () => {
+      await ingestRefusals(L, auth, repo);
+      const t = await tamperCheck(L, auth, repo);
+      const items = [];
+      for (const q of auth.db.prepare('SELECT * FROM landq WHERE result IS NULL ORDER BY created_at, job').all()) {
+        const c = claimRow(auth, repo, q.agent);
+        if (!c || c.id !== q.claim) { setResult(auth, repo, q.job, { ok: false, status: 'refused', reason: 'claim released before landing' }); continue; }
+        if (t.main || t.agents.has(c.agent)) {
+          await auth.appendLedger(repo, 'promote_refused', { job: q.job, claim: c.id, agent: c.agent, reason: 'authority_tampered' });
+          setResult(auth, repo, q.job, { ok: false, status: 'refused', reason: 'authority_tampered', hint: 'refs moved outside g4a; run `g4a authority audit` and restore before landing' });
+          continue;
+        }
+        if (revq(L, `refs/heads/agents/${c.agent}`) !== q.candidate) { setResult(auth, repo, q.job, { ok: false, status: 'refused', reason: 'authority agent ref moved after the land request' }); continue; }
+        safeGit(L.repo, ['update-ref', `refs/heads/${c.branch}`, q.candidate]);
+        items.push({ claim: c, jobId: q.job });
+      }
+      plan = await planBatch(auth, items);
+      for (const [job, r] of plan.results) setResult(auth, repo, job, r);
+      auth.flushAnchors(); // anchors reach the new head before the lock is released
+    });
+    if (!plan?.batch) return;
+    const w = await runBatchWitnesses(plan.batch);
+    await withLock(L, async () => {
+      const valid = (ms) => ms.every((m) => {
+        const c = claimRow(auth, repo, m.claim.agent);
+        const q = auth.db.prepare('SELECT candidate, result FROM landq WHERE job = ?').get(m.jobId);
+        return c && c.id === m.claim.id && q && q.result === null && q.candidate === m.candidate
+          && revq(L, `refs/heads/agents/${c.agent}`) === m.candidate && revq(L, `refs/heads/${c.branch}`) === m.candidate;
+      });
+      const out = await commitBatch(auth, plan.batch, w, valid);
+      for (const [job, r] of out) setResult(auth, repo, job, r);
+      auth.flushAnchors();
+    });
+  } finally { auth.db.close(); }
 }
 
 // refs that moved without the hook / ladder: main must equal the last ledger promote (or seed);
@@ -300,7 +466,8 @@ export async function run(L, cmd, p = {}) {
 export function audit(L, auth, repo, conf = readConf(L)) {
   const bad = [];
   const last = auth.db.prepare("SELECT payload FROM ledger WHERE repo = ? AND kind = 'promote' ORDER BY seq DESC LIMIT 1").get(repo);
-  const expectMain = last ? JSON.parse(last.payload).main_after : conf.seed;
+  const lp = last && JSON.parse(last.payload);
+  const expectMain = lp ? (lp.batch?.main_after ?? lp.main_after) : conf.seed;
   const main = safeGit(L.repo, ['rev-parse', 'refs/heads/main']).stdout.trim();
   if (main !== expectMain) bad.push({ ref: 'refs/heads/main', sha: main, expected: expectMain });
   const acc = new Map();
