@@ -50,7 +50,11 @@ if (mode === 'plain') {
 Object.assign(process.env, env);
 const AC = mode === 'g4a-push' ? await import('../src/authority-client.mjs') : null;
 const lat = []; let errors = 0, syncRetries = 0; const errSamples = [];
-const deadline = Date.now() + SECS * 1000;
+let deadline = Date.now() + SECS * 1000;
+// g4a-push: the timed window starts after every agent's one-time claim (claims are a setup cost,
+// reported separately as stepsMedianMs.claim); otherwise 64 serialized claims eat the window.
+let arrived = 0, openGate; const gate = new Promise((r) => { openGate = r; });
+const arrive = () => { if (++arrived === N) { deadline = Date.now() + SECS * 1000; t0 = Date.now(); openGate(); } return gate; };
 async function agent(i) {
   const id = `a${i}`; let seq = 0;
   let wt;
@@ -58,8 +62,9 @@ async function agent(i) {
   if (mode === 'g4a-push') {
     ag = id; loc = AC.locate(repo);
     const cl = json((await g4a(['claim', '--repo', repo, '--agent', ag, '--paths', `agents/${id}/**`, '--witness', 'true', '--session-credential'])).stdout);
-    if (!cl.ok) { errors++; errSamples.push(JSON.stringify({ ...cl, agent_credential: undefined }).slice(0, 300)); return; }
+    if (!cl.ok) { errors++; errSamples.push(JSON.stringify({ ...cl, agent_credential: undefined }).slice(0, 300)); await arrive(); return; }
     cred = cl.agent_credential; wt = cl.worktree;
+    await arrive();
   }
   if (mode === 'plain') { wt = path.join(W, id); execFileSync('git', ['clone', '-q', remote, wt], { env }); execFileSync('git', ['checkout', '-q', '-b', `agent/${id}`], { cwd: wt, env }); }
   while (Date.now() < deadline) {
@@ -92,7 +97,7 @@ async function agent(i) {
     if (ok) lat.push(ms); else { errors++; if (errSamples.length < 3) errSamples.push(why); }
   }
 }
-const t0 = Date.now();
+let t0 = Date.now();
 await Promise.all(Array.from({ length: N }, (_, i) => agent(i)));
 const wall = (Date.now() - t0) / 1000;
 lat.sort((a, b) => a - b);

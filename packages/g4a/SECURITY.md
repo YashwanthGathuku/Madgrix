@@ -158,6 +158,18 @@ and that the service refuses both commands with a caller uid or `SUDO_USER` set.
 - **Gap 6:** off by default and never in the trust path. Capture is redacted, stays local (0600) and excludes secrets and credentials. Review HTML is escaped and script-free. The eval hook is advisory, runs as the caller without `G4A_AGENT_CREDENTIAL`, has a timeout and gets redacted input.
 - **Raw push mode:** still needs a one-time permit, and the authority's scope check applies to every push.
 
+### Per-agent-ref locking (Nov 3 2026)
+- `permit` runs under a per-agent lock (`locks/agent-<id>.d`, name checked by AGENT_RE) and is read-only.
+  One-time use is still the atomic O_EXCL nonce file at receive; the permit binds one exact ref.
+- claim/land/release: agent lock, then global `lock.d`. Ledger appends, anchors and main stay serial.
+- Lock order `land.d -> agent-<id>.d -> lock.d`; no holder of `lock.d` takes an agent lock.
+- Lock dirs: a planted symlink/file is removed, not followed; a dead pid or a pid-less dir older than
+  30 s is cleared. Lock waits are async, so one held agent lock cannot stall the server.
+- Red-team (test/perref.test.mjs): one permit raced on two refs + twice on its own ref (one lands),
+  multi-ref push, cross-ref permit, forged ref in permit, out-of-claim path, same-agent and same-path
+  claim races, lock tampering, SIGKILL mid claim burst (chain + audit verify after restart).
+- Known: pid reuse can make a stale lock look live (waits up to the 900 s timeout).
+
 ## Known gaps and risks
 
 - **Same-uid agents are not isolated from each other.** This is why one OS user per agent is now

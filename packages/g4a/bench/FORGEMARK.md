@@ -161,3 +161,28 @@ forgemark -remote http://127.0.0.1:8099 -repos fm.git -strategy branch -concurre
 | g4a-push raw branch push, system | 16.79 | 651 ms | push step median 143 ms |
 
 Entire's 418/s counts local checkpoint commits with no authority, scope check or witness, so the numbers are not comparable, and g4a does not reach it with governance on. What limits g4a now is the serialized authority lock and CLI boot: claim takes about 1.9 s at 16 agents. Reproduce with `node bench/race.mjs g4a|g4a-push 16 20 [--system]`.
+
+## Per-agent-ref locks (Nov 3 2026, 8 cores, 20 s window, 0 errors in every run)
+
+`permit` now runs under `locks/agent-<id>.d` only (read-only sqlite, no Authority, no ledger write);
+claim/land/release take `agent-<id>.d` then the global `lock.d`. Lock order: `land.d -> agent-<id>.d -> lock.d`.
+`g4a-push` now starts its timed window after every agent's one-time claim (before, 64 serialized
+claims consumed most of the window, so ops/s mostly measured the claim queue).
+
+| Run (claim excluded from window) | before (669b397) | after |
+|---|---|---|
+| g4a-push 16 user | 21.85 ops/s, p50 434 ms | 20.57 ops/s, p50 496 ms |
+| g4a-push 16 system | 21.69 ops/s, p50 457 ms | 20.51 ops/s, p50 510 ms |
+| g4a-push 64 user | 31.31 ops/s, p50 1968 ms | 33.57 ops/s, p50 1857 ms |
+| g4a-push 64 system | 32.97 ops/s, p50 1901 ms | 32.74 ops/s, p50 1885 ms |
+
+| Governed landing (old harness, claim per op) | before | after |
+|---|---|---|
+| g4a 16 user / system | 3.00 / 2.97 ops/s | 2.75 / 2.78 ops/s |
+| g4a 64 user / system | 2.07 / 2.41 ops/s | 1.89 / 2.24 ops/s |
+
+Reading: within run-to-run noise. On this box raw push is CPU-bound (each op spawns git plus
+node hooks); the global lock was not the limiter once `permit` stopped writing. Governed landing is
+bounded by serialized main CAS + ledger append (kept serial on purpose) and by `claim`, which still
+needs `lock.d` because overlap checks and ledger appends must be serial. What changed is isolation:
+a held or slow lock on one agent no longer delays another agent's permit (test/perref.test.mjs).
