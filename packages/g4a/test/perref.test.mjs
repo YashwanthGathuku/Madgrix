@@ -122,8 +122,8 @@ test('lock-file tampering: planted symlink, dead-pid and pid-less stale dirs are
 
 test('crash mid-append: SIGKILL the authority during a claim burst; restart, chain and audit verify', async () => {
   const burst = Array.from({ length: 10 }, (_, i) => req('claim', { agent: `k${i}`, paths: [`agents/k${i}/**`] }));
-  await new Promise((r) => setTimeout(r, 60)); srv.kill('SIGKILL'); await Promise.all(burst);
-  await new Promise((r) => srv.once('exit', r)).catch(() => {});
+  const exited = srv.exitCode !== null || srv.signalCode !== null ? Promise.resolve() : new Promise((r) => srv.once('exit', r));
+  await new Promise((r) => setTimeout(r, 60)); srv.kill('SIGKILL'); await Promise.all(burst); await exited;
   await startServer();
   const au = await req('audit');
   assert.equal(au.ok, true, JSON.stringify(au).slice(0, 600));
